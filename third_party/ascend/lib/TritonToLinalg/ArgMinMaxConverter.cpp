@@ -166,11 +166,9 @@ struct FoldOneHotGatherAfterReduceWithIndex
 
     Value maxInput = reduceWithIndex.getInputs()[0];
     auto selectOp = maxInput.getDefiningOp<arith::SelectOp>();
-    if (!selectOp)
+    if (selectOp && selectOp.getTrueValue() != logits && selectOp.getFalseValue() != logits)
       return failure();
-
-    if (selectOp.getTrueValue() != logits &&
-        selectOp.getFalseValue() != logits)
+    if (!selectOp && maxInput != logits)
       return failure();
 
     if (op.getResult(0).getType() != reduceWithIndex.getResult(0).getType())
