@@ -55,6 +55,9 @@ from .dsl_analysis.vv_parser_options import (resolve_vv_parser_v2_enabled,
 from .utils import get_byte_per_numel, is_valid_axis_name, valid_axis_names
 from .ubtuner import UBTuner, get_origin_fn
 from .vector_axes import VectorAxes
+from .hyper_autotune.hyperparameter_cache import get_hyperparameter_autotune_cache
+from .hyper_autotune.hyperparameter_config import HyperAutotuneConfig
+from .hyper_autotune.hyperparameter_tuner import HyperparameterAutotuner, make_compiler_flags
 
 # Import CV autotune components
 from .cv_autotune.generators.cv_tile_generator import CVTileGenerator
@@ -2162,6 +2165,45 @@ class AutoTilingTuner(Autotuner):
 
         if not used_cached_result and self.auto_profile_dir is not None:
             self._profile(*args, config=self.best_config, **kwargs)
+
+        hyper_config = HyperAutotuneConfig.from_env()
+        extra_compile_flags = ()
+        if hyper_config.enabled:
+            selected_config_identity = repr(config)
+            hyper_cache = get_hyperparameter_autotune_cache()
+            cached_entry = None if hyper_config.force else hyper_cache.get(key, hyper_config, selected_config_identity)
+            if cached_entry is not None:
+                best_vector = cached_entry.vector
+                best_objective = cached_entry.objective
+                if hyper_config.log:
+                    print(
+                        "Triton hyper autotuning: using cached vector "
+                        f"{best_vector} with objective {best_objective}"
+                    )
+            else:
+                def compile_and_benchmark(extra_flags):
+                    trial_kwargs = dict(kwargs)
+                    trial_kwargs["extra_compile_flags"] = tuple(extra_flags)
+                    kernel_call = self._make_kernel_call(*args, config=config, **trial_kwargs)
+                    fn = functools.partial(kernel_call, warmup=False)
+                    return self.do_bench(fn, quantiles=(0.5, 0.2, 0.8))
+
+                tuner = HyperparameterAutotuner(
+                    hyper_config,
+                    lambda vector: compile_and_benchmark(make_compiler_flags(vector)),
+                )
+                tuning_result = tuner.tune()
+                best_vector = tuning_result.vector
+                best_objective = tuning_result.objective
+                if not hyper_config.force:
+                    hyper_cache.put(key, hyper_config, selected_config_identity, tuning_result)
+                if hyper_config.log:
+                    print(
+                        "Triton hyper autotuning: selected vector "
+                        f"{best_vector} with objective {best_objective}"
+                    )
+            extra_compile_flags = make_compiler_flags(best_vector)
+
         ub_cfg = dict(getattr(config, "ubtune_cfg", {}))
         if config.pre_hook is not None:
             full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
@@ -2169,6 +2211,8 @@ class AutoTilingTuner(Autotuner):
             config.pre_hook(full_nargs)
         final_kwargs = dict(config.all_kwargs(), **kwargs)
         final_kwargs.update(ub_cfg)
+        if extra_compile_flags:
+            final_kwargs["extra_compile_flags"] = extra_compile_flags
         ret = self.fn.run(
             *args,
             **final_kwargs,
