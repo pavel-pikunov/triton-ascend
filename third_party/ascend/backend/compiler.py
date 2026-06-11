@@ -598,6 +598,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if opt.debug:
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
+        _compile_option_list += list(opt.extra_compile_flags)
         cmd_list = (
             [npu_compiler_path, ttadapter_path]
             + _compile_option_list
@@ -828,6 +829,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         if opt.debug:
             _compile_option_list += ["--mlir-print-ir-after-failure"]
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
+        _compile_option_list += list(opt.extra_compile_flags)
         cmd_list = (
             [npu_compiler_path, ttadapter_path]
             + _compile_option_list
@@ -957,6 +959,7 @@ class NPUOptions:
     intra_cache_num: int = None
     inter_cache_num: int = None
     load_cache_num: int = None
+    extra_compile_flags: Tuple[str, ...] = ()
 
     stream: int = None
     parallel_mode: str = "simd"
@@ -979,6 +982,11 @@ class NPUOptions:
     disable_fma: bool = False
 
     def __post_init__(self):
+        if self.extra_compile_flags is None:
+            object.__setattr__(self, "extra_compile_flags", ())
+        elif not isinstance(self.extra_compile_flags, tuple):
+            object.__setattr__(self, "extra_compile_flags", tuple(self.extra_compile_flags))
+
         # Parse compile_mode and set related fields
         if self.compile_mode == "simd":
             object.__setattr__(self, "parallel_mode", "simd")
@@ -1055,6 +1063,7 @@ def ttir_to_npubin(mod, metadata, opt):
                 _compile_option_list += ["--enable-auto-blockify-loop"]
 
         npu_compiler_path, env = _get_npucompiler_path()
+        _compile_option_list += list(opt.extra_compile_flags)
         cmd_list = (
             [npu_compiler_path, src_path]
             + _compile_option_list
