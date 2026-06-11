@@ -59,13 +59,14 @@ def _load_hyper_autotune_modules():
 
 _cache_module, _config_module, _tuner_module = _load_hyper_autotune_modules()
 HyperparameterAutotuneCache = _cache_module.HyperparameterAutotuneCache
+HYPER_PARAMETER_COUNT = _config_module.HYPER_PARAMETER_COUNT
 HyperAutotuneConfig = _config_module.HyperAutotuneConfig
 HyperparameterAutotuner = _tuner_module.HyperparameterAutotuner
 make_compiler_flags = _tuner_module.make_compiler_flags
 
 
-TARGET_VECTOR = (5, 3, 2)
-BASELINE_VECTOR = (1, 1, 1)
+TARGET_VECTOR = (1,) * HYPER_PARAMETER_COUNT
+BASELINE_VECTOR = (8,) * HYPER_PARAMETER_COUNT
 
 
 def _complex_reference(data: Sequence[float]) -> List[float]:
@@ -114,11 +115,11 @@ def _config_from_args(args) -> HyperAutotuneConfig:
     return HyperAutotuneConfig.from_env(
         {
             "TRITON_ASCEND_HYPER_AUTOTUNE": "1",
-            "TRITON_ASCEND_HYPER_AUTOTUNE_DIM": "3",
+            "TRITON_ASCEND_HYPER_AUTOTUNE_DIM": str(HYPER_PARAMETER_COUNT),
             "TRITON_ASCEND_HYPER_AUTOTUNE_TRIALS": str(args.trials),
             "TRITON_ASCEND_HYPER_AUTOTUNE_TIMEOUT_SEC": str(args.timeout_sec),
-            "TRITON_ASCEND_HYPER_AUTOTUNE_LOW": "1,1,1",
-            "TRITON_ASCEND_HYPER_AUTOTUNE_HIGH": "7,5,3",
+            "TRITON_ASCEND_HYPER_AUTOTUNE_LOW": "1",
+            "TRITON_ASCEND_HYPER_AUTOTUNE_HIGH": "8",
             "TRITON_ASCEND_HYPER_AUTOTUNE_SEED": str(args.seed),
         }
     )
@@ -133,7 +134,8 @@ def run_benchmark(args) -> None:
 
     def objective(vector: Tuple[int, ...]) -> float:
         flags = make_compiler_flags(vector)
-        if flags != ("--hyper-max-parallel-parameters=" + ",".join(str(value) for value in vector),):
+        expected_flags = ("--hyper-parameters",) + tuple(str(value) for value in vector)
+        if flags != expected_flags:
             raise RuntimeError(f"unexpected compiler flags for {vector}: {flags}")
         elapsed_ms, max_abs_error = _time_kernel(vector, data, repeats=1)
         evaluated_vectors.add(vector)

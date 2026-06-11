@@ -6,10 +6,10 @@
 
 Новая фича добавляет **второй, узкий уровень автотюнинга** поверх уже выбранного `Config` в Ascend autotuner.
 
-Обычный autotuner уже выбирает Triton/Ascend `Config`: tiling/meta-параметры, `num_warps`, `num_stages`, UB tuning и т.п. Hyperparameter autotune не меняет этот `Config` и не добавляет параметры в kernel signature. Вместо этого он подбирает **маленький вектор целых чисел**, который конвертируется в один compiler flag:
+Обычный autotuner уже выбирает Triton/Ascend `Config`: tiling/meta-параметры, `num_warps`, `num_stages`, UB tuning и т.п. Hyperparameter autotune не меняет этот `Config` и не добавляет параметры в kernel signature. Вместо этого он подбирает **вектор из ровно 32 целых чисел**, который конвертируется в один compiler flag:
 
 ```text
---hyper-max-parallel-parameters=<v0>,<v1>,...,<vn>
+--hyper-parameters <v0> <v1> ... <v31>
 ```
 
 Дальше этот flag передаётся в Ascend compiler через новый option `extra_compile_flags`.
@@ -51,11 +51,11 @@ HyperAutotuneConfig(enabled=False, dim=0, max_trials=0, low=(), high=(), ...)
 | Env var | Назначение | Default при enabled mode |
 |---|---|---|
 | `TRITON_ASCEND_HYPER_AUTOTUNE` | Главный switch. `1/true/yes/on` включает фичу. | disabled |
-| `TRITON_ASCEND_HYPER_AUTOTUNE_DIM` | Размерность integer-vector, который ищет Optuna. | `1` |
+| `TRITON_ASCEND_HYPER_AUTOTUNE_DIM` | Размерность integer-vector, который ищет Optuna. | `32` |
 | `TRITON_ASCEND_HYPER_AUTOTUNE_TRIALS` | Максимальное число Optuna trials. | `16` |
 | `TRITON_ASCEND_HYPER_AUTOTUNE_TIMEOUT_SEC` | Timeout для `study.optimize`. | `None` |
-| `TRITON_ASCEND_HYPER_AUTOTUNE_LOW` | Нижняя граница search space. Можно одно число или comma-separated vector. | `1` для каждой размерности |
-| `TRITON_ASCEND_HYPER_AUTOTUNE_HIGH` | Верхняя граница search space. Можно одно число или comma-separated vector. | `8` для каждой размерности |
+| `TRITON_ASCEND_HYPER_AUTOTUNE_LOW` | Нижняя граница search space. Можно одно число или comma-separated vector. | `1` для каждой из 32 позиций |
+| `TRITON_ASCEND_HYPER_AUTOTUNE_HIGH` | Верхняя граница search space. Можно одно число или comma-separated vector. | `8` для каждой из 32 позиций |
 | `TRITON_ASCEND_HYPER_AUTOTUNE_SEED` | Seed для `TPESampler`. Если не задан, sampler создаётся без seed. | `None` |
 | `TRITON_ASCEND_HYPER_AUTOTUNE_LOG` | Включает диагностические print-сообщения. | `False` |
 | `TRITON_ASCEND_HYPER_AUTOTUNE_FORCE` | Игнорирует cache и заставляет tuning запускаться заново. | `False` |
@@ -68,6 +68,7 @@ HyperAutotuneConfig(enabled=False, dim=0, max_trials=0, low=(), high=(), ...)
 
 Экспортирует:
 
+- `HYPER_PARAMETER_COUNT`
 - `HyperAutotuneConfig`
 - `HyperparameterAutotuner`
 - `HyperparameterTuningResult`
@@ -131,11 +132,11 @@ TRITON_ASCEND_HYPER_AUTOTUNE requires Optuna. Install optuna or unset TRITON_ASC
 
 #### `make_compiler_flags(vector)`
 
-Преобразует integer vector в tuple ровно из одного compiler flag:
+Преобразует integer vector длины 32 в argv-style tuple: имя compiler flag и 32 отдельных значения:
 
 ```python
-make_compiler_flags((3, 5, 7))
-# ("--hyper-max-parallel-parameters=3,5,7",)
+make_compiler_flags(tuple(range(1, 33)))
+# ("--hyper-parameters", "1", "2", ..., "32")
 ```
 
 Важно: это не kernel argument и не `Config.kwargs`; это compiler-only option.
@@ -174,9 +175,10 @@ study.optimize(trial_objective, n_trials=config.max_trials, timeout=config.timeo
 ```
 
 6. каждый trial предлагает integer vector через `trial.suggest_int(...)`;
-7. если objective падает exception или возвращает `NaN`, trial получает `float("inf")`;
-8. если все trials failed/inf, поднимается `RuntimeError("Hyperparameter autotuning failed: all trials failed")`;
-9. иначе возвращается `HyperparameterTuningResult`.
+7. если search space включает значение `1`, перед `study.optimize(...)` добавляется initial trial из 32 единиц через `study.enqueue_trial(...)`;
+8. если objective падает exception или возвращает `NaN`, trial получает `float("inf")`;
+9. если все trials failed/inf, поднимается `RuntimeError("Hyperparameter autotuning failed: all trials failed")`;
+10. иначе возвращается `HyperparameterTuningResult`.
 
 ### 4.4 `third_party/ascend/backend/runtime/hyper_autotune/hyperparameter_cache.py`
 
@@ -375,11 +377,11 @@ identity = config.cache_identity()
 ### `make_compiler_flags(vector)`
 
 ```python
-flags = make_compiler_flags((5, 3, 2))
-# ("--hyper-max-parallel-parameters=5,3,2",)
+flags = make_compiler_flags((1,) * 32)
+# ("--hyper-parameters", "1", "1", ..., "1")
 ```
 
-Единственный supported compiler flag builder на данный момент.
+Единственный supported compiler flag builder на данный момент; он возвращает `--hyper-parameters` и ровно 32 значения отдельными argv элементами.
 
 ### `HyperparameterAutotuner`
 
@@ -419,7 +421,7 @@ Process-global cache, используемый integration path.
 ### `NPUOptions.extra_compile_flags`
 
 ```python
-fn.run(..., extra_compile_flags=("--hyper-max-parallel-parameters=5,3,2",))
+fn.run(..., extra_compile_flags=("--hyper-parameters", "1", "1", ..., "1"))
 ```
 
 Узкий compiler option hook. Не является kernel argument.
@@ -453,8 +455,9 @@ python3 tools/manual_hyper_autotune_smoke.py
 
 - Cache in-memory only: при рестарте процесса tuning results теряются.
 - Optuna optional: production import происходит только при enabled hyper autotune path.
-- Сейчас есть только один compiler flag builder: `--hyper-max-parallel-parameters=...`.
+- Сейчас есть только один compiler flag builder: `--hyper-parameters <32 space-separated values>`.
 - Objective в real integration компилирует/бенчмаркает тот же selected config с trial-specific flags, поэтому tuning может быть дорогим.
+- Если bounds включают `1`, tuner сначала ставит в очередь default vector `(1,) * 32`, чтобы начальная точка соответствовала compiler default.
 - Failed trials intentionally become `inf`, чтобы единичные compile/runtime failures не останавливали весь search.
 - Если все trials failed, это считается настоящей ошибкой и поднимается clear `RuntimeError`.
 - Vector нигде не прокидывается как kernel argument; он существует только как compiler flag.

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Mapping, Optional, Tuple
 
 _ENV_PREFIX = "TRITON_ASCEND_HYPER_AUTOTUNE"
+HYPER_PARAMETER_COUNT = 32
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off", ""}
 
@@ -77,9 +78,13 @@ class HyperAutotuneConfig:
         if not enabled:
             return cls.disabled()
 
-        dim = _parse_int(env_map.get(f"{_ENV_PREFIX}_DIM"), f"{_ENV_PREFIX}_DIM", 1)
-        if dim <= 0:
-            raise ValueError(f"{_ENV_PREFIX}_DIM must be greater than zero")
+        dim = _parse_int(
+            env_map.get(f"{_ENV_PREFIX}_DIM"),
+            f"{_ENV_PREFIX}_DIM",
+            HYPER_PARAMETER_COUNT,
+        )
+        if dim != HYPER_PARAMETER_COUNT:
+            raise ValueError(f"{_ENV_PREFIX}_DIM must be exactly {HYPER_PARAMETER_COUNT}")
 
         max_trials = _parse_int(env_map.get(f"{_ENV_PREFIX}_TRIALS"), f"{_ENV_PREFIX}_TRIALS", 16)
         if max_trials <= 0:

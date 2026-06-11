@@ -43,7 +43,7 @@ def synthetic_objective(vector):
 
 def main() -> None:
     os.environ.setdefault("TRITON_ASCEND_HYPER_AUTOTUNE", "1")
-    os.environ.setdefault("TRITON_ASCEND_HYPER_AUTOTUNE_DIM", "2")
+    os.environ.setdefault("TRITON_ASCEND_HYPER_AUTOTUNE_DIM", "32")
     os.environ.setdefault("TRITON_ASCEND_HYPER_AUTOTUNE_TRIALS", "16")
     os.environ.setdefault("TRITON_ASCEND_HYPER_AUTOTUNE_LOW", "1")
     os.environ.setdefault("TRITON_ASCEND_HYPER_AUTOTUNE_HIGH", "8")

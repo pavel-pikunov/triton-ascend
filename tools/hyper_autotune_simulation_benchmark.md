@@ -13,7 +13,7 @@ python3 tools/hyper_autotune_simulation_benchmark.py --trials 80 --repeats 5
 
 ## What it checks
 
-- **Functionality:** the real `HyperparameterAutotuner` proposes vectors and converts them to `--hyper-max-parallel-parameters=...` flags.
+- **Functionality:** the real `HyperparameterAutotuner` proposes vectors and converts them to `--hyper-parameters <32 space-separated values>` flags.
 - **Accuracy:** a nonlinear synthetic kernel is compared with a deterministic reference for both baseline and tuned vectors.
 - **Performance:** the tuned vector must beat a deliberately poor baseline by at least `--min-speedup`.
 - **Cache path:** the chosen vector/objective is stored in and retrieved from `HyperparameterAutotuneCache`.

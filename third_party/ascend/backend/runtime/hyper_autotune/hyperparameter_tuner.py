@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence, Tuple
 
-from .hyperparameter_config import HyperAutotuneConfig
+from .hyperparameter_config import HYPER_PARAMETER_COUNT, HyperAutotuneConfig
 
 Objective = Callable[[Tuple[int, ...]], float]
 
@@ -23,7 +23,9 @@ def import_optuna():
 
 
 def make_compiler_flags(vector: Sequence[int]) -> Tuple[str, ...]:
-    return ("--hyper-max-parallel-parameters=" + ",".join(str(int(value)) for value in vector),)
+    if len(vector) != HYPER_PARAMETER_COUNT:
+        raise ValueError(f"--hyper-parameters requires exactly {HYPER_PARAMETER_COUNT} values")
+    return ("--hyper-parameters",) + tuple(str(int(value)) for value in vector)
 
 
 @dataclass(frozen=True)
@@ -47,9 +49,14 @@ class HyperparameterAutotuner:
 
     def _suggest_vector(self, trial) -> Tuple[int, ...]:
         return tuple(
-            int(trial.suggest_int(f"hyper_max_parallel_parameter_{index}", low, high))
+            int(trial.suggest_int(f"hyper_parameter_{index}", low, high))
             for index, (low, high) in enumerate(zip(self.config.low, self.config.high))
         )
+
+    def _default_vector(self) -> Optional[Tuple[int, ...]]:
+        if all(low <= 1 <= high for low, high in zip(self.config.low, self.config.high)):
+            return (1,) * self.config.dim
+        return None
 
     def tune(self) -> HyperparameterTuningResult:
         optuna = self._load_optuna()
@@ -58,6 +65,12 @@ class HyperparameterAutotuner:
             sampler_kwargs["seed"] = self.config.seed
         sampler = optuna.samplers.TPESampler(**sampler_kwargs)
         study = optuna.create_study(direction="minimize", sampler=sampler)
+        default_vector = self._default_vector()
+        if default_vector is not None and hasattr(study, "enqueue_trial"):
+            study.enqueue_trial({
+                f"hyper_parameter_{index}": value
+                for index, value in enumerate(default_vector)
+            })
 
         def trial_objective(trial) -> float:
             vector = self._suggest_vector(trial)
@@ -82,7 +95,7 @@ class HyperparameterAutotuner:
             best_value = float(best_trial.value)
 
         best_vector = tuple(
-            int(best_trial.params[f"hyper_max_parallel_parameter_{index}"])
+            int(best_trial.params[f"hyper_parameter_{index}"])
             for index in range(self.config.dim)
         )
         return HyperparameterTuningResult(vector=best_vector, objective=best_value)

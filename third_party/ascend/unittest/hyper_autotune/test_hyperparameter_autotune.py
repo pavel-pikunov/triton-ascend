@@ -29,6 +29,7 @@ def _load_hyper_autotune_modules():
 
 
 _config_module, _tuner_module, _cache_module = _load_hyper_autotune_modules()
+HYPER_PARAMETER_COUNT = _config_module.HYPER_PARAMETER_COUNT
 HyperAutotuneConfig = _config_module.HyperAutotuneConfig
 HyperparameterAutotuner = _tuner_module.HyperparameterAutotuner
 HyperparameterTuningResult = _tuner_module.HyperparameterTuningResult
@@ -103,11 +104,11 @@ def test_config_from_env_enabled_parses_bounds_and_controls():
     config = HyperAutotuneConfig.from_env(
         {
             "TRITON_ASCEND_HYPER_AUTOTUNE": "1",
-            "TRITON_ASCEND_HYPER_AUTOTUNE_DIM": "2",
+            "TRITON_ASCEND_HYPER_AUTOTUNE_DIM": str(HYPER_PARAMETER_COUNT),
             "TRITON_ASCEND_HYPER_AUTOTUNE_TRIALS": "7",
             "TRITON_ASCEND_HYPER_AUTOTUNE_TIMEOUT_SEC": "3.5",
-            "TRITON_ASCEND_HYPER_AUTOTUNE_LOW": "2,4",
-            "TRITON_ASCEND_HYPER_AUTOTUNE_HIGH": "8,10",
+            "TRITON_ASCEND_HYPER_AUTOTUNE_LOW": "2",
+            "TRITON_ASCEND_HYPER_AUTOTUNE_HIGH": "10",
             "TRITON_ASCEND_HYPER_AUTOTUNE_SEED": "123",
             "TRITON_ASCEND_HYPER_AUTOTUNE_LOG": "true",
             "TRITON_ASCEND_HYPER_AUTOTUNE_FORCE": "yes",
@@ -115,18 +116,35 @@ def test_config_from_env_enabled_parses_bounds_and_controls():
     )
 
     assert config.enabled
-    assert config.dim == 2
+    assert config.dim == HYPER_PARAMETER_COUNT
     assert config.max_trials == 7
     assert config.timeout_sec == 3.5
-    assert config.low == (2, 4)
-    assert config.high == (8, 10)
+    assert config.low == (2,) * HYPER_PARAMETER_COUNT
+    assert config.high == (10,) * HYPER_PARAMETER_COUNT
     assert config.seed == 123
     assert config.log
     assert config.force
 
 
-def test_make_compiler_flags_returns_one_hyper_flag():
-    assert make_compiler_flags((3, 5, 7)) == ("--hyper-max-parallel-parameters=3,5,7",)
+def test_config_from_env_rejects_non_32_dim_for_hyper_parameters_flag():
+    with pytest.raises(ValueError, match="exactly 32"):
+        HyperAutotuneConfig.from_env(
+            {
+                "TRITON_ASCEND_HYPER_AUTOTUNE": "1",
+                "TRITON_ASCEND_HYPER_AUTOTUNE_DIM": "2",
+            }
+        )
+
+
+def test_make_compiler_flags_returns_hyper_parameters_flag_and_32_values():
+    vector = tuple(range(1, HYPER_PARAMETER_COUNT + 1))
+
+    assert make_compiler_flags(vector) == ("--hyper-parameters",) + tuple(str(value) for value in vector)
+
+
+def test_make_compiler_flags_rejects_non_32_value_vector():
+    with pytest.raises(ValueError, match="exactly 32"):
+        make_compiler_flags((1, 2, 3))
 
 
 def test_fake_objective_tuning_uses_bounds_trials_timeout_and_seed():
@@ -159,6 +177,43 @@ def test_fake_objective_tuning_uses_bounds_trials_timeout_and_seed():
     assert objective_calls == [(1, 1), (4, 3), (4, 4)]
     assert seed_holder == {"seed": 99}
     assert study_holder["study"].optimize_kwargs == {"n_trials": 3, "timeout": 9.0}
+
+
+
+
+def test_tuning_enqueues_all_ones_default_vector_when_supported():
+    class EnqueueStudy(_FakeStudy):
+        def __init__(self, vectors):
+            super().__init__(vectors)
+            self._queued_vectors = []
+
+        def enqueue_trial(self, params):
+            self._queued_vectors.append(tuple(params[f"hyper_parameter_{index}"] for index in range(len(params))))
+
+        def optimize(self, objective, n_trials, timeout):
+            self.optimize_kwargs = {"n_trials": n_trials, "timeout": timeout}
+            vectors = (self._queued_vectors + self._vectors)[:n_trials]
+            for vector in vectors:
+                trial = _FakeTrial(vector)
+                trial.value = objective(trial)
+                self.trials.append(trial)
+            finite_trials = [trial for trial in self.trials if trial.value != float("inf")]
+            self.best_trial = min(finite_trials, key=lambda trial: trial.value)
+
+    module = types.SimpleNamespace()
+    module.samplers = types.SimpleNamespace(TPESampler=lambda **kwargs: object())
+    module.create_study = lambda direction, sampler: EnqueueStudy([(2,)])
+    config = HyperAutotuneConfig(enabled=True, dim=1, max_trials=2, low=(1,), high=(3,))
+    objective_calls = []
+
+    result = HyperparameterAutotuner(
+        config,
+        lambda vector: objective_calls.append(vector) or float(vector[0]),
+        optuna_module=module,
+    ).tune()
+
+    assert objective_calls == [(1,), (2,)]
+    assert result.vector == (1,)
 
 
 def test_unseeded_tuning_does_not_seed_tpe_sampler():
