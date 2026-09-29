@@ -2158,6 +2158,7 @@ class AutoTilingTuner(Autotuner):
         return {cfg: run_fns[cfg] for cfg in valid_configs}
 
     def generate_key_and_configs(self, *args, **kwargs):
+        self._strict_benchmark_options = self._get_strict_benchmark_options()
         self.nargs = dict(zip(self.arg_names, args))
         self.is_simt_mode = (
             kwargs.get("force_simt_only", False)
@@ -2194,6 +2195,9 @@ class AutoTilingTuner(Autotuner):
         if dtype is None:
             raise NotImplementedError("Not support for non-Tensor inputs")
 
+        if self._strict_benchmark_options is not None:
+            from .._strict_benchmark import strict_cache_key
+            key.append(strict_cache_key(self._strict_benchmark_options))
         key = tuple(key)
         if key not in self.cache:
             if self.auto_gen_config:
@@ -2231,8 +2235,16 @@ class AutoTilingTuner(Autotuner):
                 self.configs = self.gen_configs + expanded_user_configs
         return key
 
+    def _get_strict_benchmark_options(self):
+        if not self.user_defined_do_bench and os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu-strict":
+            from .._strict_benchmark import options_from_env
+            return options_from_env()
+        return None
+
     def run(self, *args, **kwargs):
         key = self.generate_key_and_configs(*args, **kwargs)
+        if not hasattr(self, "_strict_benchmark_reports"):
+            self._strict_benchmark_reports = {}
         cache_miss = key not in self.cache
         if self.is_simt_mode and kwargs.get('simt_stack_limit', None) is None:
             kwargs['simt_stack_limit'] = self.simt_stack_limit
@@ -2250,6 +2262,8 @@ class AutoTilingTuner(Autotuner):
                 full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
                 self.pre_hook(full_nargs, reset_only=True)
                 self.configs_timings = timings
+                if self._strict_benchmark_options is not None:
+                    self._strict_benchmark_reports[key] = (self._strict_benchmark_result, list(timings))
                 config = self.cache[key]
             else:
                 config = pruned_configs[0]
@@ -2257,6 +2271,10 @@ class AutoTilingTuner(Autotuner):
             config = self.cache[key]
 
         self.best_config = config
+        if key in self._strict_benchmark_reports:
+            from .._strict_benchmark import report_results
+            report, measured_configs = self._strict_benchmark_reports[key]
+            report_results(report, [str(candidate) for candidate in measured_configs], self.print_autotuning)
 
         if self.print_autotuning and not used_cached_result:
             print(
@@ -2307,6 +2325,8 @@ class AutoTilingTuner(Autotuner):
     def _batch_bench(self, *args, configs, **kwargs):
         from triton.compiler.errors import CompileTimeAssertionFailure, MLIRCompilationError
         from triton.runtime.errors import OutOfResources
+
+        strict_options = self._get_strict_benchmark_options()
 
         kernels_call = {config: self._make_kernel_call(*args, config=config, **kwargs) for config in configs}
         run_fns = {}
@@ -2359,6 +2379,18 @@ class AutoTilingTuner(Autotuner):
 
         if len(run_fns) == 0:
             raise RuntimeError(f"No valid triton configs. {type(exc).__name__}: {exc} \nStack trace: {exc_stack}")
+
+        if strict_options is not None:
+            from .._strict_benchmark import run_strict_benchmark
+            result = run_strict_benchmark(
+                list(run_fns.values()),
+                strict_options,
+                target_kernel_names=[getattr(kernels_call[config], "target_kernel_name", None) for config in run_fns],
+                verbose=self.print_autotuning,
+                prepare_in_call=True,
+            )
+            self._strict_benchmark_result = result
+            return dict(zip(run_fns, result["timings"]))
 
         if len(run_fns) == 1:
             # we ignore expensive profiling method when only single config is left
@@ -2423,11 +2455,13 @@ class AutoTilingTuner(Autotuner):
             current.update(ub_cfg)
         full_nargs = {**self.nargs, **current}
 
-        def kernel_call(warmup):
+        def kernel_call(warmup, *, benchmark_prepare=None):
             if config.pre_hook:
                 config.pre_hook(full_nargs)
             self.pre_hook(full_nargs)
             try:
+                if benchmark_prepare is not None and not warmup:
+                    benchmark_prepare()
                 current.update({"warmup": warmup})
                 res = self.fn.run(
                     *args,

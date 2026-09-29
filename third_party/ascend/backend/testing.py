@@ -27,6 +27,28 @@ from typing import Optional
 import triton.runtime as runtime
 
 
+def do_bench_npu_strict(funcs, *, clear_l2_cache, warmup=25, active=150, measure_budget_ms=5.0, calibration_runs=10,
+                        max_attempts=5, prof_dir=None, keep_res=False, target_kernel_name=None):
+    """Return minimum central-half profiler means in ms, with quality-directed retries.
+
+    Explicit clear_l2_cache selects cold (True) or warmed, unflushed (False) L2.
+    active is a minimum; calibration sets one common count for the device budget.
+    target_kernel_name accepts a shared name or names aligned with the functions.
+    """
+    from ._strict_benchmark import run_strict_benchmark, report_results
+
+    funcs = funcs if isinstance(funcs, list) else [funcs]
+    names = ([target_kernel_name] * len(funcs)
+             if target_kernel_name is None or isinstance(target_kernel_name, str) else list(target_kernel_name))
+    options = dict(clear_l2_cache=clear_l2_cache, warmup=warmup, active=active, measure_budget_ms=measure_budget_ms,
+                   calibration_runs=calibration_runs, max_attempts=max_attempts)
+    verbose = os.getenv("TRITON_PRINT_AUTOTUNING") == "1"
+    result = run_strict_benchmark(funcs, options, target_kernel_names=names, prof_dir=prof_dir, keep_res=keep_res,
+                                  verbose=verbose)
+    report_results(result, verbose=verbose)
+    return result["timings"][0] if len(funcs) == 1 else result["timings"]
+
+
 class ProfilerResultMismatchError(RuntimeError):
     def __init__(self, target_kernel_name: str, expected_rows: int, actual_rows: int):
         self.target_kernel_name = target_kernel_name
@@ -46,6 +68,8 @@ def do_bench_npu(
     prof_dir=None,
     keep_res=False,
     target_kernel_name: Optional[str] = None,
+    _return_samples: bool = False,
+    _prepare_in_call: bool = False,
 ):
     import torch
     import torch_npu
@@ -83,6 +107,10 @@ def do_bench_npu(
         buffer.sum()
         torch.npu.synchronize()  # shake out of any npu error
 
+    def evict_cache():
+        buffer.sum()
+        torch.npu.synchronize()
+
     total = warmup + active
     with torch_npu.profiler.profile(
         activities=[torch_npu.profiler.ProfilerActivity.NPU],
@@ -96,10 +124,12 @@ def do_bench_npu(
     ) as prof:
         for fn in funcs:
             for _ in builtins.range(total):
-                if clear_l2_cache:
-                    buffer.sum()  # use buffer read to clear l2 cache
-                    torch.npu.synchronize()
-                fn()
+                if clear_l2_cache and _prepare_in_call:
+                    fn(benchmark_prepare=evict_cache)
+                else:
+                    if clear_l2_cache:
+                        evict_cache()
+                    fn()
                 torch.npu.synchronize()
     if clear_l2_cache:
         del buffer
@@ -112,6 +142,7 @@ def do_bench_npu(
             active,
             target_kernel_name=target_kernel_name,
             clear_l2_cache=clear_l2_cache,
+            _return_samples=_return_samples,
         )
     finally:
         _rm_dic(keep_res, torch_path)
@@ -133,6 +164,7 @@ def _collect_prof_result(
     num_active: int,
     target_kernel_name: Optional[str] = None,
     clear_l2_cache: bool = False,
+    _return_samples: bool = False,
 ):
     """
     Collect kernel performance from kernel_details.csv, returned in millisecond.
@@ -149,6 +181,10 @@ def _collect_prof_result(
     :param target_kernel_name: target triton kernel name reported by profiler
     :type target_kernel_name: Optional[str]
     """
+
+    if _return_samples:
+        from ._strict_benchmark import _read_profile
+        return _read_profile(base_dir, target_kernel_name, num_warmup, num_active, clear_l2_cache)
 
     import numpy as np
     import pandas as pd
