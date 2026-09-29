@@ -2090,6 +2090,9 @@ class AutoTilingTuner(Autotuner):
         return {cfg: run_fns[cfg] for cfg in valid_configs}
 
     def generate_key_and_configs(self, *args, **kwargs):
+        # Validate strict policy before generating configurations or probing a
+        # cache. A custom benchmarker retains precedence over the environment.
+        self._strict_benchmark_options = self._get_strict_benchmark_options()
         self.nargs = dict(zip(self.arg_names, args))
         compile_mode = kwargs.get("compile_mode", _DEFAULT_COMPILE_MODE)
         self.is_simt_mode = compile_mode == "simt_only"
@@ -2120,6 +2123,9 @@ class AutoTilingTuner(Autotuner):
         if dtype is None:
             raise NotImplementedError("Not support for non-Tensor inputs")
         key.append(("compile_mode", compile_mode))
+        if self._strict_benchmark_options is not None:
+            from .._strict_benchmark import strict_cache_key
+            key.append(strict_cache_key(self._strict_benchmark_options))
 
         key = tuple(key)
         if key not in self.cache:
@@ -2154,6 +2160,27 @@ class AutoTilingTuner(Autotuner):
             else:
                 self.configs = self.gen_configs + expanded_user_configs
         return key
+
+    def _get_strict_benchmark_options(self):
+        if (not self.user_defined_do_bench and os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu-strict"):
+            from .._strict_benchmark import options_from_env
+            return options_from_env()
+        return None
+
+    def _get_benchmark_metadata(self):
+        if getattr(self, "_strict_benchmark_options", None) is not None:
+            return self._strict_benchmark_result
+        return None
+
+    def _load_benchmark_metadata(self, metadata):
+        if getattr(self, "_strict_benchmark_options", None) is None:
+            return True
+        if not isinstance(metadata, dict) or not {"rows", "active", "timings", "cache_mode"}.issubset(metadata):
+            return False
+        if not metadata["timings"] or len(metadata["rows"]) != len(metadata["timings"]):
+            return False
+        self._strict_benchmark_result = metadata
+        return True
 
     @staticmethod
     def _inject_grid_num_tiles(kwargs):
@@ -2212,6 +2239,8 @@ class AutoTilingTuner(Autotuner):
         kwargs = _remove_deprecated_npu_options(kwargs)
         self._inject_grid_num_tiles(kwargs)
         key = self.generate_key_and_configs(*args, **kwargs)
+        if not hasattr(self, "_strict_benchmark_reports"):
+            self._strict_benchmark_reports = {}
         cache_miss = key not in self.cache
         did_benchmark = False
         disk_cache_hit = False
@@ -2237,6 +2266,8 @@ class AutoTilingTuner(Autotuner):
                     full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
                     self.pre_hook(full_nargs, reset_only=True)
                     self.configs_timings = timings
+                    if getattr(self, "_strict_benchmark_options", None) is not None:
+                        self._strict_benchmark_reports[key] = (self._strict_benchmark_result, list(timings))
                     self._record_user_timings(timings)
 
                 if self.cache_results:
@@ -2259,10 +2290,19 @@ class AutoTilingTuner(Autotuner):
 
         self.best_config = config
 
+        if disk_cache_hit and getattr(self, "_strict_benchmark_options", None) is not None:
+            self._strict_benchmark_reports[key] = (self._strict_benchmark_result, list(self.configs_timings))
+        strict_report = self._strict_benchmark_reports.get(key)
+        if strict_report is not None:
+            from .._strict_benchmark import report_results
+            report, measured_configs = strict_report
+            report_results(report, [str(candidate) for candidate in measured_configs], self.print_autotuning)
+
         if self.print_autotuning and did_benchmark:
             print(f"Triton autotuning for function {self.base_fn.__name__} finished after "
                   f"{self.bench_time:.2f}s; best config selected: {self.best_config};")
-            self._print_benchmark_results(self.configs_timings)
+            if strict_report is None:
+                self._print_benchmark_results(self.configs_timings)
 
         if did_benchmark and self.auto_profile_dir is not None:
             self._profile(*args, config=self.best_config, **kwargs)
@@ -2462,6 +2502,8 @@ class AutoTilingTuner(Autotuner):
         from triton.compiler.errors import CompileTimeAssertionFailure, MLIRCompilationError
         from triton.runtime.errors import OutOfResources
 
+        strict_options = self._get_strict_benchmark_options()
+
         kernels_call = {}
         for config in configs:
             try:
@@ -2556,6 +2598,21 @@ class AutoTilingTuner(Autotuner):
         if len(run_fns) == 0:
             raise RuntimeError(f"No valid triton configs. {type(exc).__name__}: {exc} \nStack trace: {exc_stack}")
 
+        if strict_options is not None:
+            from .._strict_benchmark import run_strict_benchmark
+
+            result = run_strict_benchmark(
+                list(run_fns.values()),
+                strict_options,
+                target_kernel_names=[getattr(kernels_call[config], "target_kernel_name", None) for config in run_fns],
+                verbose=self.print_autotuning,
+                prepare_in_call=True,
+            )
+            self._strict_benchmark_result = result
+            timings = dict(zip(run_fns, result["timings"]))
+            self._record_user_timings(timings)
+            return timings
+
         if len(run_fns) == 1:
             # we ignore expensive profiling method when only single config is left
             return {config: self._bench_config(config, fn) for config, fn in run_fns.items()}
@@ -2623,11 +2680,13 @@ class AutoTilingTuner(Autotuner):
             current.update(ub_cfg)
         full_nargs = {**self.nargs, **current}
 
-        def kernel_call(warmup):
+        def kernel_call(warmup, *, benchmark_prepare=None):
             if config.pre_hook:
                 config.pre_hook(full_nargs)
             self.pre_hook(full_nargs)
             try:
+                if benchmark_prepare is not None and not warmup:
+                    benchmark_prepare()
                 current.update({"warmup": warmup})
                 res = self.fn.run(
                     *args,

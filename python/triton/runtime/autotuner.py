@@ -167,6 +167,12 @@ class Autotuner(KernelInterface):
                 print(f"Autotuning failed with {e}")
             return [float("inf"), float("inf"), float("inf")]
 
+    def _get_benchmark_metadata(self):
+        return None
+
+    def _load_benchmark_metadata(self, metadata):
+        return True
+
     def check_disk_cache(self, tuning_key, configs, bench_fn):
         # We can't serialize prehooks, so just give up and run the benchmarks.
         if not tuning_key or any(cfg.pre_hook for cfg in configs):
@@ -193,15 +199,18 @@ class Autotuner(KernelInterface):
         path = cache.get_file(file_name)
         if path:
             with open(path, "r") as cached_configs:
-                timings = json.load(cached_configs)["configs_timings"]
-                timings = {Config(**config): timing for config, timing in timings}
+                data = json.load(cached_configs)
+            if self._load_benchmark_metadata(data.get("benchmark_metadata")):
+                timings = {Config(**config): timing for config, timing in data["configs_timings"]}
                 self.cache[tuning_key] = builtins.min(timings, key=timings.get)
                 self.configs_timings = timings
-            return True
+                return True
 
         bench_fn()
         cache.put(
             json.dumps({
+                "benchmark_metadata":
+                self._get_benchmark_metadata(),
                 "key":
                 tuning_key,
                 "configs_timings":
