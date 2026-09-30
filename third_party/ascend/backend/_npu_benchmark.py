@@ -23,8 +23,8 @@ COUNT_MINIMUMS = {
     "active": 1,
     "max_retries": 0,
     "calibration_runs": 2,
-    "prune_runs": 1,
-    "prune_recheck_runs": 1,
+    "slow_config_runs": 1,
+    "slow_config_recheck_runs": 1,
 }
 
 
@@ -42,10 +42,10 @@ class NpuBenchmarkOptions:
     max_retries: int = 0
     measure_budget_ms: float | None = None
     calibration_runs: int = 10
-    pruning: str = "existing"
-    prune_runs: int = 20
-    prune_recheck_runs: int = 40
-    prune_factor: float = 5.0
+    filter_slow_configs: bool = False
+    slow_config_runs: int = 20
+    slow_config_recheck_runs: int = 40
+    slow_config_factor: float = 5.0
     verbose: bool | None = None
 
     @property
@@ -59,11 +59,11 @@ class NpuBenchmarkOptions:
     def cache_key(self):
         policy = tuple(sorted(asdict(self).items()))
         thresholds = tuple(sorted(THRESHOLDS.items())) if self.quality_check else ()
-        return ("npu-benchmark", 1, policy, thresholds)
+        return ("npu-benchmark", 2, policy, thresholds)
 
 
 def resolve_options(arguments=None):
-    """Resolve each field independently: argument > environment > legacy default."""
+    """Resolve each field independently: argument > environment > default."""
     if arguments is not None and not isinstance(arguments, Mapping):
         raise TypeError("npu_bench_options must be a mapping")
     arguments = dict(arguments or {})
@@ -72,7 +72,7 @@ def resolve_options(arguments=None):
     if unknown:
         raise ValueError(f"Unknown NPU benchmark options: {', '.join(sorted(unknown))}")
 
-    float_fields = {"measure_budget_ms", "prune_factor"}
+    float_fields = {"measure_budget_ms", "slow_config_factor"}
     for name in values:
         if arguments.get(name) is not None:
             values[name] = arguments[name]
@@ -85,7 +85,7 @@ def resolve_options(arguments=None):
                 value = int(value)
             elif name in float_fields:
                 value = float(value)
-            elif name in {"quality_check", "verbose"}:
+            elif name in {"quality_check", "filter_slow_configs", "verbose"}:
                 normalized = value.strip().lower()
                 if normalized not in {"0", "1", "false", "true"}:
                     raise ValueError("expected 0, 1, false or true")
@@ -98,9 +98,7 @@ def resolve_options(arguments=None):
 
     if values["cache_mode"] not in (None, "hot", "cold"):
         raise ValueError("cache_mode must be 'hot' or 'cold'")
-    if values["pruning"] not in ("existing", "fast"):
-        raise ValueError("pruning must be 'existing' or 'fast'")
-    for name in ("quality_check", "verbose"):
+    for name in ("quality_check", "filter_slow_configs", "verbose"):
         if values[name] is not None and not isinstance(values[name], bool):
             raise ValueError(f"{name} must be a boolean")
     for name, minimum in COUNT_MINIMUMS.items():
@@ -114,12 +112,12 @@ def resolve_options(arguments=None):
         if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
                                   or not math.isfinite(value) or value <= 0):
             raise ValueError(f"{name} must be finite and positive")
-    if values["prune_factor"] < 1:
-        raise ValueError("prune_factor must be >= 1 to retain the fastest candidate")
+    if values["slow_config_factor"] < 1:
+        raise ValueError("slow_config_factor must be >= 1 to retain the fastest candidate")
     return NpuBenchmarkOptions(**values)
 
 
-def fast_prune(funcs, synchronize, options):
+def filter_slow_configs(funcs, synchronize, options):
     """Conservatively reject slow candidates using the best rough host time."""
     if len(funcs) < 2:
         return list(range(len(funcs)))
@@ -136,15 +134,15 @@ def fast_prune(funcs, synchronize, options):
             best = min(best, time.perf_counter() - start)
         return best
 
-    first = [measure(fn, options.prune_runs) for fn in funcs]
-    threshold = min(first) * options.prune_factor
+    first = [measure(fn, options.slow_config_runs) for fn in funcs]
+    threshold = min(first) * options.slow_config_factor
     return [i for i, value in enumerate(first)
-            if value <= threshold or measure(funcs[i], options.prune_recheck_runs) <= threshold]
+            if value <= threshold or measure(funcs[i], options.slow_config_recheck_runs) <= threshold]
 
 
 def benchmark_with_options(measure, funcs, names, options, *, warmup, active, prof_root, synchronize,
                            verbose=False, keep_res=False):
-    """Wrap the existing profiler with optional pruning, calibration and retries.
+    """Wrap the existing profiler with optional filtering, calibration and retries.
 
     measure returns device timestamps and durations (microseconds) per callable.
     Profiling errors can be retried; callable execution errors always propagate.
@@ -157,7 +155,9 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
         if verbose:
             print(f"npu benchmark: {message}")
 
-    indices = fast_prune(funcs, synchronize, options) if options.pruning == "fast" else list(range(len(funcs)))
+    indices = (filter_slow_configs(funcs, synchronize, options)
+               if options.filter_slow_configs else list(range(len(funcs))))
+    active_counts = [active] * len(funcs)
     costs = [float("inf")] * len(funcs)
     best_failures = [[] for _ in funcs]
     root = Path(prof_root)
@@ -200,33 +200,38 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
                 log(f"calibration attempt={attempt + 1}: {exc}")
                 if attempt == options.max_retries:
                     raise RuntimeError("NPU benchmark: no usable calibration samples") from exc
-        for _, durations in calibration:
+        for index, (_, durations) in zip(indices, calibration):
             required = options.measure_budget_ms * 1000 / float(np.mean(durations))
             if not math.isfinite(required):
                 raise ValueError("Unrepresentable NPU benchmark sample count")
-            active = max(active, math.ceil(required))
-        log(f"budget_ms={options.measure_budget_ms}, active={active}")
+            active_counts[index] = max(active, math.ceil(required))
+        log(f"budget_ms={options.measure_budget_ms}, active_per_config={active_counts}")
 
     pending = indices
     last_acquisition_error = None
     for attempt in range(options.max_retries + 1):
-        try:
-            samples = collect(pending, warmup, active)
-        except ProfilerAcquisitionError as exc:
-            last_acquisition_error = exc
-            log(f"attempt={attempt + 1}, configs={pending}: {exc}")
-            continue
+        groups = {}
+        for index in pending:
+            groups.setdefault(active_counts[index], []).append(index)
         retry = []
-        for index, (times, durations) in zip(pending, samples):
-            # Keep the existing NPU arithmetic mean for configuration ranking.
-            cost = float(np.mean(durations)) / 1000
-            metrics, failures = evaluate_quality(times, durations) if options.quality_check else ({}, [])
-            if cost < costs[index]:
-                costs[index], best_failures[index] = cost, failures
-            log(f"config={index}, attempt={attempt + 1}, cost_ms={cost:.8g}, "
-                f"metrics={metrics}, failures={failures}")
-            if failures:
-                retry.append(index)
+        for active_count, selected in groups.items():
+            try:
+                samples = collect(selected, warmup, active_count)
+            except ProfilerAcquisitionError as exc:
+                last_acquisition_error = exc
+                log(f"attempt={attempt + 1}, configs={selected}, active={active_count}: {exc}")
+                retry.extend(selected)
+                continue
+            for index, (times, durations) in zip(selected, samples):
+                # Keep the existing NPU arithmetic mean for configuration ranking.
+                cost = float(np.mean(durations)) / 1000
+                metrics, failures = evaluate_quality(times, durations) if options.quality_check else ({}, [])
+                if cost < costs[index]:
+                    costs[index], best_failures[index] = cost, failures
+                log(f"config={index}, attempt={attempt + 1}, active={active_count}, cost_ms={cost:.8g}, "
+                    f"metrics={metrics}, failures={failures}")
+                if failures:
+                    retry.append(index)
         pending = retry
         if not pending:
             break

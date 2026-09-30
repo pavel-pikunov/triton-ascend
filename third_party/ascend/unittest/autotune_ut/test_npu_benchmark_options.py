@@ -10,10 +10,11 @@ import os
 import sys
 import types
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Dict
 
 import numpy as np
 import pytest
@@ -46,7 +47,7 @@ def backend(monkeypatch):
     source = ast.parse((BACKEND / "runtime" / "autotuner.py").read_text(encoding="utf-8"))
     original = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "AutoTilingTuner")
     names = {"_get_npu_benchmark_options", "_npu_cache_pre_hook", "_make_kernel_call", "_batch_bench",
-             "_resolve_target_kernel_name", "generate_key_and_configs"}
+             "_resolve_target_kernel_name", "generate_key_and_configs", "_prune_by_time_limit"}
     methods = [node for node in original.body if isinstance(node, ast.FunctionDef) and node.name in names]
     for method in methods:
         method.body = [node for node in method.body if not (
@@ -55,7 +56,7 @@ def backend(monkeypatch):
     cls = ast.ClassDef(name="Tuner", bases=[], keywords=[], body=methods, decorator_list=[])
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     namespace = dict(__package__=PACKAGE + ".runtime", contextmanager=contextmanager, functools=functools,
-                     os=os, builtins=builtins, warnings=warnings, asdict=asdict,
+                     os=os, builtins=builtins, warnings=warnings, asdict=asdict, Any=Any, Dict=Dict, Config=Config,
                      get_byte_per_numel=lambda dtype: 4, CompileTimeAssertionFailure=type("CompileError", (Exception,), {}),
                      MLIRCompilationError=type("MLIRError", (Exception,), {}),
                      OutOfResources=type("ResourceError", (Exception,), {}))
@@ -69,17 +70,21 @@ def test_argument_overrides_environment_per_field(backend, monkeypatch):
     monkeypatch.setenv(policy.ENV_PREFIX + "QUALITY_CHECK", "true")
     monkeypatch.setenv(policy.ENV_PREFIX + "MAX_RETRIES", "invalid but overridden")
     monkeypatch.setenv(policy.ENV_PREFIX + "ACTIVE", "71")
-    options = policy.resolve_options(dict(cache_mode="cold", quality_check=False, max_retries=0))
+    monkeypatch.setenv(policy.ENV_PREFIX + "FILTER_SLOW_CONFIGS", "true")
+    options = policy.resolve_options(dict(cache_mode="cold", quality_check=False, max_retries=0,
+                                         filter_slow_configs=False))
     assert options.cache_mode == "cold"
     assert options.quality_check is False and options.max_retries == 0
     assert options.active == 71 and options.measure_budget_ms is None
-    assert options.pruning == "existing"
+    assert options.filter_slow_configs is False
 
 
 @pytest.mark.parametrize("options", [dict(quality_check=1), dict(active=True), dict(warmup=-1),
                                     dict(max_retries=-1), dict(measure_budget_ms=float("nan")),
-                                    dict(pruning="both"), dict(cache_mode="L1"), dict(unknown=1),
-                                    dict(quality_check=True, active=1), dict(prune_factor=0.5)])
+                                    dict(filter_slow_configs="true"), dict(cache_mode="L1"), dict(unknown=1),
+                                    dict(quality_check=True, active=1), dict(slow_config_factor=0.5),
+                                    dict(slow_config_runs=0), dict(slow_config_recheck_runs=0),
+                                    dict(pruning="fast")])
 def test_invalid_options(backend, options):
     with pytest.raises(ValueError):
         backend.policy.resolve_options(options)
@@ -89,10 +94,10 @@ def sample(duration=10, count=4):
     return np.arange(count, dtype=float) + 1, np.full(count, duration, dtype=float)
 
 
-def run_policy(backend, tmp_path, measure, options, funcs=None):
+def run_policy(backend, tmp_path, measure, options, funcs=None, names=None):
     funcs = funcs or [lambda: None, lambda: None]
     return backend.policy.benchmark_with_options(
-        measure, funcs, ["a", "b"][:len(funcs)], backend.policy.resolve_options(options),
+        measure, funcs, names or ["a", "b"][:len(funcs)], backend.policy.resolve_options(options),
         warmup=5, active=30, prof_root=tmp_path, synchronize=lambda: None,
     )
 
@@ -135,6 +140,68 @@ def test_budget_calibrates_without_enabling_quality(backend, tmp_path, monkeypat
 
     assert run_policy(backend, tmp_path, measure, dict(measure_budget_ms=1)) == [0.01, 0.01]
     assert calls == [(0, 10), (5, 100)]
+
+
+def test_budget_groups_individual_counts_and_preserves_candidate_order(backend, tmp_path):
+    durations = {"a": 10, "b": 1000, "c": 10}
+    calls, executed = [], []
+
+    def measure(funcs, names, warmup, active, directory):
+        calls.append((names, warmup, active))
+        for fn in funcs:
+            fn()
+        return [sample(durations[name], count=active) for name in names]
+
+    result = run_policy(backend, tmp_path, measure, dict(measure_budget_ms=5),
+                        funcs=[lambda name=name: executed.append(name) for name in durations], names=list(durations))
+    assert result == [0.01, 1, 0.01]
+    assert calls == [(["a", "b", "c"], 0, 10), (["a", "c"], 5, 500), (["b"], 5, 30)]
+    assert executed == ["a", "b", "c", "a", "c", "b"]
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure", ["quality", "acquisition"])
+@pytest.mark.parametrize("failed_group", ["small", "large"])
+def test_budget_retries_only_failed_candidates_with_their_counts(backend, tmp_path, monkeypatch,
+                                                                failure, failed_group):
+    durations = {"a": 10, "b": 1000, "c": 10}
+    calls = []
+    failure_call = 2 if failed_group == "small" else 3
+    failure_duration = 10 if failed_group == "small" else 1000
+    monkeypatch.setattr(backend.policy, "evaluate_quality",
+                        lambda t, d: ({}, ["bad"] if d[0] == failure_duration and len(calls) == failure_call else []))
+
+    def measure(funcs, names, warmup, active, directory):
+        calls.append((names, warmup, active))
+        if failure == "acquisition" and len(calls) == failure_call:
+            raise backend.policy.ProfilerAcquisitionError("missing rows")
+        return [sample(durations[name], count=active) for name in names]
+
+    warning = (pytest.warns(RuntimeWarning, match="selected config 0")
+               if failure == "quality" and failed_group == "small" else nullcontext())
+    with warning:
+        result = run_policy(backend, tmp_path, measure,
+                            dict(measure_budget_ms=5, quality_check=failure == "quality", max_retries=1),
+                            funcs=[lambda: None] * 3, names=["a", "b", "c"])
+    assert result == [0.01, 1, 0.01]
+    expected_retry = (["a", "c"], 5, 500) if failed_group == "small" else (["b"], 5, 30)
+    assert calls == [(["a", "b", "c"], 0, 10), (["a", "c"], 5, 500),
+                     (["b"], 5, 30), expected_retry]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_budget_calibration_retries_acquisition_failure(backend, tmp_path):
+    calls = []
+
+    def measure(funcs, names, warmup, active, directory):
+        calls.append((names, warmup, active))
+        if len(calls) == 1:
+            raise backend.policy.ProfilerAcquisitionError("missing calibration")
+        return [sample(10 if name == "a" else 1000, count=active) for name in names]
+
+    assert run_policy(backend, tmp_path, measure, dict(measure_budget_ms=5, max_retries=1)) == [0.01, 1]
+    assert calls == [(["a", "b"], 0, 10), (["a", "b"], 0, 10), (["a"], 5, 500), (["b"], 5, 30)]
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_acquisition_failure_is_retried(backend, tmp_path):
@@ -221,10 +288,19 @@ class Config:
         return {}
 
 
-@pytest.mark.parametrize("pruning", ["existing", "fast"])
-def test_pruning_strategies_are_exclusive(backend, monkeypatch, pruning):
+@pytest.mark.parametrize("filter_slow", [False, True])
+@pytest.mark.parametrize("counts", [{}, dict(active=30), dict(measure_budget_ms=5)])
+@pytest.mark.parametrize("source", ["argument", "environment"])
+def test_explicit_counts_bypass_cv_calculation_independently_of_filter(backend, monkeypatch,
+                                                                    filter_slow, counts, source):
     monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
-    tuner = make_tuner(backend, dict(pruning=pruning))
+    arguments = dict(filter_slow_configs=filter_slow)
+    if source == "argument":
+        arguments.update(counts)
+    else:
+        for name, value in counts.items():
+            monkeypatch.setenv(backend.policy.ENV_PREFIX + name.upper(), str(value))
+    tuner = make_tuner(backend, arguments)
     prunes, profiled = [], []
 
     def existing_prune(funcs):
@@ -240,21 +316,95 @@ def test_pruning_strategies_are_exclusive(backend, monkeypatch, pruning):
 
     monkeypatch.setattr(backend.testing, "do_bench_npu", profile)
     assert list(tuner._batch_bench(configs=[Config(), Config()]).values()) == [1, 2]
-    assert prunes == (["existing"] if pruning == "existing" else [])
+    assert prunes == ([] if counts else ["existing"])
     kwargs = profiled[0]
-    if pruning == "fast":
-        assert kwargs["npu_bench_options"]["pruning"] == "fast"
+    assert kwargs["npu_bench_options"]["filter_slow_configs"] is filter_slow
+    if counts:
         assert kwargs["warmup"] == 5 and kwargs["active"] == 30
     else:
-        assert backend.policy.resolve_options(kwargs["npu_bench_options"]).is_default
         assert kwargs["warmup"] == 8 and kwargs["active"] == 50
 
 
-def test_legacy_single_candidate_uses_existing_benchmarker(backend, monkeypatch):
+def test_default_single_candidate_uses_existing_benchmarker(backend, monkeypatch):
     monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
     tuner = make_tuner(backend)
     tuner.do_bench = lambda fn, quantiles: 7
     assert list(tuner._batch_bench(configs=[Config()]).values()) == [7]
+
+
+@pytest.mark.parametrize("source", ["argument", "environment"])
+def test_warmup_override_is_used_in_cv_time_estimate(backend, monkeypatch, source):
+    monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
+    tuner = make_tuner(backend, dict(warmup=0) if source == "argument" else None)
+    if source == "environment":
+        monkeypatch.setenv(backend.policy.ENV_PREFIX + "WARMUP", "0")
+    tuner.print_autotuning = False
+    tuner._rough_bench_once = lambda fn: 10000
+    profiled = []
+
+    def profile(funcs, **kwargs):
+        profiled.append((len(funcs), kwargs["warmup"], kwargs["active"]))
+        return [1] * len(funcs)
+
+    monkeypatch.setattr(backend.testing, "do_bench_npu", profile)
+    configs = [Config() for _ in range(12)]
+    assert len(tuner._batch_bench(configs=configs)) == 12
+    assert profiled == [(12, 0, 1)]
+
+
+def test_default_cv_calculation_preserves_counts_and_time_limit_pruning(backend, monkeypatch):
+    monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
+    tuner = make_tuner(backend)
+    tuner.print_autotuning = False
+    tuner._rough_bench_once = lambda fn: 10000
+    profiled = []
+
+    def profile(funcs, **kwargs):
+        profiled.append((len(funcs), kwargs["warmup"], kwargs["active"]))
+        return [1] * len(funcs)
+
+    monkeypatch.setattr(backend.testing, "do_bench_npu", profile)
+    assert len(tuner._batch_bench(configs=[Config() for _ in range(12)])) == 10
+    assert profiled == [(10, 1, 1)]
+
+
+@pytest.mark.parametrize("options", [dict(active=17), dict(measure_budget_ms=5)])
+def test_explicit_counts_reach_profiler_and_bypass_cv_candidate_cap(backend, monkeypatch, tmp_path, options):
+    monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
+    monkeypatch.setenv(backend.policy.ENV_PREFIX + "ACTIVE", "99")
+    # In the budget-only case leave active unspecified, retaining its default 30.
+    if "active" not in options:
+        monkeypatch.delenv(backend.policy.ENV_PREFIX + "ACTIVE")
+    tuner = make_tuner(backend, options)
+    tuner._prune_by_time_limit = lambda funcs: pytest.fail("unexpected CV count calculation")
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: None)))
+    backend.testing.runtime = SimpleNamespace(cache=SimpleNamespace(get_home_dir=lambda: str(tmp_path)))
+    calls = []
+
+    def profile(funcs, warmup, active, *args, **kwargs):
+        calls.append((len(funcs), warmup, active))
+        if kwargs.get("_return_samples"):
+            return [sample(1000, count=active) for _ in funcs]
+        return [1] * len(funcs)
+
+    monkeypatch.setattr(backend.testing, "_profile_npu", profile)
+    assert len(tuner._batch_bench(configs=[Config() for _ in range(12)])) == 12
+    assert calls == ([(12, 5, 17)] if "active" in options else [(12, 0, 10), (12, 5, 30)])
+
+
+def test_configured_single_cv_candidate_uses_default_counts(backend, monkeypatch):
+    monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
+    tuner = make_tuner(backend, dict(cache_mode="hot"))
+    tuner._prune_by_time_limit = lambda funcs: pytest.fail("cannot derive CV counts for one candidate")
+    calls = []
+
+    def profile(funcs, **kwargs):
+        calls.append((kwargs["warmup"], kwargs["active"]))
+        return 1
+
+    monkeypatch.setattr(backend.testing, "do_bench_npu", profile)
+    assert list(tuner._batch_bench(configs=[Config()]).values()) == [1]
+    assert calls == [(5, 30)]
 
 
 def test_pre_hook_composition_order_reset_only_and_restoration(backend):
@@ -276,7 +426,7 @@ def test_pre_hook_composition_order_reset_only_and_restoration(backend):
     assert tuner.pre_hook is original
 
 
-def test_cache_keys_track_effective_options_and_preserve_legacy_key(backend, monkeypatch):
+def test_cache_keys_track_effective_options_and_preserve_default_key(backend, monkeypatch):
     monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
     tuner = make_tuner(backend)
     tuner.keys = []
@@ -295,6 +445,13 @@ def test_cache_keys_track_effective_options_and_preserve_legacy_key(backend, mon
     assert hot_key != cold_key
     tuner.npu_bench_options = dict(cache_mode="cold", quality_check=True)
     assert tuner.generate_key_and_configs(tensor) not in (cold_key, hot_key)
+    tuner.npu_bench_options = dict(active=30)
+    explicit_count_key = tuner.generate_key_and_configs(tensor)
+    tuner.npu_bench_options = dict(active=30, filter_slow_configs=True)
+    filtered_key = tuner.generate_key_and_configs(tensor)
+    assert filtered_key != explicit_count_key
+    tuner.npu_bench_options = dict(active=30, filter_slow_configs=True, measure_budget_ms=5)
+    assert tuner.generate_key_and_configs(tensor) != filtered_key
 
 
 @pytest.mark.parametrize("failure_stage", ["eviction", "kernel"])
@@ -325,8 +482,8 @@ def test_other_methods_and_user_benchmarkers_ignore_npu_options(backend, monkeyp
     assert tuner._get_npu_benchmark_options() is None
 
 
-@pytest.mark.parametrize("mode", ["legacy", "cold", "hot"])
-def test_profiler_preserves_legacy_order_and_composes_explicit_cold(backend, monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize("mode", ["default", "cold", "hot"])
+def test_profiler_preserves_default_order_and_composes_explicit_cold(backend, monkeypatch, tmp_path, mode):
     events = []
     tuner = make_tuner(backend)
     tuner.pre_hook = original = lambda args, reset_only=False: events.append("user")
@@ -358,12 +515,12 @@ def test_profiler_preserves_legacy_order_and_composes_explicit_cold(backend, mon
         get_empty_cache_for_benchmark=lambda: Buffer(),
     )))
     monkeypatch.setattr(backend.testing, "_collect_prof_result", lambda *args, **kwargs: 2)
-    kwargs = {} if mode == "legacy" else dict(npu_bench_options=dict(cache_mode=mode),
+    kwargs = {} if mode == "default" else dict(npu_bench_options=dict(cache_mode=mode),
                                               _pre_hook_scope=tuner._npu_cache_pre_hook)
     assert backend.testing.do_bench_npu(fn, warmup=0, active=2, clear_l2_cache=True,
                                        prof_dir=str(tmp_path / "trace"), **kwargs) == 2
     measured = events[events.index("profile enter") + 1:events.index("profile exit")]
-    iteration = (["evict", "config", "user", "kernel"] if mode == "legacy" else
+    iteration = (["evict", "config", "user", "kernel"] if mode == "default" else
                  ["config", "user", "evict", "kernel"] if mode == "cold" else ["config", "user", "kernel"])
     assert measured == iteration * 2
     assert tuner.pre_hook is original
@@ -374,8 +531,8 @@ def test_profiler_preserves_legacy_order_and_composes_explicit_cold(backend, mon
 def test_explicit_defaults_do_not_reenable_environment_policies(backend, monkeypatch):
     monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
     monkeypatch.setenv(backend.policy.ENV_PREFIX + "QUALITY_CHECK", "true")
-    monkeypatch.setenv(backend.policy.ENV_PREFIX + "PRUNING", "fast")
-    tuner = make_tuner(backend, dict(quality_check=False, pruning="existing"))
+    monkeypatch.setenv(backend.policy.ENV_PREFIX + "FILTER_SLOW_CONFIGS", "true")
+    tuner = make_tuner(backend, dict(quality_check=False, filter_slow_configs=False))
 
     def existing_prune(funcs):
         tuner.cv_warmup, tuner.cv_repeat = 5, 30
@@ -393,7 +550,7 @@ def test_explicit_defaults_do_not_reenable_environment_policies(backend, monkeyp
     assert len(calls) == 1 and "_return_samples" not in calls[0]
 
 
-def test_fast_prune_rechecks_slow_candidates_and_preserves_result_alignment(backend, monkeypatch, tmp_path):
+def test_slow_config_filter_rechecks_candidates_and_preserves_result_alignment(backend, monkeypatch, tmp_path):
     clock, calls = [0.0], [0, 0]
     monkeypatch.setattr(backend.policy.time, "perf_counter", lambda: clock[0])
 
@@ -410,7 +567,45 @@ def test_fast_prune_rechecks_slow_candidates_and_preserves_result_alignment(back
         return [sample()]
 
     costs = run_policy(backend, tmp_path, measure,
-                       dict(pruning="fast", prune_runs=2, prune_recheck_runs=3),
+                       dict(filter_slow_configs=True, slow_config_runs=2, slow_config_recheck_runs=3),
                        funcs=[candidate(0, 1), candidate(1, 8)])
     assert costs == [0.01, float("inf")]
     assert measured == [["a"]] and calls == [3, 6]
+
+
+def test_disabled_slow_filter_is_not_called(backend, monkeypatch, tmp_path):
+    monkeypatch.setattr(backend.policy, "filter_slow_configs", lambda *args: pytest.fail("filter unexpectedly enabled"))
+    assert run_policy(backend, tmp_path, lambda *args: [sample(), sample()],
+                      dict(quality_check=True)) == [0.01, 0.01]
+
+
+@pytest.mark.parametrize("explicit_counts", [False, True])
+def test_slow_filter_operates_on_candidates_remaining_after_cv_estimate(backend, monkeypatch, tmp_path,
+                                                                      explicit_counts):
+    monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
+    options = dict(filter_slow_configs=True)
+    if explicit_counts:
+        options["measure_budget_ms"] = 5
+    tuner = make_tuner(backend, options)
+    tuner.print_autotuning = False
+    tuner._rough_bench_once = lambda fn: 10000
+    configs = [Config() for _ in range(12)]
+    filtered, profiled = [], []
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: None)))
+    backend.testing.runtime = SimpleNamespace(cache=SimpleNamespace(get_home_dir=lambda: str(tmp_path)))
+
+    def filter_candidates(funcs, synchronize, options):
+        filtered.append(len(funcs))
+        return [1, len(funcs) - 1]
+
+    def profile(funcs, warmup, active, *args, **kwargs):
+        profiled.append((len(funcs), warmup, active))
+        return [sample(1000, count=active) for _ in funcs]
+
+    monkeypatch.setattr(backend.policy, "filter_slow_configs", filter_candidates)
+    monkeypatch.setattr(backend.testing, "_profile_npu", profile)
+    costs = tuner._batch_bench(configs=configs)
+    assert filtered == ([12] if explicit_counts else [10])
+    assert profiled == ([(2, 0, 10), (2, 5, 30)] if explicit_counts else [(2, 1, 1)])
+    kept = [config for config, cost in costs.items() if np.isfinite(cost)]
+    assert kept == [configs[1], configs[11 if explicit_counts else 9]]
