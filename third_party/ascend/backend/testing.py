@@ -80,8 +80,8 @@ def do_bench_npu(
     verbose = options.verbose if options.verbose is not None else os.getenv("TRITON_PRINT_AUTOTUNING") == "1"
     if verbose:
         print(f"npu benchmark: cache={'cold' if clear_l2_cache else 'hot'}, warmup={warmup}, active={active}, "
-              f"quality_check={options.quality_check}, pruning={options.pruning}")
-    if not options.needs_samples and options.pruning == "existing":
+              f"quality_check={options.quality_check}, filter_slow_configs={options.filter_slow_configs}")
+    if not options.needs_samples and not options.filter_slow_configs:
         return _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
                             _pre_hook_scope=_pre_hook_scope)
 
@@ -266,7 +266,7 @@ def _collect_prof_result(
         samples = _read_profile_samples(base_dir, target_kernel_name, num_warmup, num_active, clear_l2_cache)
         if _return_samples:
             return samples
-        # Per-configuration names use the same arithmetic mean as the legacy
+        # Per-configuration names use the same arithmetic mean as the existing
         # shared-name collector, while excluding unrelated preparation kernels.
         costs = [float(durations.mean()) / 1000 for _, durations in samples]
         return costs[0] if len(funcs) == 1 else costs

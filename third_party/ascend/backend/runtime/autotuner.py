@@ -2119,7 +2119,7 @@ class AutoTilingTuner(Autotuner):
             )
             return float("inf")
 
-    def _prune_by_time_limit(self, run_fns: Dict[Config, Any]) -> Dict[Config, Any]:
+    def _prune_by_time_limit(self, run_fns: Dict[Config, Any], *, warmup=None) -> Dict[Config, Any]:
         time_limit = 200
 
         if len(run_fns) <= 1:
@@ -2132,7 +2132,7 @@ class AutoTilingTuner(Autotuner):
         sorted_configs = sorted(rough_timings.keys(), key=lambda c: rough_timings[c])
 
         fastest_time = rough_timings[sorted_configs[0]]
-        n_warmup = max(1, int(25 / fastest_time))
+        n_warmup = max(1, int(25 / fastest_time)) if warmup is None else warmup
         n_repeat = max(1, int(100 / fastest_time))
         self.cv_warmup = n_warmup
         self.cv_repeat = n_repeat
@@ -2404,9 +2404,18 @@ class AutoTilingTuner(Autotuner):
             # we ignore expensive profiling method when only single config is left
             return {config: self.do_bench(fn, quantiles=(0.5, 0.2, 0.8)) for config, fn in run_fns.items()}
 
-        use_existing_pruning = npu_options is None or npu_options.pruning == "existing"
-        if use_existing_pruning and (self.parser_mode in ("cube", "mix") and self.cv_parse_result is not None):
-            run_fns = self._prune_by_time_limit(run_fns)
+        use_existing_counts = npu_options is None or (
+            npu_options.active is None and npu_options.measure_budget_ms is None
+        )
+        cv_mode = (
+            use_existing_counts and len(run_fns) > 1
+            and self.parser_mode in ("cube", "mix") and self.cv_parse_result is not None
+        )
+        if cv_mode:
+            if npu_options is not None and npu_options.warmup is not None:
+                run_fns = self._prune_by_time_limit(run_fns, warmup=npu_options.warmup)
+            else:
+                run_fns = self._prune_by_time_limit(run_fns)
 
         use_profiling = os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu"
         # Respect user-provided benchmarkers even when NPU profiling mode is enabled.
@@ -2414,12 +2423,11 @@ class AutoTilingTuner(Autotuner):
         if use_npu_profiling:
             from ..testing import ProfilerResultMismatchError, do_bench_npu
 
-            cv_mode = use_existing_pruning and self.parser_mode in ("cube", "mix") and self.cv_parse_result is not None
             warmup = self.cv_warmup if cv_mode else 5
             active = self.cv_repeat if cv_mode else 30
             target_kernel_name = self._resolve_target_kernel_name(kernels_call, run_fns.keys())
             # Forward resolved values even when arguments explicitly restore a
-            # legacy default: the profiler must not reapply a conflicting env.
+            # default: the profiler must not reapply a conflicting env.
             benchmark_kwargs = {"npu_bench_options": asdict(npu_options)}
             if configured_npu:
                 if npu_options.cache_mode == "cold":
@@ -2852,10 +2860,13 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
         TRITON_BENCH_METHOD=npu and the built-in benchmarker. Fields override
         TRITON_NPU_BENCH_* independently: cache_mode ('hot'/'cold'), warmup,
         active (launch counts), quality_check, max_retries (additional attempts),
-        measure_budget_ms, calibration_runs, pruning ('existing'/'fast'),
-        prune_runs, prune_recheck_runs, prune_factor, and verbose.
+        measure_budget_ms, calibration_runs, filter_slow_configs,
+        slow_config_runs, slow_config_recheck_runs, slow_config_factor, and verbose.
+        Explicit active or measure_budget_ms bypasses the existing CV count
+        calculation and time-limit pruning. A budget sets a per-candidate count
+        with active as the minimum (30 when unspecified).
         Unset fields preserve existing behavior; quality checks do not enable
-        retries, calibration, or fast pruning automatically.
+        retries, calibration, or slow-configuration filtering automatically.
     """
 
     def decorator(fn):

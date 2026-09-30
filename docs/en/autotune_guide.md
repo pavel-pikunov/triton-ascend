@@ -309,7 +309,7 @@ these autotuner policies.
         "max_retries": 4,
         "active": 150,
         "measure_budget_ms": 5.0,
-        "pruning": "fast",
+        "filter_slow_configs": True,
     },
 )
 @triton.jit
@@ -318,31 +318,55 @@ def kernel(x, y, N, BLOCK: tl.constexpr):
 ```
 
 All policies are independent and optional. Enabling quality checks does not
-enable retries, calibration or fast pruning, or change launch counts and cache
-state. Without new settings, autotuning retains cold L2 and the existing
-measurement counts (normally 5 warmup and 30 active launches; CV pruning may
-derive its own counts). Standalone `do_bench_npu` retains its existing
+enable retries, calibration or slow-configuration filtering, or change launch
+counts and cache state. Without new settings, autotuning retains cold L2 and the
+existing measurement counts (normally 5 warmup and 30 active launches; the CV
+time estimate may derive its own counts). Standalone `do_bench_npu` retains its existing
 `clear_l2_cache=False` default unless `cache_mode` is specified.
 
 | Mapping field | Environment variable | Default / meaning |
 | --- | --- | --- |
 | `cache_mode` | `TRITON_NPU_BENCH_CACHE_MODE` | Inherit existing cache setting. `cold` evicts L2; `hot` warms up and repeats without eviction. |
-| `warmup` | `TRITON_NPU_BENCH_WARMUP` | Inherit existing warmup launch count; integer >= 0. |
-| `active` | `TRITON_NPU_BENCH_ACTIVE` | Inherit existing measured launch count; integer >= 1, or >= 2 with quality checks. |
+| `warmup` | `TRITON_NPU_BENCH_WARMUP` | Inherit existing warmup launch count; integer >= 0. With explicit `active` or a budget, defaults to `5` in autotuning. |
+| `active` | `TRITON_NPU_BENCH_ACTIVE` | Inherit existing measured launch count; integer >= 1, or >= 2 with quality checks. With a budget, defaults to `30` in autotuning and sets the minimum count per candidate. |
 | `quality_check` | `TRITON_NPU_BENCH_QUALITY_CHECK` | `False`; evaluate predefined sample-quality metrics. |
 | `max_retries` | `TRITON_NPU_BENCH_MAX_RETRIES` | `0`; additional attempts for failed quality checks or unusable profiler data. |
 | `measure_budget_ms` | `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | Unset; optional minimum accumulated device time per candidate, not a wall-clock timeout. |
 | `calibration_runs` | `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; used only when a measurement budget is supplied. |
-| `pruning` | `TRITON_NPU_BENCH_PRUNING` | `existing` uses the current time-limit pruning where applicable; `fast` replaces it with conservative rough host-time pruning. |
-| `prune_runs` | `TRITON_NPU_BENCH_PRUNE_RUNS` | `20`; initial rough launches for `fast` pruning. |
-| `prune_recheck_runs` | `TRITON_NPU_BENCH_PRUNE_RECHECK_RUNS` | `40`; recheck slow candidates before excluding them. |
-| `prune_factor` | `TRITON_NPU_BENCH_PRUNE_FACTOR` | `5.0`, >= 1; candidates above this multiple of the best rough time are rechecked. |
+| `filter_slow_configs` | `TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS` | `False`; independently exclude especially slow candidates using rough host timings. |
+| `slow_config_runs` | `TRITON_NPU_BENCH_SLOW_CONFIG_RUNS` | `20`; initial rough launches for slow-configuration filtering. |
+| `slow_config_recheck_runs` | `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_RUNS` | `40`; recheck slow candidates before excluding them. |
+| `slow_config_factor` | `TRITON_NPU_BENCH_SLOW_CONFIG_FACTOR` | `5.0`, >= 1; candidates above this multiple of the best rough time are rechecked. |
 | `verbose` | `TRITON_NPU_BENCH_VERBOSE` | Inherit `TRITON_PRINT_AUTOTUNING`; print policy and per-attempt diagnostics. |
 
 Boolean environment values accept `0`, `1`, `false`, and `true`. Generic
-`prune_configs` still runs first. The two time-based pruning strategies are
-exclusive; quality checks do not select a pruning strategy. Fast pruning uses
-rough host timings, including synchronization, before the profiler measurements.
+`prune_configs` still runs first. Without explicit `active` or
+`measure_budget_ms`, applicable CV cases retain the existing calculation of
+`cv_warmup/cv_repeat` and candidate pruning by an estimated 200-second measurement
+cost. This estimate is not a strict timeout for the whole autotuning process.
+An explicit `warmup` alone preserves that calculation and is included in the
+time estimate.
+
+An explicit `active` or `measure_budget_ms` from the mapping or environment
+bypasses both the CV count calculation and its time-limit candidate pruning.
+Even `active=30` selects this behavior; internally derived counts do not.
+Unspecified autotuning counts then default to `warmup=5` and `active=30`.
+Standalone profiling retains its `warmup` and `active` arguments as defaults.
+
+Slow-configuration filtering is independent of count selection. If enabled,
+it runs on the remaining candidates before calibration and profiling. It uses
+the best rough host time, including synchronization, and rechecks candidates
+above `slow_config_factor` times the best candidate's time before excluding them.
+
+With a budget, calibration determines `duration_i_ms` for each candidate, then
+`active_i = max(active, ceil(measure_budget_ms / duration_i_ms))`. For example,
+`active=30` and a `5 ms` budget give candidates taking `0.01 ms` and `1 ms`
+respectively **500 and 30 measured launches**. Candidates with the same count
+are profiled together; retries retain each candidate's calculated count.
+
+The former `pruning`, `prune_runs`, `prune_recheck_runs`, and `prune_factor`
+mapping fields and their `TRITON_NPU_BENCH_*` variables are replaced by the
+slow-configuration options above.
 
 An explicit `cache_mode="cold"` composes cache eviction after the autotuner's
 existing preparation hooks during profiling. Those hooks and the `kernel_call`
