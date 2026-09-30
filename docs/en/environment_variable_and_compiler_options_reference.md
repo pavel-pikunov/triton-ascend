@@ -48,6 +48,7 @@ The following table describes how to set environment variables.
 | **Running and scheduling**| ENABLE_PRINT_UB_BITS | **0** or not set| After this parameter is enabled, the current UB usage can be obtained for the inductor.| **0**: Disabled.<br>**1**: Enabled.| |
 | **Running and scheduling** | NPU_DEVICE_LIMIT | Not set | Users can set the maximum number of ai cores and vector cores for operator runtime. Format: numbers separated by commas.Example:14,28.| No default value | |
 | **Others**| TRITON_BENCH_METHOD | Not set| When the Ascend NPU is used, change `do_bench` in `testing.py` to `do_bench_npu`. (This parameter is used when `INDUCTOR_ASCEND_AGGRESSIVE_AUTOTUNE` is set to `1`.) If this parameter is set to `default`, the original `do_bench` function is still called even if the NPU is available.| **"npu"**: Switch to `do_bench_npu`.| |
+| **NPU benchmarking** | TRITON_NPU_BENCH_* | Not set | Optional L2 state, sample counts, quality checks, retries, measurement budget, pruning and logging for the NPU benchmark. | See [NPU benchmark policies](autotune_guide.md#optional-npu-benchmark-policies). Explicit `npu_bench_options` fields override env values. | Unset fields retain existing behavior. |
 | **Others**| TRITON_REMOTE_RUN_CONFIG_PATH | path | Specifies the configuration path for remote running.| Specify the path directly.| |
 
 ## Compiler Options

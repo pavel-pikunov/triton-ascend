@@ -33,6 +33,7 @@ import pprint
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import itertools
 from collections.abc import Sequence
 from dataclasses import asdict, is_dataclass
@@ -252,6 +253,7 @@ class AutoTilingTuner(Autotuner):
         do_bench=None,
         auto_profile_dir=None,
         hints=None,
+        npu_bench_options=None,
     ):
         """
         :param key: a list of argument names whose runtime value changes invalidate the autotune cache
@@ -281,6 +283,7 @@ class AutoTilingTuner(Autotuner):
             do_bench,
         )
         self.user_defined_do_bench = do_bench is not None
+        self.npu_bench_options = copy.copy(npu_bench_options)
         self.hints = reserved_hints
         self.config_hints = config_hints
         self.vv_parser_v2_mode = resolve_vv_parser_v2_mode(self.hints)
@@ -2158,7 +2161,7 @@ class AutoTilingTuner(Autotuner):
         return {cfg: run_fns[cfg] for cfg in valid_configs}
 
     def generate_key_and_configs(self, *args, **kwargs):
-        self._strict_benchmark_options = self._get_strict_benchmark_options()
+        self._npu_benchmark_options = self._get_npu_benchmark_options()
         self.nargs = dict(zip(self.arg_names, args))
         self.is_simt_mode = (
             kwargs.get("force_simt_only", False)
@@ -2195,9 +2198,8 @@ class AutoTilingTuner(Autotuner):
         if dtype is None:
             raise NotImplementedError("Not support for non-Tensor inputs")
 
-        if self._strict_benchmark_options is not None:
-            from .._strict_benchmark import strict_cache_key
-            key.append(strict_cache_key(self._strict_benchmark_options))
+        if self._npu_benchmark_options is not None and not self._npu_benchmark_options.is_default:
+            key.append(self._npu_benchmark_options.cache_key())
         key = tuple(key)
         if key not in self.cache:
             if self.auto_gen_config:
@@ -2235,16 +2237,39 @@ class AutoTilingTuner(Autotuner):
                 self.configs = self.gen_configs + expanded_user_configs
         return key
 
-    def _get_strict_benchmark_options(self):
-        if not self.user_defined_do_bench and os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu-strict":
-            from .._strict_benchmark import options_from_env
-            return options_from_env()
+    def _get_npu_benchmark_options(self):
+        if not self.user_defined_do_bench and os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu":
+            from .._npu_benchmark import resolve_options
+            return resolve_options(self.npu_bench_options)
         return None
+
+    @contextmanager
+    def _npu_cache_pre_hook(self, evict_cache):
+        """Compose measurement preparation after both existing kernel hooks."""
+        original = self.pre_hook
+
+        def pre_hook(args, reset_only=False):
+            if reset_only:
+                return original(args, reset_only=True)
+            original(args)
+            try:
+                evict_cache()
+            except Exception as exc:
+                # Preparation may have saved tensors for restore_value. Pair
+                # it with the existing cleanup even if eviction prevents launch.
+                try:
+                    self.post_hook(args, exception=exc)
+                finally:
+                    raise
+
+        self.pre_hook = pre_hook
+        try:
+            yield
+        finally:
+            self.pre_hook = original
 
     def run(self, *args, **kwargs):
         key = self.generate_key_and_configs(*args, **kwargs)
-        if not hasattr(self, "_strict_benchmark_reports"):
-            self._strict_benchmark_reports = {}
         cache_miss = key not in self.cache
         if self.is_simt_mode and kwargs.get('simt_stack_limit', None) is None:
             kwargs['simt_stack_limit'] = self.simt_stack_limit
@@ -2262,8 +2287,6 @@ class AutoTilingTuner(Autotuner):
                 full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
                 self.pre_hook(full_nargs, reset_only=True)
                 self.configs_timings = timings
-                if self._strict_benchmark_options is not None:
-                    self._strict_benchmark_reports[key] = (self._strict_benchmark_result, list(timings))
                 config = self.cache[key]
             else:
                 config = pruned_configs[0]
@@ -2271,10 +2294,6 @@ class AutoTilingTuner(Autotuner):
             config = self.cache[key]
 
         self.best_config = config
-        if key in self._strict_benchmark_reports:
-            from .._strict_benchmark import report_results
-            report, measured_configs = self._strict_benchmark_reports[key]
-            report_results(report, [str(candidate) for candidate in measured_configs], self.print_autotuning)
 
         if self.print_autotuning and not used_cached_result:
             print(
@@ -2326,7 +2345,7 @@ class AutoTilingTuner(Autotuner):
         from triton.compiler.errors import CompileTimeAssertionFailure, MLIRCompilationError
         from triton.runtime.errors import OutOfResources
 
-        strict_options = self._get_strict_benchmark_options()
+        npu_options = self._get_npu_benchmark_options()
 
         kernels_call = {config: self._make_kernel_call(*args, config=config, **kwargs) for config in configs}
         run_fns = {}
@@ -2380,23 +2399,13 @@ class AutoTilingTuner(Autotuner):
         if len(run_fns) == 0:
             raise RuntimeError(f"No valid triton configs. {type(exc).__name__}: {exc} \nStack trace: {exc_stack}")
 
-        if strict_options is not None:
-            from .._strict_benchmark import run_strict_benchmark
-            result = run_strict_benchmark(
-                list(run_fns.values()),
-                strict_options,
-                target_kernel_names=[getattr(kernels_call[config], "target_kernel_name", None) for config in run_fns],
-                verbose=self.print_autotuning,
-                prepare_in_call=True,
-            )
-            self._strict_benchmark_result = result
-            return dict(zip(run_fns, result["timings"]))
-
-        if len(run_fns) == 1:
+        configured_npu = npu_options is not None and not npu_options.is_default
+        if len(run_fns) == 1 and not configured_npu:
             # we ignore expensive profiling method when only single config is left
             return {config: self.do_bench(fn, quantiles=(0.5, 0.2, 0.8)) for config, fn in run_fns.items()}
 
-        if (self.parser_mode in ("cube", "mix") and self.cv_parse_result is not None):
+        use_existing_pruning = npu_options is None or npu_options.pruning == "existing"
+        if use_existing_pruning and (self.parser_mode in ("cube", "mix") and self.cv_parse_result is not None):
             run_fns = self._prune_by_time_limit(run_fns)
 
         use_profiling = os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu"
@@ -2405,10 +2414,18 @@ class AutoTilingTuner(Autotuner):
         if use_npu_profiling:
             from ..testing import ProfilerResultMismatchError, do_bench_npu
 
-            cv_mode = self.parser_mode in ("cube", "mix") and self.cv_parse_result is not None
+            cv_mode = use_existing_pruning and self.parser_mode in ("cube", "mix") and self.cv_parse_result is not None
             warmup = self.cv_warmup if cv_mode else 5
             active = self.cv_repeat if cv_mode else 30
             target_kernel_name = self._resolve_target_kernel_name(kernels_call, run_fns.keys())
+            # Forward resolved values even when arguments explicitly restore a
+            # legacy default: the profiler must not reapply a conflicting env.
+            benchmark_kwargs = {"npu_bench_options": asdict(npu_options)}
+            if configured_npu:
+                if npu_options.cache_mode == "cold":
+                    benchmark_kwargs["_pre_hook_scope"] = self._npu_cache_pre_hook
+                target_kernel_name = [getattr(kernels_call[config], "target_kernel_name", None)
+                                      for config in run_fns]
             try:
                 time_cost = do_bench_npu(
                     list(run_fns.values()),
@@ -2416,10 +2433,17 @@ class AutoTilingTuner(Autotuner):
                     active=active,
                     clear_l2_cache=True,
                     target_kernel_name=target_kernel_name,
+                    **benchmark_kwargs,
                 )
+                if len(run_fns) == 1:
+                    time_cost = [time_cost]
                 assert len(time_cost) == len(run_fns)
                 return {config: cost for config, cost in zip(run_fns.keys(), time_cost)}
             except ProfilerResultMismatchError as exc:
+                if configured_npu:
+                    # A requested cache/measurement policy must not silently fall
+                    # back to event timing with different measurement conditions.
+                    raise
                 warnings.warn(
                     "Filtered profiler rows do not match the expected count for autotune benchmarking; "
                     f"target_kernel_name={exc.target_kernel_name!r}, expected_rows={exc.expected_rows}, "
@@ -2455,13 +2479,11 @@ class AutoTilingTuner(Autotuner):
             current.update(ub_cfg)
         full_nargs = {**self.nargs, **current}
 
-        def kernel_call(warmup, *, benchmark_prepare=None):
+        def kernel_call(warmup):
             if config.pre_hook:
                 config.pre_hook(full_nargs)
             self.pre_hook(full_nargs)
             try:
-                if benchmark_prepare is not None and not warmup:
-                    benchmark_prepare()
                 current.update({"warmup": warmup})
                 res = self.fn.run(
                     *args,
@@ -2767,7 +2789,8 @@ class AutoTilingTuner(Autotuner):
 
 
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
-             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, *, auto_prof_dir=None, hints=None):
+             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, *, auto_prof_dir=None, hints=None,
+             npu_bench_options=None):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -2825,12 +2848,21 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
         If this parameter is None or the best config is retrieved from cache, the profiling process will be ignored.
     :type auto_prof_dir: str
     :param hints: a dict of autotune hint auguments passed to AutoTilingTuner.
+    :param npu_bench_options: optional NPU profiling policies, used only with
+        TRITON_BENCH_METHOD=npu and the built-in benchmarker. Fields override
+        TRITON_NPU_BENCH_* independently: cache_mode ('hot'/'cold'), warmup,
+        active (launch counts), quality_check, max_retries (additional attempts),
+        measure_budget_ms, calibration_runs, pruning ('existing'/'fast'),
+        prune_runs, prune_recheck_runs, prune_factor, and verbose.
+        Unset fields preserve existing behavior; quality checks do not enable
+        retries, calibration, or fast pruning automatically.
     """
 
     def decorator(fn):
         return AutoTilingTuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                                post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
-                               use_cuda_graph=use_cuda_graph, do_bench=do_bench, auto_profile_dir=auto_prof_dir, hints=hints)
+                               use_cuda_graph=use_cuda_graph, do_bench=do_bench, auto_profile_dir=auto_prof_dir, hints=hints,
+                               npu_bench_options=npu_bench_options)
 
     return decorator
 
@@ -3150,7 +3182,7 @@ def get_max_configs(config, kernel_type="mixcv", **kwargs):
 def max_autotune(configs, key, kernel_type="mixcv",
                  prune_configs_by=None, reset_to_zero=None, restore_value=None,
                  pre_hook=None, post_hook=None, warmup=None, rep=None,
-                 use_cuda_graph=False, do_bench=None, **tuning_params):
+                 use_cuda_graph=False, do_bench=None, npu_bench_options=None, **tuning_params):
     """
     Decorator that expands each base Config with tuning parameters before auto-tuning.
 
@@ -3170,6 +3202,7 @@ def max_autotune(configs, key, kernel_type="mixcv",
     :param rep: Deprecated.
     :param use_cuda_graph: Deprecated.
     :param do_bench: Same as in autotune.
+    :param npu_bench_options: Same as in autotune.
     :param tuning_params: Additional tuning parameters as keyword arguments.
                           Each value must be a list; the Cartesian product of these lists
                           will be combined with each base config.
@@ -3196,6 +3229,7 @@ def max_autotune(configs, key, kernel_type="mixcv",
             warmup=warmup,
             rep=rep,
             use_cuda_graph=use_cuda_graph,
-            do_bench=do_bench
+            do_bench=do_bench,
+            npu_bench_options=npu_bench_options,
         )(fn)
     return decorator

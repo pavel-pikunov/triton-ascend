@@ -289,9 +289,84 @@ This means:
 - non-tiling parameters or compilation parameters (such as GROUP_SIZE_M and multibuffer) are provided explicitly by the user through `hints`;
 - autotune evaluates the combined search space of both parts.
 
+## Optional NPU benchmark policies
+
+With `TRITON_BENCH_METHOD=npu`, the built-in NPU profiler can be configured through
+`npu_bench_options` on `autotune` or `max_autotune`. The same mapping is accepted
+by `do_bench_npu` for standalone profiling. Each field uses the following priority:
+explicit mapping value, corresponding environment variable, then the existing benchmark setting.
+`None` leaves a field unspecified; `False` and `0` are explicit overrides.
+Custom `do_bench` callbacks retain control of their measurements and do not use
+these autotuner policies.
+
+```python
+@triton.autotune(
+    configs=configs,
+    key=["N"],
+    npu_bench_options={
+        "cache_mode": "hot",
+        "quality_check": True,
+        "max_retries": 4,
+        "active": 150,
+        "measure_budget_ms": 5.0,
+        "pruning": "fast",
+    },
+)
+@triton.jit
+def kernel(x, y, N, BLOCK: tl.constexpr):
+    ...
+```
+
+All policies are independent and optional. Enabling quality checks does not
+enable retries, calibration or fast pruning, or change launch counts and cache
+state. Without new settings, autotuning retains cold L2 and the existing
+measurement counts (normally 5 warmup and 30 active launches; CV pruning may
+derive its own counts). Standalone `do_bench_npu` retains its existing
+`clear_l2_cache=False` default unless `cache_mode` is specified.
+
+| Mapping field | Environment variable | Default / meaning |
+| --- | --- | --- |
+| `cache_mode` | `TRITON_NPU_BENCH_CACHE_MODE` | Inherit existing cache setting. `cold` evicts L2; `hot` warms up and repeats without eviction. |
+| `warmup` | `TRITON_NPU_BENCH_WARMUP` | Inherit existing warmup launch count; integer >= 0. |
+| `active` | `TRITON_NPU_BENCH_ACTIVE` | Inherit existing measured launch count; integer >= 1, or >= 2 with quality checks. |
+| `quality_check` | `TRITON_NPU_BENCH_QUALITY_CHECK` | `False`; evaluate predefined sample-quality metrics. |
+| `max_retries` | `TRITON_NPU_BENCH_MAX_RETRIES` | `0`; additional attempts for failed quality checks or unusable profiler data. |
+| `measure_budget_ms` | `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | Unset; optional minimum accumulated device time per candidate, not a wall-clock timeout. |
+| `calibration_runs` | `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; used only when a measurement budget is supplied. |
+| `pruning` | `TRITON_NPU_BENCH_PRUNING` | `existing` uses the current time-limit pruning where applicable; `fast` replaces it with conservative rough host-time pruning. |
+| `prune_runs` | `TRITON_NPU_BENCH_PRUNE_RUNS` | `20`; initial rough launches for `fast` pruning. |
+| `prune_recheck_runs` | `TRITON_NPU_BENCH_PRUNE_RECHECK_RUNS` | `40`; recheck slow candidates before excluding them. |
+| `prune_factor` | `TRITON_NPU_BENCH_PRUNE_FACTOR` | `5.0`, >= 1; candidates above this multiple of the best rough time are rechecked. |
+| `verbose` | `TRITON_NPU_BENCH_VERBOSE` | Inherit `TRITON_PRINT_AUTOTUNING`; print policy and per-attempt diagnostics. |
+
+Boolean environment values accept `0`, `1`, `false`, and `true`. Generic
+`prune_configs` still runs first. The two time-based pruning strategies are
+exclusive; quality checks do not select a pruning strategy. Fast pruning uses
+rough host timings, including synchronization, before the profiler measurements.
+
+An explicit `cache_mode="cold"` composes cache eviction after the autotuner's
+existing preparation hooks during profiling. Those hooks and the `kernel_call`
+interface are preserved. `hot` does not guarantee that the working set fits in
+L2; it means that the benchmark does not evict it between measured launches.
+
+Quality checks cover tail contamination, gaps, multimodality, drift, and change
+points, using the predefined thresholds in `_benchmark_quality.py`. Candidate
+ranking keeps the existing arithmetic mean of kernel durations. Only failing
+candidates are remeasured. After exhausting retries, the fastest collected
+measurement remains eligible, with a warning if quality checks failed or some
+candidates still lack usable data. If no usable measurements were collected,
+profiling raises an error. Kernel execution errors propagate without retries.
+An explicit policy does not fall back to event timing with different cache
+conditions. Effective policies participate in the autotune result cache key.
+
+The separate `npu-strict` mode is removed. Select `TRITON_BENCH_METHOD=npu` and
+enable the desired fields above; `TRITON_NPU_STRICT_*` variables are replaced by
+`TRITON_NPU_BENCH_*` variables. Existing arguments take precedence over env
+values, including overrides that disable a feature enabled in the environment.
+
 ## Summary
 
-The key extension of Triton-Ascend over community autotune is not a change in user-facing interfaces, but the addition of automatic tiling-candidate generation and tuning on top of the community interface. For most users, the recommended usage is:
+Triton-Ascend extends community autotune with automatic tiling-candidate generation, joint parameter tuning, and optional NPU benchmark policies. For most users, the recommended usage is:
 
 - keep the community-style `@triton.autotune` interface;
 - set `configs=[]`;

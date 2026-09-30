@@ -19,34 +19,15 @@
 # THE SOFTWARE.
 
 import builtins
+import csv
 import multiprocessing
 import os
+from contextlib import nullcontext
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import triton.runtime as runtime
-
-
-def do_bench_npu_strict(funcs, *, clear_l2_cache, warmup=25, active=150, measure_budget_ms=5.0, calibration_runs=10,
-                        max_attempts=5, prof_dir=None, keep_res=False, target_kernel_name=None):
-    """Return minimum central-half profiler means in ms, with quality-directed retries.
-
-    Explicit clear_l2_cache selects cold (True) or warmed, unflushed (False) L2.
-    active is a minimum; calibration sets one common count for the device budget.
-    target_kernel_name accepts a shared name or names aligned with the functions.
-    """
-    from ._strict_benchmark import run_strict_benchmark, report_results
-
-    funcs = funcs if isinstance(funcs, list) else [funcs]
-    names = ([target_kernel_name] * len(funcs)
-             if target_kernel_name is None or isinstance(target_kernel_name, str) else list(target_kernel_name))
-    options = dict(clear_l2_cache=clear_l2_cache, warmup=warmup, active=active, measure_budget_ms=measure_budget_ms,
-                   calibration_runs=calibration_runs, max_attempts=max_attempts)
-    verbose = os.getenv("TRITON_PRINT_AUTOTUNING") == "1"
-    result = run_strict_benchmark(funcs, options, target_kernel_names=names, prof_dir=prof_dir, keep_res=keep_res,
-                                  verbose=verbose)
-    report_results(result, verbose=verbose)
-    return result["timings"][0] if len(funcs) == 1 else result["timings"]
 
 
 class ProfilerResultMismatchError(RuntimeError):
@@ -68,8 +49,66 @@ def do_bench_npu(
     prof_dir=None,
     keep_res=False,
     target_kernel_name: Optional[str] = None,
+    *,
+    npu_bench_options=None,
+    _pre_hook_scope=None,
+):
+    """Profile NPU kernels, optionally controlling L2, quality and retries.
+
+    npu_bench_options overrides TRITON_NPU_BENCH_* per field. Unspecified
+    fields inherit the existing arguments. Counts are launches, budget is ms,
+    and max_retries counts additional attempts after the initial measurement.
+    The result remains a scalar for one callable and a list for multiple ones.
+    """
+    from ._npu_benchmark import benchmark_with_options, resolve_options
+
+    options = resolve_options(npu_bench_options)
+    funcs = funcs if isinstance(funcs, list) else [funcs]
+    if not funcs:
+        return []
+    warmup = warmup if options.warmup is None else options.warmup
+    active = active if options.active is None else options.active
+    if options.cache_mode is not None:
+        clear_l2_cache = options.cache_mode == "cold"
+    if options.is_default:
+        return _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name)
+
+    names = ([target_kernel_name] * len(funcs)
+             if target_kernel_name is None or isinstance(target_kernel_name, str) else list(target_kernel_name))
+    if len(names) != len(funcs) or any(name is not None and (not isinstance(name, str) or not name) for name in names):
+        raise ValueError("Provide one nonempty target kernel name (or None) per function")
+    verbose = options.verbose if options.verbose is not None else os.getenv("TRITON_PRINT_AUTOTUNING") == "1"
+    if verbose:
+        print(f"npu benchmark: cache={'cold' if clear_l2_cache else 'hot'}, warmup={warmup}, active={active}, "
+              f"quality_check={options.quality_check}, pruning={options.pruning}")
+    if not options.needs_samples and options.pruning == "existing":
+        return _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
+                            _pre_hook_scope=_pre_hook_scope)
+
+    import torch
+
+    def measure(callables, kernel_names, warmup_count, active_count, directory):
+        return _profile_npu(callables, warmup_count, active_count, clear_l2_cache, directory, True,
+                            kernel_names, _return_samples=True, _pre_hook_scope=_pre_hook_scope)
+
+    root = prof_dir if prof_dir is not None else Path(runtime.cache.get_home_dir()) / ".triton" / "profile_results"
+    costs = benchmark_with_options(measure, funcs, names, options, warmup=warmup, active=active,
+                                   prof_root=root, synchronize=torch.npu.synchronize,
+                                   verbose=verbose, keep_res=keep_res)
+    return costs[0] if len(funcs) == 1 else costs
+
+
+def _profile_npu(
+    funcs,
+    warmup=5,
+    active=30,
+    clear_l2_cache=False,
+    prof_dir=None,
+    keep_res=False,
+    target_kernel_name=None,
+    *,
     _return_samples: bool = False,
-    _prepare_in_call: bool = False,
+    _pre_hook_scope=None,
 ):
     import torch
     import torch_npu
@@ -112,29 +151,26 @@ def do_bench_npu(
         torch.npu.synchronize()
 
     total = warmup + active
-    with torch_npu.profiler.profile(
-        activities=[torch_npu.profiler.ProfilerActivity.NPU],
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-        with_flops=False,
-        with_modules=False,
-        experimental_config=experimental_config,
-    ) as prof:
-        for fn in funcs:
-            for _ in builtins.range(total):
-                if clear_l2_cache and _prepare_in_call:
-                    fn(benchmark_prepare=evict_cache)
-                else:
-                    if clear_l2_cache:
+    # Only an explicitly selected cold cache policy composes the autotuner hook.
+    # Ordinary callers retain cache eviction before fn(), as in release/3.2.2.
+    hook_scope = _pre_hook_scope(evict_cache) if clear_l2_cache and _pre_hook_scope else nullcontext()
+    try:
+        with hook_scope, torch_npu.profiler.profile(
+            activities=[torch_npu.profiler.ProfilerActivity.NPU],
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+            with_flops=False,
+            with_modules=False,
+            experimental_config=experimental_config,
+        ):
+            for fn in funcs:
+                for _ in builtins.range(total):
+                    if clear_l2_cache and _pre_hook_scope is None:
                         evict_cache()
                     fn()
-                torch.npu.synchronize()
-    if clear_l2_cache:
-        del buffer
-
-    try:
+                    torch.npu.synchronize()
         return _collect_prof_result(
             torch_path,
             funcs,
@@ -145,6 +181,8 @@ def do_bench_npu(
             _return_samples=_return_samples,
         )
     finally:
+        if clear_l2_cache:
+            del buffer
         _rm_dic(keep_res, torch_path)
 
 
@@ -155,6 +193,48 @@ def _rm_dic(keep_res, torch_path):
 
     if os.path.exists(torch_path):
         shutil.rmtree(torch_path)
+
+
+def _read_profile_samples(directory, names, warmup, active, clear_l2_cache):
+    """Read validated device samples for optional quality evaluation and retries."""
+    import math
+    import numpy as np
+    from ._npu_benchmark import ProfilerAcquisitionError
+
+    paths = list(Path(directory).rglob("kernel_details.csv"))
+    if len(paths) != 1:
+        raise ProfilerAcquisitionError(f"Expected one kernel_details.csv, found {len(paths)}")
+    targets = set(names) if all(name is not None for name in names) else None
+    rows = []
+    try:
+        with paths[0].open(newline="", encoding="utf-8-sig") as stream:
+            for row in csv.DictReader(stream):
+                name = row["Name"].strip()
+                if targets is not None:
+                    if name not in targets:
+                        continue
+                elif clear_l2_cache and row.get("Type", "").strip().lower() == "reducesum":
+                    continue
+                start, duration = float(row["Start Time(us)"]), float(row["Duration(us)"])
+                if not math.isfinite(start) or not math.isfinite(duration) or duration <= 0:
+                    raise ValueError("timestamps must be finite and durations positive")
+                rows.append((start, duration, name))
+    except (OSError, ValueError, KeyError, TypeError, csv.Error) as exc:
+        raise ProfilerAcquisitionError(f"Invalid profiler data: {exc}") from exc
+    total = warmup + active
+    if len(rows) != len(names) * total:
+        raise ProfilerAcquisitionError(f"Expected {len(names) * total} target rows, got {len(rows)}")
+    rows.sort(key=lambda row: row[0])
+    samples = []
+    for index, name in enumerate(names):
+        chunk = rows[index * total:(index + 1) * total]
+        if name is not None and any(row[2] != name for row in chunk):
+            raise ProfilerAcquisitionError(f"Unexpected target order for config {index}: expected {name!r}")
+        times, durations = np.asarray([(row[0], row[1]) for row in chunk[warmup:]]).T
+        if np.any(np.diff(times) <= 0):
+            raise ProfilerAcquisitionError(f"Non-increasing device timestamps for config {index}")
+        samples.append((times, durations))
+    return samples
 
 
 def _collect_prof_result(
@@ -182,9 +262,14 @@ def _collect_prof_result(
     :type target_kernel_name: Optional[str]
     """
 
-    if _return_samples:
-        from ._strict_benchmark import _read_profile
-        return _read_profile(base_dir, target_kernel_name, num_warmup, num_active, clear_l2_cache)
+    if _return_samples or isinstance(target_kernel_name, (list, tuple)):
+        samples = _read_profile_samples(base_dir, target_kernel_name, num_warmup, num_active, clear_l2_cache)
+        if _return_samples:
+            return samples
+        # Per-configuration names use the same arithmetic mean as the legacy
+        # shared-name collector, while excluding unrelated preparation kernels.
+        costs = [float(durations.mean()) / 1000 for _, durations in samples]
+        return costs[0] if len(funcs) == 1 else costs
 
     import numpy as np
     import pandas as pd
