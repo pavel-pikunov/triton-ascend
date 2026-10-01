@@ -2263,8 +2263,10 @@ class AutoTilingTuner(Autotuner):
                 # it with the existing cleanup even if eviction prevents launch.
                 try:
                     self.post_hook(args, exception=exc)
-                finally:
-                    raise
+                except Exception as cleanup_error:
+                    from .._npu_benchmark import _warn_secondary
+                    _warn_secondary("NPU post_hook failed after cache eviction", cleanup_error)
+                raise
 
         self.pre_hook = pre_hook
         try:
