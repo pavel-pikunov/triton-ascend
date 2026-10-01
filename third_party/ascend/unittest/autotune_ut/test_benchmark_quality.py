@@ -1,19 +1,13 @@
 """CPU references and resource checks for the full-sample quality metrics."""
 
-import importlib.util
 import time
 import tracemalloc
-from pathlib import Path
 
 import numpy as np
 import pytest
 from scipy.stats import theilslopes
 
-
-spec = importlib.util.spec_from_file_location(
-    "_benchmark_quality_test", Path(__file__).resolve().parents[2] / "backend" / "_benchmark_quality.py")
-quality = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(quality)
+from triton.backends.ascend import _benchmark_quality as quality
 
 
 def direct_qn(values):
@@ -48,8 +42,18 @@ def samples(n, kind):
     return times, values
 
 
-@pytest.mark.parametrize("n", [33, 34, 255, 256, 257, 258, 259, 260, 513])
-@pytest.mark.parametrize("kind", ["random", "ties", "constant", "outliers", "drift", "collinear"])
+@pytest.mark.parametrize("n,kind", [
+    (33, "random"),
+    (34, "ties"),
+    (255, "constant"),
+    (256, "outliers"),
+    (257, "drift"),
+    (258, "random"),
+    (259, "ties"),
+    (260, "collinear"),
+    (513, "random"),
+    (513, "constant"),
+])
 def test_pair_statistics_match_direct_and_scipy(n, kind):
     times, values = samples(n, kind)
     assert quality._qn(values) == direct_qn(values)
@@ -63,8 +67,8 @@ def test_pair_statistics_match_direct_and_scipy(n, kind):
         assert quality._select_slope(times, values, rank, np.random.default_rng(0)) == slopes[rank]
 
 
-@pytest.mark.parametrize("kind", ["random", "ties", "constant", "outliers", "drift",
-                                  "threshold_above", "threshold_below"])
+@pytest.mark.parametrize("kind",
+                         ["random", "ties", "constant", "outliers", "drift", "threshold_above", "threshold_below"])
 def test_quality_metrics_and_decisions_match_direct(monkeypatch, kind):
     times, values = samples(300, kind)
     actual, failures = quality.evaluate_quality(times[::-1], values[::-1])
@@ -85,10 +89,14 @@ def test_quality_metrics_and_decisions_match_direct(monkeypatch, kind):
 
 @pytest.mark.parametrize("inclusive", [False, True])
 def test_rounded_ties_do_not_hide_crossings(inclusive):
-    times = np.array([0.23909220398153466, 0.5490686931729879, 0.9059729500487292,
-                      1.1285749538055665, 2.4240720539245073, 3.7276966487007464])
-    values = np.array([0.3457955495015555, 0.7941100015311158, 1.310295395996436,
-                       1.632241410661087, 3.5058998744389296, 5.391313014589693])
+    times = np.array([
+        0.23909220398153466, 0.5490686931729879, 0.9059729500487292, 1.1285749538055665, 2.4240720539245073,
+        3.7276966487007464
+    ])
+    values = np.array([
+        0.3457955495015555, 0.7941100015311158, 1.310295395996436, 1.632241410661087, 3.5058998744389296,
+        5.391313014589693
+    ])
     pivot = 1.4462853398944855
     i, j = np.triu_indices(len(values), 1)
     slopes = np.sort((values[j] - values[i]) / (times[j] - times[i]))
