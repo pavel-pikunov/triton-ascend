@@ -7,7 +7,6 @@ import pprint
 import warnings
 from dataclasses import dataclass
 
-
 REPORT_ENV = "TRITON_NPU_BENCH_REPORT_BEST_CONFIG"
 
 
@@ -41,7 +40,7 @@ def report_safely(action):
     except Exception as exc:
         try:
             warnings.warn(f"Autotune report unavailable: {exc}", RuntimeWarning, stacklevel=3)
-        except Warning:
+        except Exception:
             # Even a warnings-as-errors policy must not change autotuning.
             pass
 
@@ -68,8 +67,8 @@ def print_best_config_report(function_name, configs, config, measurement=None):
         stream.write(f"cache={measurement.cache_mode}, warmup={measurement.warmup}, "
                      f"active={measurement.active}, selected attempt={measurement.attempt}\n")
         if measurement.quality_failures:
-            stream.write("Selected measurement failed quality checks: "
-                         + "; ".join(measurement.quality_failures) + "\n")
+            stream.write("Selected measurement failed quality checks: " + "; ".join(measurement.quality_failures) +
+                         "\n")
         stream.write("Measured launches: all kernel_details.csv columns (warmup excluded)\n")
         writer = csv.DictWriter(stream, fieldnames=measurement.columns, lineterminator="\n")
         writer.writeheader()

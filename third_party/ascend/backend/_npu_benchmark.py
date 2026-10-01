@@ -14,9 +14,6 @@ from pathlib import Path
 
 import numpy as np
 
-from ._benchmark_quality import THRESHOLDS, evaluate_quality
-
-
 ENV_PREFIX = "TRITON_NPU_BENCH_"
 COUNT_MINIMUMS = {
     "warmup": 0,
@@ -30,6 +27,32 @@ COUNT_MINIMUMS = {
 
 class ProfilerAcquisitionError(RuntimeError):
     """The profiler did not produce a complete, usable set of device samples."""
+
+
+class _ResolvedOptions(dict):
+    """Internal snapshot whose inactive fields have already been diagnosed."""
+
+
+def _supplied_option_fields(arguments=None):
+    fields = {
+        name
+        for name in NpuBenchmarkOptions.__dataclass_fields__
+        if os.getenv(ENV_PREFIX + name.upper()) is not None
+    }
+    if isinstance(arguments, Mapping):
+        fields.update(name for name, value in arguments.items() if value is not None)
+    return fields
+
+
+def _inactive_option_messages(options, arguments=None):
+    fields = _supplied_option_fields(arguments)
+    if options.measure_budget_ms is None and "calibration_runs" in fields:
+        yield ("inactive_calibration", "calibration_runs is ignored because measure_budget_ms is unset. "
+               "Set measure_budget_ms to enable calibration.")
+    slow_fields = sorted(fields & {"slow_config_runs", "slow_config_recheck_runs", "slow_config_factor"})
+    if not options.filter_slow_configs and slow_fields:
+        yield ("inactive_slow_filter", f"{', '.join(slow_fields)} are ignored because filter_slow_configs=False. "
+               "Set filter_slow_configs=True to use these fields.")
 
 
 @dataclass(frozen=True)
@@ -68,7 +91,10 @@ class NpuBenchmarkOptions:
 
     def cache_key(self):
         policy = self._effective_policy()
-        thresholds = tuple(sorted(THRESHOLDS.items())) if self.quality_check else ()
+        thresholds = ()
+        if self.quality_check:
+            from ._benchmark_quality import THRESHOLDS
+            thresholds = tuple(sorted(THRESHOLDS.items()))
         return ("npu-benchmark", 2, policy, thresholds)
 
 
@@ -155,12 +181,14 @@ def filter_slow_configs(funcs, synchronize, options):
 
     first = [measure(fn, options.slow_config_runs) for fn in funcs]
     threshold = min(first) * options.slow_config_factor
-    return [i for i, value in enumerate(first)
-            if value <= threshold or measure(funcs[i], options.slow_config_recheck_runs) <= threshold]
+    return [
+        i for i, value in enumerate(first)
+        if value <= threshold or measure(funcs[i], options.slow_config_recheck_runs) <= threshold
+    ]
 
 
-def benchmark_with_options(measure, funcs, names, options, *, warmup, active, prof_root, synchronize,
-                           verbose=False, keep_res=False, _report_sink=None):
+def benchmark_with_options(measure, funcs, names, options, *, warmup, active, prof_root, synchronize, verbose=False,
+                           keep_res=False, _report_sink=None):
     """Wrap the existing profiler with optional filtering, calibration and retries.
 
     measure returns device timestamps and durations (microseconds) per callable.
@@ -168,14 +196,16 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
     """
     if options.quality_check and active < 2:
         raise ValueError("quality_check requires active >= 2")
+    if options.quality_check:
+        from ._benchmark_quality import evaluate_quality
     verbose = verbose if options.verbose is None else options.verbose
 
     def log(message):
         if verbose:
             print(f"npu benchmark: {message}")
 
-    indices = (filter_slow_configs(funcs, synchronize, options)
-               if options.filter_slow_configs else list(range(len(funcs))))
+    indices = (filter_slow_configs(funcs, synchronize, options) if options.filter_slow_configs else list(
+        range(len(funcs))))
     active_counts = [active] * len(funcs)
     costs = [float("inf")] * len(funcs)
     best_failures = [[] for _ in funcs]
@@ -188,6 +218,7 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
         failed = False
 
         def track(fn):
+
             def call():
                 nonlocal execution_failed
                 try:
@@ -197,13 +228,13 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
                 except Exception:
                     execution_failed = True
                     raise
+
             return call
 
         directory = tempfile.mkdtemp(prefix="npu_bench_", dir=root)
         try:
-            return measure([track(funcs[i]) for i in selected], [names[i] for i in selected],
-                           warmup_count, active_count, directory,
-                           **({"_report_sink": reports.extend} if reports is not None else {}))
+            return measure([track(funcs[i]) for i in selected], [names[i] for i in selected], warmup_count,
+                           active_count, directory, **({"_report_sink": reports.extend} if reports is not None else {}))
         except (RuntimeError, OSError) as exc:
             failed = True
             if execution_failed:
@@ -266,8 +297,8 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
                         def capture():
                             best_reports[index] = None
                             if len(reports) == len(selected) and reports[position] is not None:
-                                best_reports[index] = replace(reports[position], mean_ms=cost,
-                                                              attempt=attempt + 1, quality_failures=tuple(failures))
+                                best_reports[index] = replace(reports[position], mean_ms=cost, attempt=attempt + 1,
+                                                              quality_failures=tuple(failures))
 
                         report_safely(capture)
                 log(f"config={index}, attempt={attempt + 1}, active={active_count}, cost_ms={cost:.8g}, "
@@ -285,8 +316,8 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
     if pending:
         reasons.append(f"quality/acquisition retries exhausted for configs {pending}")
     if best_failures[best]:
-        reasons.append(f"selected config {best} uses a measurement that failed quality checks: "
-                       + "; ".join(best_failures[best]))
+        reasons.append(f"selected config {best} uses a measurement that failed quality checks: " +
+                       "; ".join(best_failures[best]))
     if reasons:
         warnings.warn("NPU benchmark: " + "; ".join(reasons), RuntimeWarning, stacklevel=3)
     if _report_sink is not None:

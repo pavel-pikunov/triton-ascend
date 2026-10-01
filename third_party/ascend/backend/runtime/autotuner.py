@@ -28,6 +28,7 @@ import functools
 import ast
 import gc
 import inspect
+import math
 import os
 import pprint
 import time
@@ -284,6 +285,8 @@ class AutoTilingTuner(Autotuner):
             use_cuda_graph,
             do_bench,
         )
+        self._warning_reasons = set()
+        self._warning_registry = {}
         self.user_defined_do_bench = do_bench is not None
         self.npu_bench_options = copy.copy(npu_bench_options)
         from .._autotune_report import resolve_report_best_config
@@ -341,6 +344,21 @@ class AutoTilingTuner(Autotuner):
         )
         self._source_module_ast_cache: Optional[ast.Module] = None
         self._source_module_ast_resolved = False
+
+    def _warn_once(self, reason, message):
+        """Emit each reason once per tuner, respecting ignore and error filters."""
+        if reason in self._warning_reasons:
+            return
+        kernel = self.base_fn
+        warnings.warn_explicit(
+            f"Autotuning kernel {kernel.__name__}: {message}",
+            RuntimeWarning,
+            filename=kernel.__code__.co_filename,
+            lineno=kernel.__code__.co_firstlineno,
+            module=kernel.__module__,
+            registry=self._warning_registry,
+        )
+        self._warning_reasons.add(reason)
 
     @staticmethod
     def _parse_explicit_tunable_params(raw_value) -> List[str]:
@@ -551,8 +569,12 @@ class AutoTilingTuner(Autotuner):
         if hasattr(self, "_get_constexpr_candidates"):
             try:
                 constexpr_names = set(self._get_constexpr_candidates())
-            except Exception:
+            except Exception as exc:
                 constexpr_names = set()
+                self._warn_once(
+                    "constexpr_axis_analysis", f"Constexpr analysis for vector axes failed: "
+                    f"{type(exc).__name__}: {exc}; treating all arguments as runtime arguments. "
+                    "Check kernel annotations or supply axis hints.")
         return [
             arg_name for arg_name in getattr(self, "arg_names", [])
             if arg_name not in constexpr_names
@@ -878,8 +900,12 @@ class AutoTilingTuner(Autotuner):
         parsed_ast = None
         try:
             parsed_ast = self.fn.parse()
-        except Exception:
+        except Exception as exc:
             parsed_ast = None
+            self._warn_once(
+                "kernel_classification_parse", f"Kernel classification parsing failed: "
+                f"{type(exc).__name__}: {exc}; using the kernel_type hint or vector fallback. "
+                "Check kernel code or supply a kernel_type hint.")
 
         kernel_type = resolve_kernel_type(self.hints, parsed_ast)
         if kernel_type != "vector" or not self._is_auto_kernel_hint() or parsed_ast is None:
@@ -900,7 +926,10 @@ class AutoTilingTuner(Autotuner):
                 module_ast=module_ast,
                 entry_function_name=entry_function_name,
             )
-        except Exception:
+        except Exception as exc:
+            self._warn_once(
+                "kernel_dot_analysis", f"Kernel dot-site analysis failed: {type(exc).__name__}: {exc}; "
+                f"keeping classification {kernel_type!r}. Supply a kernel_type hint if needed.")
             return kernel_type
 
         if dot_result.dot_sites:
@@ -1588,13 +1617,10 @@ class AutoTilingTuner(Autotuner):
     ):
         try:
             return parser_fn()
-        except Exception:
-            if self.print_autotuning:
-                print(
-                    "[WARNING] Failed to parse {}, fallback to {}.".format(
-                        parser_name, fallback_value
-                    )
-                )
+        except Exception as exc:
+            self._warn_once(
+                f"vector_parser_{parser_name}", f"Parsing {parser_name} failed: {type(exc).__name__}: {exc}; "
+                f"using fallback {fallback_value!r}. Check kernel code or supply axis hints.")
             return fallback_value
 
     def _parse_reduction_axes_with_fallback(self) -> List[str]:
@@ -1951,7 +1977,10 @@ class AutoTilingTuner(Autotuner):
             return list(dsl_result.missing_tunable)
         except ValueError:
             raise
-        except Exception:
+        except Exception as exc:
+            self._warn_once(
+                "tunable_analysis", f"Tunable-parameter analysis failed: {type(exc).__name__}: {exc}; "
+                "using missing constexpr parameters as fallback. Supply tunable_parameter hints.")
             constexpr_names = set(self._get_constexpr_candidates())
             fallback = [
                 arg_name for arg_name in required_missing_params
@@ -2008,15 +2037,11 @@ class AutoTilingTuner(Autotuner):
                 )
             return result
         except Exception as exc:
-            if self.print_autotuning:
-                print(
-                    "Ascend autotuning vector v2 parse failed: {}: {}".format(
-                        type(exc).__name__,
-                        exc,
-                    )
-                )
             self.vv_parse_result_v2 = None
             self.vv_adapter_result_v2 = None
+            self._warn_once(
+                "vector_v2_parser", f"Vector v2 parsing failed: {type(exc).__name__}: {exc}; "
+                "using the legacy vector parser fallback. Check kernel code or supply axis hints.")
             return None
 
     def _gen_tile_configs(
@@ -2107,7 +2132,7 @@ class AutoTilingTuner(Autotuner):
 
     def _rough_bench_once(self, fn) -> float:
         di = triton.runtime.driver.active.get_device_interface()
-        di.synchronize()  
+        di.synchronize()
         try:
             start_event = di.Event(enable_timing=True)
             end_event = di.Event(enable_timing=True)
@@ -2242,16 +2267,21 @@ class AutoTilingTuner(Autotuner):
         return key
 
     def _get_npu_benchmark_options(self):
+        from .._npu_benchmark import _inactive_option_messages, _supplied_option_fields, resolve_options
+
         if not self.user_defined_do_bench and os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu":
-            from .._npu_benchmark import resolve_options
-            return resolve_options(self.npu_bench_options)
-        if self.npu_bench_options is not None and not getattr(self, "_warned_ignored_npu_options", False):
-            reason = ("a custom do_bench was provided" if self.user_defined_do_bench
-                      else "TRITON_BENCH_METHOD is not set to 'npu'")
-            warnings.warn(f"npu_bench_options are ignored because {reason}. "
-                          "Use TRITON_BENCH_METHOD=npu with the built-in benchmarker to apply them.",
-                          RuntimeWarning, stacklevel=3)
-            self._warned_ignored_npu_options = True
+            options = resolve_options(self.npu_bench_options)
+            for reason, message in _inactive_option_messages(options, self.npu_bench_options):
+                self._warn_once(reason, message)
+            return options
+        fields = _supplied_option_fields(self.npu_bench_options)
+        if fields or self.npu_bench_options is not None:
+            reason = ("a custom do_bench was provided"
+                      if self.user_defined_do_bench else "TRITON_BENCH_METHOD is not set to 'npu'")
+            self._warn_once(
+                "ignored_npu_options", f"npu_bench_options and TRITON_NPU_BENCH_* measurement settings "
+                f"({', '.join(sorted(fields)) or 'npu_bench_options'}) are ignored because {reason}. "
+                "Use TRITON_BENCH_METHOD=npu with the built-in benchmarker to apply them.")
         return None
 
     @contextmanager
@@ -2295,17 +2325,30 @@ class AutoTilingTuner(Autotuner):
                 used_cached_result = False
                 bench_start = time.time()
                 timings = self._batch_bench(
-                    *args, configs=pruned_configs,
-                    **({"_report_sink": reports.update} if reports is not None else {}), **kwargs,
+                    *args,
+                    configs=pruned_configs,
+                    **({"_report_sink": reports.update} if reports is not None else {}),
+                    **kwargs,
                 )
                 bench_end = time.time()
                 self.bench_time = bench_end - bench_start
+                if not any(math.isfinite(cost[0] if isinstance(cost, Sequence) else cost) for cost in timings.values()):
+                    self._warn_once(
+                        "unusable_measurements", "All final benchmark scores are non-finite; "
+                        "selecting a config without usable measurements. Check profiler output "
+                        "and benchmark settings.")
                 self.cache[key] = builtins.min(timings, key=timings.get)
                 full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
                 self.pre_hook(full_nargs, reset_only=True)
                 self.configs_timings = timings
                 config = self.cache[key]
             else:
+                npu_options = self._npu_benchmark_options
+                if npu_options is not None and not npu_options.is_default:
+                    self._warn_once(
+                        "skipped_measurements", "Only one config remains after pruning; autotuning "
+                        "skips measurements and the effective NPU benchmark policy is not applied. "
+                        "Provide multiple surviving configs or benchmark the kernel directly.")
                 config = pruned_configs[0]
         else:
             config = self.cache[key]
@@ -2322,7 +2365,10 @@ class AutoTilingTuner(Autotuner):
             from .._autotune_report import print_best_config_report, report_safely
             try:
                 report_safely(lambda: print_best_config_report(
-                    self.base_fn.__name__, self.configs, config, reports.get(config),
+                    self.base_fn.__name__,
+                    self.configs,
+                    config,
+                    reports.get(config),
                 ))
             finally:
                 reports.clear()
@@ -2364,8 +2410,9 @@ class AutoTilingTuner(Autotuner):
                 ub_fn = self._make_kernel_call(*args, config=config, **kwargs)
                 run_fns[config] = functools.partial(ub_fn, warmup=False)
         except Exception as e:
-            if self.print_autotuning:
-                print(f"[WARN] encounter exception when try ubtune, Details: {e}")
+            self._warn_once(
+                "ubtuner_failure", f"UBTuner recovery failed: {type(e).__name__}: {e}; "
+                "continuing with available candidates. Check UBTuner settings and kernel resources.")
 
     def _batch_bench(self, *args, configs, _report_sink=None, **kwargs):
         from triton.compiler.errors import CompileTimeAssertionFailure, MLIRCompilationError
@@ -2408,6 +2455,10 @@ class AutoTilingTuner(Autotuner):
             except Exception as e:
                 # ignore exception from __exit__() of AsyncCompileMode
                 triton.runtime._async_compile.active_mode.set(None)
+                self._warn_once(
+                    "parallel_compile_failure", f"Parallel compilation failed: {type(e).__name__}: {e}; "
+                    "continuing with available candidates after resetting active_mode. "
+                    "Check compilation errors or set TRITON_AUTOTUNE_PARALLEL_COMPILE=0.")
         else:
             for config, fn in kernels_call.items():
                 try:
@@ -2430,13 +2481,10 @@ class AutoTilingTuner(Autotuner):
             # we ignore expensive profiling method when only single config is left
             return {config: self.do_bench(fn, quantiles=(0.5, 0.2, 0.8)) for config, fn in run_fns.items()}
 
-        use_existing_counts = npu_options is None or (
-            npu_options.active is None and npu_options.measure_budget_ms is None
-        )
-        cv_mode = (
-            use_existing_counts and len(run_fns) > 1
-            and self.parser_mode in ("cube", "mix") and self.cv_parse_result is not None
-        )
+        use_existing_counts = npu_options is None or (npu_options.active is None
+                                                      and npu_options.measure_budget_ms is None)
+        cv_mode = (use_existing_counts and len(run_fns) > 1 and self.parser_mode in ("cube", "mix")
+                   and self.cv_parse_result is not None)
         if cv_mode:
             if npu_options is not None and npu_options.warmup is not None:
                 run_fns = self._prune_by_time_limit(run_fns, warmup=npu_options.warmup)
@@ -2451,18 +2499,19 @@ class AutoTilingTuner(Autotuner):
 
             warmup = self.cv_warmup if cv_mode else 5
             active = self.cv_repeat if cv_mode else 30
-            target_kernel_name = self._resolve_target_kernel_name(kernels_call, run_fns.keys())
             # Forward resolved values even when arguments explicitly restore a
             # default: the profiler must not reapply a conflicting env.
-            benchmark_kwargs = {"npu_bench_options": asdict(npu_options)}
+            from .._npu_benchmark import _ResolvedOptions
+            benchmark_kwargs = {"npu_bench_options": _ResolvedOptions(asdict(npu_options))}
             measurement_reports = [] if _report_sink is not None else None
             if measurement_reports is not None:
                 benchmark_kwargs["_report_sink"] = measurement_reports.extend
             if configured_npu:
                 if npu_options.cache_mode == "cold":
                     benchmark_kwargs["_pre_hook_scope"] = self._npu_cache_pre_hook
-                target_kernel_name = [getattr(kernels_call[config], "target_kernel_name", None)
-                                      for config in run_fns]
+                target_kernel_name = [getattr(kernels_call[config], "target_kernel_name", None) for config in run_fns]
+            else:
+                target_kernel_name = self._resolve_target_kernel_name(kernels_call, run_fns.keys())
             try:
                 time_cost = do_bench_npu(
                     list(run_fns.values()),
@@ -2576,6 +2625,11 @@ class AutoTilingTuner(Autotuner):
     def _profile(self, *args, config, **meta):
         from ..testing import do_bench_npu
 
+        if self.npu_bench_options is not None:
+            self._warn_once(
+                "extra_profile_options", "The additional winner _profile does not receive explicit "
+                "npu_bench_options; it uses TRITON_NPU_BENCH_* environment settings and defaults. "
+                "Set those environment variables for this profile or omit auto_prof_dir.")
         kernel_call = self._make_kernel_call(*args, config=config, **meta)
         fn = functools.partial(kernel_call, warmup=False)
         do_bench_npu(
@@ -2910,8 +2964,8 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     def decorator(fn):
         return AutoTilingTuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                                post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
-                               use_cuda_graph=use_cuda_graph, do_bench=do_bench, auto_profile_dir=auto_prof_dir, hints=hints,
-                               npu_bench_options=npu_bench_options, report_best_config=report_best_config)
+                               use_cuda_graph=use_cuda_graph, do_bench=do_bench, auto_profile_dir=auto_prof_dir,
+                               hints=hints, npu_bench_options=npu_bench_options, report_best_config=report_best_config)
 
     return decorator
 
@@ -3034,6 +3088,12 @@ class BaseAutotuner:
         self.validation_rules = validation_rules
 
     def validate_parameters(self, **kwargs):
+        unsupported = sorted(kwargs.keys() - self.supported_params)
+        if unsupported:
+            warnings.warn(
+                f"Config generator '{self.operator_name}' does not support parameters {unsupported}. "
+                "Known unsupported keys are ignored; unknown keys fail validation. "
+                "Remove them or use a generator that supports them.", RuntimeWarning, stacklevel=3)
         # Check for unsupported parameters
         invalid_params = [k for k in kwargs.keys() if k not in _ALL_PARAMS]
         if invalid_params:
@@ -3141,6 +3201,20 @@ def get_autotune_vector_config(**kwargs: Any) -> List[triton.Config]:
     return VectorAutotuner.get_configs(**kwargs)
 
 
+def _check_max_config_parameters(kernel_type, tuning_params):
+    if kernel_type not in ("cube", "mixcv", "vector"):
+        warnings.warn(
+            f"Unknown kernel_type {kernel_type!r}; falling back to 'mixcv'. "
+            "Use 'cube', 'mixcv', or 'vector'.", RuntimeWarning, stacklevel=3)
+    supported = (_CUBE_PARAMS
+                 if kernel_type == "cube" else _VECTOR_PARAMS if kernel_type == "vector" else _MIXCV_PARAMS)
+    unsupported = sorted(tuning_params.keys() - supported)
+    if unsupported:
+        warnings.warn(
+            f"Config expansion for kernel_type {kernel_type!r} ignores parameters {unsupported}. "
+            "Remove unknown keys or choose a kernel_type that supports them.", RuntimeWarning, stacklevel=3)
+
+
 def get_max_configs(config, kernel_type="mixcv", **kwargs):
     """
     Expand a single base Config by combining it with tuning parameters.
@@ -3152,6 +3226,11 @@ def get_max_configs(config, kernel_type="mixcv", **kwargs):
                    or from the defaults.
     :return: List of expanded Config objects.
     """
+    _check_max_config_parameters(kernel_type, kwargs)
+    return _expand_max_configs(config, kernel_type, kwargs)
+
+
+def _expand_max_configs(config, kernel_type, kwargs):
     # Determine the set of parameters supported by the current kernel_type
     if kernel_type == "cube":
         supported = _CUBE_PARAMS
@@ -3159,11 +3238,6 @@ def get_max_configs(config, kernel_type="mixcv", **kwargs):
         supported = _VECTOR_PARAMS
     else:
         supported = _MIXCV_PARAMS
-
-    # Warn about unsupported parameters provided in kwargs
-    unsupported = [k for k in kwargs if k not in supported and k in _ALL_PARAMS]
-    if unsupported:
-        print(f"[WARNING] The following parameters are not supported for kernel_type '{kernel_type}': {unsupported}. They will be ignored.")
 
     # Build value lists for each parameter (priority: kwargs > base config > defaults)
     param_values = {}
@@ -3228,11 +3302,9 @@ def get_max_configs(config, kernel_type="mixcv", **kwargs):
     return new_configs
 
 
-def max_autotune(configs, key, kernel_type="mixcv",
-                 prune_configs_by=None, reset_to_zero=None, restore_value=None,
-                 pre_hook=None, post_hook=None, warmup=None, rep=None,
-                 use_cuda_graph=False, do_bench=None, npu_bench_options=None, *, report_best_config=None,
-                 **tuning_params):
+def max_autotune(configs, key, kernel_type="mixcv", prune_configs_by=None, reset_to_zero=None, restore_value=None,
+                 pre_hook=None, post_hook=None, warmup=None, rep=None, use_cuda_graph=False, do_bench=None,
+                 npu_bench_options=None, *, report_best_config=None, **tuning_params):
     """
     Decorator that expands each base Config with tuning parameters before auto-tuning.
 
@@ -3262,10 +3334,11 @@ def max_autotune(configs, key, kernel_type="mixcv",
         if not configs or len(configs) == 0:
             raise ValueError("[max_autotune] The argument 'configs' cannot be empty. "
                              "Please provide at least one base config. ")
+        _check_max_config_parameters(kernel_type, tuning_params)
         # Expand each base config with the provided tuning parameters
         expanded_configs = []
         for cfg in configs:
-            expanded = get_max_configs(cfg, kernel_type=kernel_type, **tuning_params)
+            expanded = _expand_max_configs(cfg, kernel_type, tuning_params)
             expanded_configs.extend(expanded)
 
         # Call the original autotune decorator with the expanded configs

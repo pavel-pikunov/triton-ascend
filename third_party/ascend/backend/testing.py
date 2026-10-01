@@ -22,6 +22,7 @@ import builtins
 import csv
 import multiprocessing
 import os
+import warnings
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,9 +62,12 @@ def do_bench_npu(
     and max_retries counts additional attempts after the initial measurement.
     The result remains a scalar for one callable and a list for multiple ones.
     """
-    from ._npu_benchmark import benchmark_with_options, resolve_options
+    from ._npu_benchmark import _ResolvedOptions, _inactive_option_messages, benchmark_with_options, resolve_options
 
     options = resolve_options(npu_bench_options)
+    if not isinstance(npu_bench_options, _ResolvedOptions):
+        for _, message in _inactive_option_messages(options, npu_bench_options):
+            warnings.warn(f"NPU benchmark: {message}", RuntimeWarning, stacklevel=2)
     funcs = funcs if isinstance(funcs, list) else [funcs]
     if not funcs:
         return []
@@ -91,13 +95,13 @@ def do_bench_npu(
     import torch
 
     def measure(callables, kernel_names, warmup_count, active_count, directory, **diagnostics):
-        return _profile_npu(callables, warmup_count, active_count, clear_l2_cache, directory, True,
-                            kernel_names, _return_samples=True, _pre_hook_scope=_pre_hook_scope, **diagnostics)
+        return _profile_npu(callables, warmup_count, active_count, clear_l2_cache, directory, True, kernel_names,
+                            _return_samples=True, _pre_hook_scope=_pre_hook_scope, **diagnostics)
 
     root = prof_dir if prof_dir is not None else Path(runtime.cache.get_home_dir()) / ".triton" / "profile_results"
-    costs = benchmark_with_options(measure, funcs, names, options, warmup=warmup, active=active,
-                                   prof_root=root, synchronize=torch.npu.synchronize,
-                                   verbose=verbose, keep_res=keep_res, **report_kwargs)
+    costs = benchmark_with_options(measure, funcs, names, options, warmup=warmup, active=active, prof_root=root,
+                                   synchronize=torch.npu.synchronize, verbose=verbose, keep_res=keep_res,
+                                   **report_kwargs)
     return costs[0] if len(funcs) == 1 else costs
 
 
@@ -161,14 +165,14 @@ def _profile_npu(
     failed = False
     try:
         with hook_scope, torch_npu.profiler.profile(
-            activities=[torch_npu.profiler.ProfilerActivity.NPU],
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
-            record_shapes=False,
-            profile_memory=False,
-            with_stack=False,
-            with_flops=False,
-            with_modules=False,
-            experimental_config=experimental_config,
+                activities=[torch_npu.profiler.ProfilerActivity.NPU],
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+                with_flops=False,
+                with_modules=False,
+                experimental_config=experimental_config,
         ):
             for fn in funcs:
                 for _ in builtins.range(total):
@@ -255,10 +259,16 @@ def _read_profile_samples(directory, names, warmup, active, clear_l2_cache, _rep
         from ._autotune_report import NpuMeasurementReport, report_safely
 
         def capture():
-            reports = [NpuMeasurementReport(
-                columns, tuple(row[3] for row in rows[index * total + warmup:(index + 1) * total]),
-                warmup, active, "cold" if clear_l2_cache else "hot", float(durations.mean()) / 1000,
-            ) for index, (_, durations) in enumerate(samples)]
+            reports = [
+                NpuMeasurementReport(
+                    columns,
+                    tuple(row[3] for row in rows[index * total + warmup:(index + 1) * total]),
+                    warmup,
+                    active,
+                    "cold" if clear_l2_cache else "hot",
+                    float(durations.mean()) / 1000,
+                ) for index, (_, durations) in enumerate(samples)
+            ]
             _report_sink(reports)
 
         report_safely(capture)
@@ -293,7 +303,7 @@ def _collect_prof_result(
 
     if _return_samples or isinstance(target_kernel_name, (list, tuple)):
         samples = _read_profile_samples(base_dir, target_kernel_name, num_warmup, num_active, clear_l2_cache,
-                                       **({"_report_sink": _report_sink} if _report_sink is not None else {}))
+                                        **({"_report_sink": _report_sink} if _report_sink is not None else {}))
         if _return_samples:
             return samples
         # Per-configuration names use the same arithmetic mean as the existing
@@ -312,6 +322,9 @@ def _collect_prof_result(
                 break
     num_funcs = len(funcs)
     if kernel_details_file is None:
+        warnings.warn(
+            f"NPU profiler CSV kernel_details.csv was not found in {base_dir!r}; "
+            "returning inf for each candidate. Check profiler output and prof_dir.", RuntimeWarning, stacklevel=2)
         if num_funcs == 1:
             return float("inf")
         else:
@@ -347,11 +360,16 @@ def _collect_prof_result(
                 columns = tuple(reader.fieldnames or ())
                 raw_rows = list(reader)
             total = num_warmup + num_active
-            reports = [NpuMeasurementReport(
-                columns, tuple(raw_rows[i] for i in filter_df.iloc[
-                    index * total + num_warmup:(index + 1) * total
-                ].index), num_warmup, num_active, "cold" if clear_l2_cache else "hot", cost,
-            ) for index, cost in enumerate(time_cost)]
+            reports = [
+                NpuMeasurementReport(
+                    columns,
+                    tuple(raw_rows[i] for i in filter_df.iloc[index * total + num_warmup:(index + 1) * total].index),
+                    num_warmup,
+                    num_active,
+                    "cold" if clear_l2_cache else "hot",
+                    cost,
+                ) for index, cost in enumerate(time_cost)
+            ]
             _report_sink(reports)
 
         report_safely(capture)

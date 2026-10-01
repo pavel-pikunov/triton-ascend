@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import ast
+import warnings
 from typing import Any, Dict, Optional
 
 SUPPORTED_KERNEL_TYPES = {"vector", "cube", "mix", "auto"}
@@ -65,7 +66,10 @@ def classify_kernel_type_from_dsl(func_ast: Optional[ast.AST]) -> str:
                 continue
             if _base_name(node.func) == "tl":
                 return "mix"
-    except Exception:
+    except Exception as exc:
+        warnings.warn(
+            f"Kernel classification failed: {type(exc).__name__}: {exc}; "
+            "using the vector fallback. Check kernel AST or supply a kernel_type hint.", RuntimeWarning, stacklevel=2)
         return "vector"
     return "vector"
 
