@@ -364,10 +364,6 @@ With a budget, calibration determines `duration_i_ms` for each candidate, then
 respectively **500 and 30 measured launches**. Candidates with the same count
 are profiled together; retries retain each candidate's calculated count.
 
-The former `pruning`, `prune_runs`, `prune_recheck_runs`, and `prune_factor`
-mapping fields and their `TRITON_NPU_BENCH_*` variables are replaced by the
-slow-configuration options above.
-
 An explicit `cache_mode="cold"` composes cache eviction after the autotuner's
 existing preparation hooks during profiling. Those hooks and the `kernel_call`
 interface are preserved. `hot` does not guarantee that the working set fits in
@@ -383,10 +379,21 @@ profiling raises an error. Kernel execution errors propagate without retries.
 An explicit policy does not fall back to event timing with different cache
 conditions. Effective policies participate in the autotune result cache key.
 
-The separate `npu-strict` mode is removed. Select `TRITON_BENCH_METHOD=npu` and
-enable the desired fields above; `TRITON_NPU_STRICT_*` variables are replaced by
-`TRITON_NPU_BENCH_*` variables. Existing arguments take precedence over env
-values, including overrides that disable a feature enabled in the environment.
+### Warnings
+
+The tuner emits `RuntimeWarning` once per reason per instance, attributed to the
+kernel's definition. Python warning filters (`default`, `ignore`, and `error`)
+apply. Explicit measurement settings are diagnosed when ignored by another
+benchmark method, a custom `do_bench`, or selection with only one surviving
+configuration. `calibration_runs` is inactive without a budget; slow-filter
+fields are inactive when `filter_slow_configs=False`. These inactive fields and
+`verbose` do not change measurement routing or cache keys.
+
+Parser and compilation fallbacks, failed UBTuner recovery, missing profiler CSV,
+and non-finite final scores also warn with the fallback and a suggested action.
+The optional `auto_prof_dir` winner profile uses environment settings and warns
+when explicit `npu_bench_options` are not forwarded to it. Cleanup and report
+diagnostics preserve an exception already in flight, even with warnings as errors.
 
 ### Selected-configuration report
 
@@ -417,24 +424,7 @@ The complete measured rows from `kernel_details.csv` follow as CSV, preserving
 every column, its original value, and column order without truncation. Warmup
 rows and unrelated operations are excluded using the benchmark's row selection.
 
-For example, a two-launch measurement can produce:
-
-```text
-Triton autotuning result for kernel
-Selected config: 2/4 (1-based, before pruning)
-Full config parameters:
-{'kwargs': {'BLOCK': 128}, ...}
-Profiler kernel: kernel_...
-Mean duration: 10 us (0.01 ms)
-cache=hot, warmup=5, active=2, selected attempt=1
-Measured launches: all kernel_details.csv columns (warmup excluded)
-Name,Type,Start Time(us),Duration(us),Task ID
-kernel_...,Kernel,100.000,10.000,0001
-kernel_...,Kernel,110.000,10.000,0002
-```
-
-The configuration excerpt above is abbreviated for documentation; the actual
-report prints every field. CSV columns depend on the profiler's current settings
+CSV columns depend on the profiler's settings
 and version. No additional metrics or profiling runs are enabled by reporting.
 With retries, the report describes the attempt whose mean was retained for
 ranking, including any failed quality checks. It does not combine attempts.
