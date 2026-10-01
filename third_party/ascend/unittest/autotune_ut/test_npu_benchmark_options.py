@@ -481,12 +481,30 @@ def test_failed_measurement_runs_cleanup_and_restores_hook(backend, failure_stag
 
 
 def test_other_methods_and_user_benchmarkers_ignore_npu_options(backend, monkeypatch):
-    tuner = make_tuner(backend, dict(quality_check=True))
-    monkeypatch.setenv("TRITON_BENCH_METHOD", "default")
-    assert tuner._get_npu_benchmark_options() is None
+    for mode, custom, reason in [(None, False, "TRITON_BENCH_METHOD"),
+                                 ("default", False, "TRITON_BENCH_METHOD"), ("npu", True, "custom do_bench")]:
+        if mode is None:
+            monkeypatch.delenv("TRITON_BENCH_METHOD", raising=False)
+        else:
+            monkeypatch.setenv("TRITON_BENCH_METHOD", mode)
+        tuner = make_tuner(backend, dict(quality_check=True))
+        tuner.user_defined_do_bench = custom
+        with pytest.warns(RuntimeWarning, match=reason) as captured:
+            assert tuner._get_npu_benchmark_options() is None
+            assert tuner._get_npu_benchmark_options() is None
+        assert len(captured) == 1
+        tuner.npu_bench_options = None
+        del tuner._warned_ignored_npu_options
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            assert tuner._get_npu_benchmark_options() is None
+        assert not captured
     monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
-    tuner.user_defined_do_bench = True
-    assert tuner._get_npu_benchmark_options() is None
+    tuner = make_tuner(backend, dict(quality_check=True))
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        assert tuner._get_npu_benchmark_options().quality_check is True
+    assert not captured
 
 
 @pytest.mark.parametrize("mode", ["default", "cold", "hot"])

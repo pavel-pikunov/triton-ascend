@@ -2245,6 +2245,13 @@ class AutoTilingTuner(Autotuner):
         if not self.user_defined_do_bench and os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu":
             from .._npu_benchmark import resolve_options
             return resolve_options(self.npu_bench_options)
+        if self.npu_bench_options is not None and not getattr(self, "_warned_ignored_npu_options", False):
+            reason = ("a custom do_bench was provided" if self.user_defined_do_bench
+                      else "TRITON_BENCH_METHOD is not set to 'npu'")
+            warnings.warn(f"npu_bench_options are ignored because {reason}. "
+                          "Use TRITON_BENCH_METHOD=npu with the built-in benchmarker to apply them.",
+                          RuntimeWarning, stacklevel=3)
+            self._warned_ignored_npu_options = True
         return None
 
     @contextmanager
@@ -2882,7 +2889,8 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     :type auto_prof_dir: str
     :param hints: a dict of autotune hint auguments passed to AutoTilingTuner.
     :param npu_bench_options: optional NPU profiling policies, used only with
-        TRITON_BENCH_METHOD=npu and the built-in benchmarker. Fields override
+        TRITON_BENCH_METHOD=npu and the built-in benchmarker. Ignored explicit
+        options emit a RuntimeWarning once per tuner when first used. Fields override
         TRITON_NPU_BENCH_* independently: cache_mode ('hot'/'cold'), warmup,
         active (launch counts), quality_check, max_retries (additional attempts),
         measure_budget_ms, calibration_runs, filter_slow_configs,
