@@ -158,6 +158,8 @@ def test_selection_without_profiler_data_does_not_add_measurements(capsys, confi
     tuner._batch_bench = lambda *args, **kwargs: pytest.fail("extra measurement")
     assert tuner.run(torch.empty(1)) == "result"
     assert "NPU profiler measurements unavailable" in capsys.readouterr().out
+    assert tuner.run(torch.empty(1)) == "result"
+    assert capsys.readouterr().out == ""
 
 
 @pytest.mark.parametrize("failure", ["observer", "formatting", "warning"])

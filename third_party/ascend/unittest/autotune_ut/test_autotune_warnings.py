@@ -91,7 +91,7 @@ def test_single_pruned_config_skips_measurements_and_keeps_execution(monkeypatch
     assert len(captured) == (0 if tuner._npu_benchmark_options.is_default else 1)
     if captured:
         assert "skips measurements" in str(captured[0].message)
-    assert tuner.best_config is configs[1] and tuner.cache == {}
+    assert tuner.best_config is configs[1] and list(tuner.cache.values()) == [configs[1]]
 
 
 def test_extra_winner_profile_warns_and_keeps_environment_route(backend, monkeypatch, make_tuner):
