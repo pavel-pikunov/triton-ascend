@@ -9,7 +9,7 @@ import tempfile
 import time
 import warnings
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -141,7 +141,7 @@ def filter_slow_configs(funcs, synchronize, options):
 
 
 def benchmark_with_options(measure, funcs, names, options, *, warmup, active, prof_root, synchronize,
-                           verbose=False, keep_res=False):
+                           verbose=False, keep_res=False, _report_sink=None):
     """Wrap the existing profiler with optional filtering, calibration and retries.
 
     measure returns device timestamps and durations (microseconds) per callable.
@@ -160,10 +160,11 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
     active_counts = [active] * len(funcs)
     costs = [float("inf")] * len(funcs)
     best_failures = [[] for _ in funcs]
+    best_reports = [None] * len(funcs) if _report_sink is not None else None
     root = Path(prof_root)
     root.mkdir(parents=True, exist_ok=True)
 
-    def collect(selected, warmup_count, active_count):
+    def collect(selected, warmup_count, active_count, reports=None):
         execution_failed = False
 
         def track(fn):
@@ -181,7 +182,8 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
         directory = tempfile.mkdtemp(prefix="npu_bench_", dir=root)
         try:
             return measure([track(funcs[i]) for i in selected], [names[i] for i in selected],
-                           warmup_count, active_count, directory)
+                           warmup_count, active_count, directory,
+                           **({"_report_sink": reports.extend} if reports is not None else {}))
         except (RuntimeError, OSError) as exc:
             if execution_failed:
                 raise
@@ -215,19 +217,30 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
             groups.setdefault(active_counts[index], []).append(index)
         retry = []
         for active_count, selected in groups.items():
+            reports = [] if _report_sink is not None else None
             try:
-                samples = collect(selected, warmup, active_count)
+                samples = collect(selected, warmup, active_count, reports)
             except ProfilerAcquisitionError as exc:
                 last_acquisition_error = exc
                 log(f"attempt={attempt + 1}, configs={selected}, active={active_count}: {exc}")
                 retry.extend(selected)
                 continue
-            for index, (times, durations) in zip(selected, samples):
+            for position, (index, (times, durations)) in enumerate(zip(selected, samples)):
                 # Keep the existing NPU arithmetic mean for configuration ranking.
                 cost = float(np.mean(durations)) / 1000
                 metrics, failures = evaluate_quality(times, durations) if options.quality_check else ({}, [])
                 if cost < costs[index]:
                     costs[index], best_failures[index] = cost, failures
+                    if best_reports is not None:
+                        from ._autotune_report import report_safely
+
+                        def capture():
+                            best_reports[index] = None
+                            if len(reports) == len(selected) and reports[position] is not None:
+                                best_reports[index] = replace(reports[position], mean_ms=cost,
+                                                              attempt=attempt + 1, quality_failures=tuple(failures))
+
+                        report_safely(capture)
                 log(f"config={index}, attempt={attempt + 1}, active={active_count}, cost_ms={cost:.8g}, "
                     f"metrics={metrics}, failures={failures}")
                 if failures:
@@ -247,4 +260,7 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
                        + "; ".join(best_failures[best]))
     if reasons:
         warnings.warn("NPU benchmark: " + "; ".join(reasons), RuntimeWarning, stacklevel=3)
+    if _report_sink is not None:
+        from ._autotune_report import report_safely
+        report_safely(lambda: _report_sink(best_reports))
     return costs

@@ -388,6 +388,64 @@ enable the desired fields above; `TRITON_NPU_STRICT_*` variables are replaced by
 `TRITON_NPU_BENCH_*` variables. Existing arguments take precedence over env
 values, including overrides that disable a feature enabled in the environment.
 
+### Selected-configuration report
+
+To print a detailed report after selecting a configuration, set
+`report_best_config=True` on `autotune` or `max_autotune`, or set
+`TRITON_NPU_BENCH_REPORT_BEST_CONFIG=1`. This diagnostic option is separate from
+`npu_bench_options` and `verbose`. An explicit argument overrides the environment;
+the default is disabled. Environment values accept `0`, `1`, `false`, and `true`.
+
+```python
+@triton.autotune(
+    configs=configs,
+    key=["N"],
+    report_best_config=True,
+    npu_bench_options={"cache_mode": "hot", "active": 30},
+)
+@triton.jit
+def kernel(x, y, N, BLOCK: tl.constexpr):
+    ...
+```
+
+The report prints the configuration's **1-based number in the original candidate
+list before pruning**, all configuration fields (including defaults and `None`),
+and `ubtune_cfg` when present. With NPU profiler data available, it also prints
+the profiler kernel name, mean duration in microseconds and milliseconds, cache
+mode, warmup and measured launch counts, and the selected measurement attempt.
+The complete measured rows from `kernel_details.csv` follow as CSV, preserving
+every column, its original value, and column order without truncation. Warmup
+rows and unrelated operations are excluded using the benchmark's row selection.
+
+For example, a two-launch measurement can produce:
+
+```text
+Triton autotuning result for kernel
+Selected config: 2/4 (1-based, before pruning)
+Full config parameters:
+{'kwargs': {'BLOCK': 128}, ...}
+Profiler kernel: kernel_...
+Mean duration: 10 us (0.01 ms)
+cache=hot, warmup=5, active=2, selected attempt=1
+Measured launches: all kernel_details.csv columns (warmup excluded)
+Name,Type,Start Time(us),Duration(us),Task ID
+kernel_...,Kernel,100.000,10.000,0001
+kernel_...,Kernel,110.000,10.000,0002
+```
+
+The configuration excerpt above is abbreviated for documentation; the actual
+report prints every field. CSV columns depend on the profiler's current settings
+and version. No additional metrics or profiling runs are enabled by reporting.
+With retries, the report describes the attempt whose mean was retained for
+ranking, including any failed quality checks. It does not combine attempts.
+
+Reporting does not change launch counts, pruning, configuration selection, or
+autotune cache keys. Cache hits do not print the report again. If selection did
+not capture NPU profiler data (for example, a single candidate needed no tuning
+or a custom benchmarker was used), the report prints the configuration and
+states that profiler measurements are unavailable. Temporary files retain their
+existing cleanup behavior; captured rows are released after reporting.
+
 ## Summary
 
 Triton-Ascend extends community autotune with automatic tiling-candidate generation, joint parameter tuning, and optional NPU benchmark policies. For most users, the recommended usage is:
