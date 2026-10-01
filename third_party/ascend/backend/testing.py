@@ -71,6 +71,10 @@ def do_bench_npu(
     active = active if options.active is None else options.active
     if options.cache_mode is not None:
         clear_l2_cache = options.cache_mode == "cold"
+    verbose = options.verbose if options.verbose is not None else os.getenv("TRITON_PRINT_AUTOTUNING") == "1"
+    if verbose:
+        print(f"npu benchmark: cache={'cold' if clear_l2_cache else 'hot'}, warmup={warmup}, active={active}, "
+              f"quality_check={options.quality_check}, filter_slow_configs={options.filter_slow_configs}")
     report_kwargs = {"_report_sink": _report_sink} if _report_sink is not None else {}
     if options.is_default:
         return _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
@@ -80,10 +84,6 @@ def do_bench_npu(
              if target_kernel_name is None or isinstance(target_kernel_name, str) else list(target_kernel_name))
     if len(names) != len(funcs) or any(name is not None and (not isinstance(name, str) or not name) for name in names):
         raise ValueError("Provide one nonempty target kernel name (or None) per function")
-    verbose = options.verbose if options.verbose is not None else os.getenv("TRITON_PRINT_AUTOTUNING") == "1"
-    if verbose:
-        print(f"npu benchmark: cache={'cold' if clear_l2_cache else 'hot'}, warmup={warmup}, active={active}, "
-              f"quality_check={options.quality_check}, filter_slow_configs={options.filter_slow_configs}")
     if not options.needs_samples and not options.filter_slow_configs:
         return _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
                             _pre_hook_scope=_pre_hook_scope, **report_kwargs)
@@ -158,6 +158,7 @@ def _profile_npu(
     # Only an explicitly selected cold cache policy composes the autotuner hook.
     # Ordinary callers retain cache eviction before fn(), as in release/3.2.2.
     hook_scope = _pre_hook_scope(evict_cache) if clear_l2_cache and _pre_hook_scope else nullcontext()
+    failed = False
     try:
         with hook_scope, torch_npu.profiler.profile(
             activities=[torch_npu.profiler.ProfilerActivity.NPU],
@@ -185,10 +186,19 @@ def _profile_npu(
             _return_samples=_return_samples,
             **({"_report_sink": _report_sink} if _report_sink is not None else {}),
         )
+    except BaseException:
+        failed = True
+        raise
     finally:
         if clear_l2_cache:
             del buffer
-        _rm_dic(keep_res, torch_path)
+        try:
+            _rm_dic(keep_res, torch_path)
+        except Exception as exc:
+            if not failed:
+                raise
+            from ._npu_benchmark import _warn_secondary
+            _warn_secondary("NPU profile cleanup failed", exc)
 
 
 def _rm_dic(keep_res, torch_path):

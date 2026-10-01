@@ -1,5 +1,7 @@
 """Hardware-independent policy tests. Run with --confcutdir=autotune_ut."""
 
+from __future__ import annotations
+
 import ast
 import builtins
 import csv
@@ -88,6 +90,7 @@ def test_argument_overrides_environment_per_field(backend, monkeypatch):
                                     dict(filter_slow_configs="true"), dict(cache_mode="L1"), dict(unknown=1),
                                     dict(quality_check=True, active=1), dict(slow_config_factor=0.5),
                                     dict(slow_config_runs=0), dict(slow_config_recheck_runs=0),
+                                    dict(calibration_runs=1),
                                     dict(pruning="fast")])
 def test_invalid_options(backend, options):
     with pytest.raises(ValueError):
@@ -613,3 +616,180 @@ def test_slow_filter_operates_on_candidates_remaining_after_cv_estimate(backend,
     assert profiled == ([(2, 0, 10), (2, 5, 30)] if explicit_counts else [(2, 1, 1)])
     kept = [config for config, cost in costs.items() if np.isfinite(cost)]
     assert kept == [configs[1], configs[11 if explicit_counts else 9]]
+
+
+INACTIVE_OPTIONS = dict(verbose=True, calibration_runs=27, slow_config_runs=31,
+                        slow_config_recheck_runs=53, slow_config_factor=7)
+
+
+@pytest.mark.parametrize("active_policy", [{}, dict(active=30), dict(quality_check=True),
+                                         dict(measure_budget_ms=5), dict(filter_slow_configs=True)])
+def test_effective_policy_ignores_only_inactive_fields(backend, active_policy):
+    resolve = backend.policy.resolve_options
+    baseline = resolve(active_policy)
+    changed = dict(INACTIVE_OPTIONS, **active_policy)
+    if baseline.measure_budget_ms is not None:
+        changed.pop("calibration_runs")
+    if baseline.filter_slow_configs:
+        for name in ("slow_config_runs", "slow_config_recheck_runs", "slow_config_factor"):
+            changed.pop(name)
+    adjusted = resolve(changed)
+    assert baseline.is_default == adjusted.is_default
+    assert baseline.cache_key() == adjusted.cache_key()
+    assert resolve(dict(active=30)).is_default is False
+    assert resolve(dict(measure_budget_ms=5)).cache_key() != resolve(dict(measure_budget_ms=5, calibration_runs=27)).cache_key()
+    assert resolve(dict(filter_slow_configs=True)).cache_key() != resolve(dict(filter_slow_configs=True, slow_config_runs=31)).cache_key()
+
+
+@pytest.mark.parametrize("source", ["argument", "environment"])
+@pytest.mark.parametrize("count", [1, 2])
+def test_diagnostics_and_inactive_fields_preserve_tuner_route_and_key(backend, monkeypatch, source, count):
+    monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
+    tuner = make_tuner(backend, INACTIVE_OPTIONS if source == "argument" else None)
+    if source == "environment":
+        for name, value in INACTIVE_OPTIONS.items():
+            monkeypatch.setenv(backend.policy.ENV_PREFIX + name.upper(), str(value))
+    tuner.keys, tuner.arg_names, tuner.cache = [], ["x"], {("float32",): None}
+    assert tuner.generate_key_and_configs(SimpleNamespace(dtype="float32")) == ("float32",)
+    prunes, profiles = [], []
+
+    def prune(funcs):
+        prunes.append(True)
+        tuner.cv_warmup, tuner.cv_repeat = 8, 50
+        return funcs
+
+    def profile(funcs, **kwargs):
+        profiles.append((kwargs["warmup"], kwargs["active"]))
+        return [7] * len(funcs)
+
+    tuner._prune_by_time_limit = prune
+    tuner.do_bench = lambda *a, **k: 7
+    monkeypatch.setattr(backend.testing, "do_bench_npu", profile)
+    assert list(tuner._batch_bench(configs=[Config() for _ in range(count)]).values()) == [7] * count
+    assert prunes == ([] if count == 1 else [True])
+    assert profiles == ([] if count == 1 else [(8, 50)])
+
+
+def test_verbose_only_changes_profiler_output(backend, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(backend.testing, "_profile_npu", lambda *a, **k: calls.append((a, k)) or 7)
+    fn = lambda: None
+    assert backend.testing.do_bench_npu(fn) == 7
+    assert backend.testing.do_bench_npu(fn, npu_bench_options=INACTIVE_OPTIONS) == 7
+    assert calls[0] == calls[1]
+    assert "npu benchmark:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("warnings_as_errors", [False, True])
+def test_eviction_and_post_hook_double_failure_preserves_eviction(backend, warnings_as_errors):
+    tuner = make_tuner(backend)
+    original = tuner.pre_hook
+    primary, secondary = RuntimeError("eviction"), ValueError("restore")
+    cleanup = []
+
+    def fail():
+        raise primary
+
+    def post_hook(args, exception):
+        cleanup.append(exception)
+        raise secondary
+
+    tuner.post_hook = post_hook
+    with warnings.catch_warnings(record=True) as diagnostics:
+        warnings.simplefilter("error" if warnings_as_errors else "always")
+        with pytest.raises(RuntimeError) as caught:
+            with tuner._npu_cache_pre_hook(fail):
+                tuner._make_kernel_call(config=Config())(warmup=False)
+    assert caught.value is primary
+    assert cleanup == [primary] and tuner.pre_hook is original
+    if not warnings_as_errors:
+        assert "restore" in str(diagnostics[0].message)
+
+
+@pytest.fixture
+def fake_profiler(backend, monkeypatch):
+    @contextmanager
+    def profile(**kwargs):
+        yield
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: None)))
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(profiler=SimpleNamespace(
+        _ExperimentalConfig=lambda **kw: None, AiCMetrics=SimpleNamespace(PipeUtilization=1),
+        ProfilerLevel=SimpleNamespace(Level1=1), ProfilerActivity=SimpleNamespace(NPU=1),
+        tensorboard_trace_handler=lambda path: None, profile=profile,
+    )))
+
+
+@pytest.mark.parametrize("stage", ["kernel", "collection", "success"])
+@pytest.mark.parametrize("warnings_as_errors", [False, True])
+def test_profile_and_removal_double_failure(backend, monkeypatch, tmp_path, fake_profiler,
+                                            stage, warnings_as_errors):
+    primary, secondary = ValueError("primary"), OSError("remove profile")
+    calls = []
+
+    def kernel():
+        calls.append(True)
+        if stage == "kernel" and len(calls) > 1:
+            raise primary
+
+    def collect(*args, **kwargs):
+        if stage == "collection":
+            raise primary
+        return 7
+
+    def remove(*args):
+        raise secondary
+
+    monkeypatch.setattr(backend.testing, "_collect_prof_result", collect)
+    monkeypatch.setattr(backend.testing, "_rm_dic", remove)
+    with warnings.catch_warnings(record=True) as diagnostics:
+        warnings.simplefilter("error" if warnings_as_errors else "always")
+        with pytest.raises(Exception) as caught:
+            backend.testing._profile_npu(kernel, warmup=0, active=1, prof_dir=str(tmp_path))
+    assert caught.value is (secondary if stage == "success" else primary)
+    if stage != "success" and not warnings_as_errors:
+        assert "remove profile" in str(diagnostics[0].message)
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_policy_profile_removal_preserves_primary_or_propagates(backend, monkeypatch, tmp_path, failure):
+    primary, secondary = ValueError("execution"), OSError("remove")
+
+    def measure(*args):
+        if failure:
+            raise primary
+        return [sample()]
+
+    def remove(*args):
+        raise secondary
+
+    monkeypatch.setattr(backend.policy.shutil, "rmtree", remove)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(Exception) as caught:
+            run_policy(backend, tmp_path, measure, dict(quality_check=True), funcs=[lambda: None])
+    assert caught.value is (primary if failure else secondary)
+
+
+def test_budget_retains_all_10000_launches_and_samples(backend, monkeypatch, tmp_path):
+    calls, launches, checked = [], [], []
+    values = np.random.default_rng(42).normal(1000, 2, 10000)
+
+    def measure(funcs, names, warmup, active, directory):
+        calls.append((warmup, active))
+        for _ in range(active):
+            funcs[0]()
+        return [(np.arange(active, dtype=float), np.full(active, 1000.) if active == 10 else values)]
+
+    original = backend.policy.evaluate_quality
+
+    def quality(times, durations):
+        checked.append(len(durations))
+        return original(times, durations)
+
+    monkeypatch.setattr(backend.policy, "evaluate_quality", quality)
+    result = run_policy(backend, tmp_path, measure, dict(measure_budget_ms=10000, quality_check=True),
+                        funcs=[lambda: launches.append(True)])
+    assert calls == [(0, 10), (5, 10000)]
+    assert len(launches) == 10010 and checked == [10000]
+    assert result == [float(np.mean(values)) / 1000]

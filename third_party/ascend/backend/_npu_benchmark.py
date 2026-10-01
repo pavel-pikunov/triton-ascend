@@ -50,16 +50,35 @@ class NpuBenchmarkOptions:
 
     @property
     def is_default(self):
-        return self == NpuBenchmarkOptions()
+        return self._effective_policy() == NpuBenchmarkOptions()._effective_policy()
+
+    def _effective_policy(self):
+        policy = asdict(self)
+        del policy["verbose"]
+        if self.measure_budget_ms is None:
+            del policy["calibration_runs"]
+        if not self.filter_slow_configs:
+            for name in ("slow_config_runs", "slow_config_recheck_runs", "slow_config_factor"):
+                del policy[name]
+        return tuple(sorted(policy.items()))
 
     @property
     def needs_samples(self):
         return self.quality_check or self.max_retries > 0 or self.measure_budget_ms is not None
 
     def cache_key(self):
-        policy = tuple(sorted(asdict(self).items()))
+        policy = self._effective_policy()
         thresholds = tuple(sorted(THRESHOLDS.items())) if self.quality_check else ()
         return ("npu-benchmark", 2, policy, thresholds)
+
+
+def _warn_secondary(message, error):
+    """Report cleanup failures without replacing an exception in flight."""
+    try:
+        warnings.warn(f"{message}: {error}", RuntimeWarning, stacklevel=3)
+    except Exception:
+        # Includes warnings-as-errors and failures in diagnostic formatting.
+        pass
 
 
 def resolve_options(arguments=None):
@@ -166,6 +185,7 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
 
     def collect(selected, warmup_count, active_count, reports=None):
         execution_failed = False
+        failed = False
 
         def track(fn):
             def call():
@@ -185,12 +205,21 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
                            warmup_count, active_count, directory,
                            **({"_report_sink": reports.extend} if reports is not None else {}))
         except (RuntimeError, OSError) as exc:
+            failed = True
             if execution_failed:
                 raise
             raise ProfilerAcquisitionError(str(exc)) from exc
+        except BaseException:
+            failed = True
+            raise
         finally:
             if not keep_res:
-                shutil.rmtree(directory, ignore_errors=True)
+                try:
+                    shutil.rmtree(directory)
+                except Exception as exc:
+                    if not failed:
+                        raise
+                    _warn_secondary("NPU profile cleanup failed", exc)
 
     log(f"configs={len(funcs)}, kept={indices}, warmup={warmup}, active={active}")
     if options.measure_budget_ms is not None:
