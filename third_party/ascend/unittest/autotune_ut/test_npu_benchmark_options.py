@@ -4,10 +4,12 @@ import ast
 import builtins
 import csv
 import functools
+import gc
 import importlib
 import inspect
 import os
 import sys
+import time
 import types
 import warnings
 from contextlib import contextmanager, nullcontext
@@ -47,7 +49,7 @@ def backend(monkeypatch):
     source = ast.parse((BACKEND / "runtime" / "autotuner.py").read_text(encoding="utf-8"))
     original = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "AutoTilingTuner")
     names = {"_get_npu_benchmark_options", "_npu_cache_pre_hook", "_make_kernel_call", "_batch_bench",
-             "_resolve_target_kernel_name", "generate_key_and_configs", "_prune_by_time_limit"}
+             "_resolve_target_kernel_name", "generate_key_and_configs", "_prune_by_time_limit", "run"}
     methods = [node for node in original.body if isinstance(node, ast.FunctionDef) and node.name in names]
     for method in methods:
         method.body = [node for node in method.body if not (
@@ -57,11 +59,13 @@ def backend(monkeypatch):
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     namespace = dict(__package__=PACKAGE + ".runtime", contextmanager=contextmanager, functools=functools,
                      os=os, builtins=builtins, warnings=warnings, asdict=asdict, Any=Any, Dict=Dict, Config=Config,
+                     gc=gc, time=time,
                      get_byte_per_numel=lambda dtype: 4, CompileTimeAssertionFailure=type("CompileError", (Exception,), {}),
                      MLIRCompilationError=type("MLIRError", (Exception,), {}),
                      OutOfResources=type("ResourceError", (Exception,), {}))
     exec(compile(module, str(BACKEND / "runtime" / "autotuner.py"), "exec"), namespace)
-    return SimpleNamespace(policy=policy, testing=testing, Tuner=namespace["Tuner"])
+    report = importlib.import_module(f"{PACKAGE}._autotune_report")
+    return SimpleNamespace(policy=policy, testing=testing, report=report, Tuner=namespace["Tuner"])
 
 
 def test_argument_overrides_environment_per_field(backend, monkeypatch):
