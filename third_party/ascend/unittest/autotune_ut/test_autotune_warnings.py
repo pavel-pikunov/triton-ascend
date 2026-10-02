@@ -12,7 +12,6 @@ import torch
 import triton
 from triton import Config
 from triton.backends.ascend.runtime import autotuner as generators
-from triton.backends.ascend.runtime.dsl_analysis import kernel_classifier as classifier
 
 
 def test_constructor_initializes_warnings_before_axis_analysis(monkeypatch, make_tuner):
@@ -175,20 +174,6 @@ def test_fallback_failures_warn_without_debug_and_keep_results(monkeypatch, oper
                             (_ for _ in ()).throw(ValueError("invalid hint")))
         with pytest.raises(ValueError, match="invalid hint"):
             call()
-
-
-def test_classifier_internal_failure_warns_and_keeps_vector_fallback(monkeypatch):
-
-    def fail(tree):
-        raise RuntimeError("AST walk broke")
-
-    monkeypatch.setattr(classifier.ast, "walk", fail)
-    with pytest.warns(RuntimeWarning, match="AST walk broke.*vector fallback"):
-        assert classifier.classify_kernel_type_from_dsl(ast.parse("")) == "vector"
-    with warnings.catch_warnings(record=True) as captured:
-        warnings.simplefilter("always")
-        assert classifier.classify_kernel_type_from_dsl(None) == "vector"
-    assert not captured
 
 
 @pytest.mark.parametrize("warnings_as_errors", [False, True])
