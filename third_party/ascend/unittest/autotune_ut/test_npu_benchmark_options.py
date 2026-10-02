@@ -229,10 +229,10 @@ def test_profile_sample_filtering_and_warmup(backend, tmp_path):
         writer.writerows([["hook", "Other", 0, 1], ["flush", "ReduceSum", 1, 1], ["a", "Kernel", 2, 99],
                           ["a", "Kernel", 3, 10], ["a", "Kernel", 4, 11], ["b", "Kernel", 5, 99],
                           ["b", "Kernel", 6, 20], ["b", "Kernel", 7, 21]])
-    samples = backend.testing._read_profile_samples(tmp_path, ["a", "b"], 1, 2, True)
+    samples = backend.profiler._read_profile_samples(tmp_path, ["a", "b"], 1, 2, True)
     assert [durations.tolist() for _, durations in samples] == [[10, 11], [20, 21]]
     with pytest.raises(backend.policy.ProfilerAcquisitionError, match="Expected"):
-        backend.testing._read_profile_samples(tmp_path, ["a", "b"], 1, 3, True)
+        backend.profiler._read_profile_samples(tmp_path, ["a", "b"], 1, 3, True)
 
 
 @pytest.mark.parametrize("source", ["argument", "environment"])
@@ -475,11 +475,11 @@ def test_eviction_and_post_hook_double_failure_preserves_eviction(warnings_as_er
         assert "restore" in str(diagnostics[0].message)
 
 
-@pytest.mark.parametrize("stage", ["kernel", "collection", "success"])
+@pytest.mark.parametrize("stage", ["kernel", "profiler_exit", "collection", "success"])
 @pytest.mark.parametrize("warnings_as_errors", [False, True])
 def test_profile_and_removal_double_failure(backend, monkeypatch, tmp_path, fake_profiler, stage, warnings_as_errors):
     primary, secondary = ValueError("primary"), OSError("remove profile")
-    calls = []
+    calls, removals = [], []
 
     def kernel():
         calls.append(True)
@@ -492,7 +492,17 @@ def test_profile_and_removal_double_failure(backend, monkeypatch, tmp_path, fake
         return 7
 
     def remove(*args):
+        removals.append(True)
         raise secondary
+
+    if stage == "profiler_exit":
+
+        @contextmanager
+        def profile(**kwargs):
+            yield
+            raise primary
+
+        monkeypatch.setattr(torch_npu.profiler, "profile", profile)
 
     monkeypatch.setattr(backend.testing, "_collect_prof_result", collect)
     monkeypatch.setattr(backend.testing, "_rm_dic", remove)
@@ -501,6 +511,7 @@ def test_profile_and_removal_double_failure(backend, monkeypatch, tmp_path, fake
         with pytest.raises(Exception) as caught:
             backend.testing._profile_npu(kernel, warmup=0, active=1, prof_dir=str(tmp_path))
     assert caught.value is (secondary if stage == "success" else primary)
+    assert len(removals) == 1
     if stage != "success" and not warnings_as_errors:
         assert "remove profile" in str(diagnostics[0].message)
 

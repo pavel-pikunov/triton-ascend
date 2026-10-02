@@ -12,7 +12,7 @@ import torch
 import torch_npu
 import triton
 import triton.language as tl
-from triton.backends.ascend import _autotune_report, _npu_benchmark, testing
+from triton.backends.ascend import _autotune_report, _npu_benchmark, _npu_profiler, testing
 from triton.backends.ascend.runtime import autotuner
 from triton.runtime.driver import driver
 
@@ -29,7 +29,8 @@ def backend(monkeypatch, tmp_path):
     monkeypatch.setenv("TRITON_BENCH_METHOD", "default")
     monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
     monkeypatch.setattr(testing.runtime.cache, "get_home_dir", lambda: str(tmp_path))
-    return SimpleNamespace(policy=_npu_benchmark, quality=_benchmark_quality, testing=testing, report=_autotune_report)
+    return SimpleNamespace(policy=_npu_benchmark, quality=_benchmark_quality, testing=testing, report=_autotune_report,
+                           profiler=_npu_profiler)
 
 
 @pytest.fixture

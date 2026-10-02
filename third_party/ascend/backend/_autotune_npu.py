@@ -1,0 +1,208 @@
+"""Private integration of optional NPU policies with the existing tuner."""
+
+import copy
+import math
+import os
+import warnings
+from collections.abc import Sequence
+from contextlib import contextmanager
+from dataclasses import asdict
+
+from . import _autotune_report as report_module
+
+
+def initialize(tuner, options, report):
+    tuner._warning_reasons = set()
+    tuner._warning_registry = {}
+    tuner.npu_bench_options = copy.copy(options)
+    tuner.report_best_config = report_module.resolve_report_best_config(report)
+
+
+def warn_once(tuner, reason, message):
+    """Emit each reason once per tuner, respecting ignore and error filters."""
+    if reason in tuner._warning_reasons:
+        return
+    kernel = tuner.base_fn
+    warnings.warn_explicit(
+        f"Autotuning kernel {kernel.__name__}: {message}",
+        RuntimeWarning,
+        filename=kernel.__code__.co_filename,
+        lineno=kernel.__code__.co_firstlineno,
+        module=kernel.__module__,
+        registry=tuner._warning_registry,
+    )
+    tuner._warning_reasons.add(reason)
+
+
+def get_options(tuner):
+    from ._npu_benchmark import _inactive_option_messages, _supplied_option_fields, resolve_options
+
+    if not tuner.user_defined_do_bench and os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu":
+        options = resolve_options(tuner.npu_bench_options)
+        for reason, message in _inactive_option_messages(options, tuner.npu_bench_options):
+            tuner._warn_once(reason, message)
+        return options
+    fields = _supplied_option_fields(tuner.npu_bench_options)
+    if fields or tuner.npu_bench_options is not None:
+        reason = ("a custom do_bench was provided"
+                  if tuner.user_defined_do_bench else "TRITON_BENCH_METHOD is not set to 'npu'")
+        tuner._warn_once(
+            "ignored_npu_options", f"npu_bench_options and TRITON_NPU_BENCH_* measurement settings "
+            f"({', '.join(sorted(fields)) or 'npu_bench_options'}) are ignored because {reason}. "
+            "Use TRITON_BENCH_METHOD=npu with the built-in benchmarker to apply them.")
+    return None
+
+
+@contextmanager
+def cache_pre_hook(tuner, evict_cache):
+    """Compose measurement preparation after both existing kernel hooks."""
+    original = tuner.pre_hook
+
+    def pre_hook(args, reset_only=False):
+        if reset_only:
+            return original(args, reset_only=True)
+        original(args)
+        try:
+            evict_cache()
+        except Exception as exc:
+            # Preparation may have saved tensors for restore_value. Pair
+            # it with the existing cleanup even if eviction prevents launch.
+            try:
+                tuner.post_hook(args, exception=exc)
+            except Exception as cleanup_error:
+                from ._npu_benchmark import _warn_secondary
+                _warn_secondary("NPU post_hook failed after cache eviction", cleanup_error)
+            raise
+
+    tuner.pre_hook = pre_hook
+    try:
+        yield
+    finally:
+        tuner.pre_hook = original
+
+
+def append_policy_key(key, options):
+    if options is not None and not options.is_default:
+        key.append(options.cache_key())
+
+
+def check_scores(tuner, timings):
+    if not any(math.isfinite(cost[0] if isinstance(cost, Sequence) else cost) for cost in timings.values()):
+        tuner._warn_once(
+            "unusable_measurements", "All final benchmark scores are non-finite; "
+            "selecting a config without usable measurements. Check profiler output "
+            "and benchmark settings.")
+
+
+def warn_skipped_measurements(tuner):
+    options = tuner._npu_benchmark_options
+    if options is not None and not options.is_default:
+        tuner._warn_once(
+            "skipped_measurements", "Only one config remains after pruning; autotuning "
+            "skips measurements and the effective NPU benchmark policy is not applied. "
+            "Provide multiple surviving configs or benchmark the kernel directly.")
+
+
+def print_winner(tuner, config, reports):
+    if reports is not None:
+        try:
+            report_module.report_safely(lambda: report_module.print_best_config_report(
+                tuner.base_fn.__name__, tuner.configs, config, reports.get(config)))
+        finally:
+            reports.clear()
+
+
+def prune_candidates(tuner, run_fns, options):
+    use_existing_counts = options is None or (options.active is None and options.measure_budget_ms is None)
+    cv_mode = (use_existing_counts and len(run_fns) > 1 and tuner.parser_mode in ("cube", "mix")
+               and tuner.cv_parse_result is not None)
+    if cv_mode:
+        if options is not None and options.warmup is not None:
+            run_fns = tuner._prune_by_time_limit(run_fns, warmup=options.warmup)
+        else:
+            run_fns = tuner._prune_by_time_limit(run_fns)
+    return run_fns, cv_mode
+
+
+def prepare_profile(tuner, options, kernels_call, run_fns, report_sink):
+    from ._npu_benchmark import _ResolvedOptions
+    # Resolved defaults must override conflicting environment values without
+    # repeating diagnostics for fields synthesized by the tuner.
+    kwargs = {"npu_bench_options": _ResolvedOptions(asdict(options))}
+    reports = [] if report_sink is not None else None
+    if reports is not None:
+        kwargs["_report_sink"] = reports.extend
+    if not options.is_default:
+        if options.cache_mode == "cold":
+            kwargs["_pre_hook_scope"] = tuner._npu_cache_pre_hook
+        names = [getattr(kernels_call[config], "target_kernel_name", None) for config in run_fns]
+    else:
+        names = tuner._resolve_target_kernel_name(kernels_call, run_fns.keys())
+    return names, kwargs, reports
+
+
+def finish_profile(run_fns, costs, reports, report_sink):
+    if len(run_fns) == 1:
+        costs = [costs]
+    assert len(costs) == len(run_fns)
+    if report_sink is not None:
+        report_module.report_safely(lambda: report_sink(dict(zip(run_fns, reports))))
+    return dict(zip(run_fns, costs))
+
+
+def warn_generator_parameters(operator_name, params, supported):
+    unsupported = sorted(params.keys() - supported)
+    if unsupported:
+        warnings.warn(
+            f"Config generator '{operator_name}' does not support parameters {unsupported}. "
+            "Known unsupported keys are ignored; unknown keys fail validation. "
+            "Remove them or use a generator that supports them.", RuntimeWarning, stacklevel=4)
+
+
+def check_max_config_parameters(kernel_type, tuning_params, cube_params, vector_params, mixcv_params):
+    if kernel_type not in ("cube", "mixcv", "vector"):
+        warnings.warn(
+            f"Unknown kernel_type {kernel_type!r}; falling back to 'mixcv'. "
+            "Use 'cube', 'mixcv', or 'vector'.", RuntimeWarning, stacklevel=4)
+    supported = cube_params if kernel_type == "cube" else vector_params if kernel_type == "vector" else mixcv_params
+    unsupported = sorted(tuning_params.keys() - supported)
+    if unsupported:
+        warnings.warn(
+            f"Config expansion for kernel_type {kernel_type!r} ignores parameters {unsupported}. "
+            "Remove unknown keys or choose a kernel_type that supports them.", RuntimeWarning, stacklevel=4)
+
+
+_FALLBACK_MESSAGES = {
+    'extra_profile_options':
+    ('The additional winner _profile does not receive explicit npu_bench_options; it uses '
+     'TRITON_NPU_BENCH_* environment settings and defaults. Set those environment variables for this '
+     'profile or omit auto_prof_dir.'),
+    'kernel_classification_parse':
+    ('Kernel classification parsing failed: {exception_type}: {exception}; using the kernel_type hint '
+     'or vector fallback. Check kernel code or supply a kernel_type hint.'),
+    'kernel_dot_analysis': ('Kernel dot-site analysis failed: {exception_type}: {exception}; keeping classification '
+                            '{kernel_type!r}. Supply a kernel_type hint if needed.'),
+    'vector_parser': ('Parsing {parser_name} failed: {exception_type}: {exception}; using fallback {fallback_value!r}. '
+                      'Check kernel code or supply axis hints.'),
+    'tunable_analysis': ('Tunable-parameter analysis failed: {exception_type}: {exception}; using missing constexpr '
+                         'parameters as fallback. Supply tunable_parameter hints.'),
+    'vector_v2_parser':
+    ('Vector v2 parsing failed: {exception_type}: {exception}; using the legacy vector parser fallback. '
+     'Check kernel code or supply axis hints.'),
+    'ubtuner_failure': ('UBTuner recovery failed: {exception_type}: {exception}; continuing with available candidates. '
+                        'Check UBTuner settings and kernel resources.'),
+    'constexpr_axis_analysis':
+    ('Constexpr analysis for vector axes failed: {exception_type}: {exception}; treating all arguments '
+     'as runtime arguments. Check kernel annotations or supply axis hints.'),
+    'parallel_compile_failure':
+    ('Parallel compilation failed: {exception_type}: {exception}; continuing with available candidates '
+     'after resetting active_mode. Check compilation errors or set TRITON_AUTOTUNE_PARALLEL_COMPILE=0.'),
+}
+
+
+def warn_fallback(tuner, reason, *, exc=None, parser_name=None, fallback_value=None, kernel_type=None):
+    message = _FALLBACK_MESSAGES[reason].format(exception_type=type(exc).__name__, exception=exc,
+                                                parser_name=parser_name, fallback_value=fallback_value,
+                                                kernel_type=kernel_type)
+    warning_reason = f"vector_parser_{parser_name}" if reason == "vector_parser" else reason
+    tuner._warn_once(warning_reason, message)

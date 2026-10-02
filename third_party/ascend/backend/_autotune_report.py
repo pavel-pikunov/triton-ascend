@@ -74,3 +74,29 @@ def print_best_config_report(function_name, configs, config, measurement=None):
         writer.writeheader()
         writer.writerows(measurement.rows)
     print(stream.getvalue(), end="")
+
+
+def capture_profile_report(kernel_details_file, filter_df, time_cost, num_warmup, num_active, clear_l2_cache,
+                           report_sink):
+
+    def capture():
+        # Use the collector's existing row selection and costs, but reread
+        # raw CSV strings so diagnostic values retain their original spelling.
+        with open(kernel_details_file, newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            columns = tuple(reader.fieldnames or ())
+            raw_rows = list(reader)
+        total = num_warmup + num_active
+        reports = [
+            NpuMeasurementReport(
+                columns,
+                tuple(raw_rows[i] for i in filter_df.iloc[index * total + num_warmup:(index + 1) * total].index),
+                num_warmup,
+                num_active,
+                "cold" if clear_l2_cache else "hot",
+                cost,
+            ) for index, cost in enumerate(time_cost)
+        ]
+        report_sink(reports)
+
+    report_safely(capture)
