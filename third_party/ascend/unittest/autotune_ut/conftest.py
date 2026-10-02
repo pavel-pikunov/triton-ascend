@@ -71,8 +71,8 @@ def make_tuner(backend, monkeypatch, jit_kernel):
 @pytest.fixture
 def configure_run(make_tuner, monkeypatch):
 
-    def configure(selected, configs, reports_enabled):
-        tuner = make_tuner(configs=configs, report_best_config=reports_enabled)
+    def configure(selected, configs, reports_enabled, **kwargs):
+        tuner = make_tuner(configs=configs, report_best_config=reports_enabled, **kwargs)
         monkeypatch.setattr(tuner, "prune_configs", lambda kwargs: [selected, configs[0]])
         monkeypatch.setattr(tuner.fn, "run", lambda *a, **k: "result")
         return tuner

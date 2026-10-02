@@ -553,9 +553,8 @@ class AutoTilingTuner(Autotuner):
         if hasattr(self, "_get_constexpr_candidates"):
             try:
                 constexpr_names = set(self._get_constexpr_candidates())
-            except Exception as exc:
+            except Exception:
                 constexpr_names = set()
-                npu_tuning.warn_fallback(self, 'constexpr_axis_analysis', exc=exc)
         return [
             arg_name for arg_name in getattr(self, "arg_names", [])
             if arg_name not in constexpr_names
@@ -881,9 +880,8 @@ class AutoTilingTuner(Autotuner):
         parsed_ast = None
         try:
             parsed_ast = self.fn.parse()
-        except Exception as exc:
+        except Exception:
             parsed_ast = None
-            npu_tuning.warn_fallback(self, 'kernel_classification_parse', exc=exc)
 
         kernel_type = resolve_kernel_type(self.hints, parsed_ast)
         if kernel_type != "vector" or not self._is_auto_kernel_hint() or parsed_ast is None:
@@ -904,8 +902,7 @@ class AutoTilingTuner(Autotuner):
                 module_ast=module_ast,
                 entry_function_name=entry_function_name,
             )
-        except Exception as exc:
-            npu_tuning.warn_fallback(self, 'kernel_dot_analysis', exc=exc, kernel_type=kernel_type)
+        except Exception:
             return kernel_type
 
         if dot_result.dot_sites:
@@ -1593,9 +1590,13 @@ class AutoTilingTuner(Autotuner):
     ):
         try:
             return parser_fn()
-        except Exception as exc:
-            npu_tuning.warn_fallback(self, 'vector_parser', exc=exc, fallback_value=fallback_value,
-                                     parser_name=parser_name)
+        except Exception:
+            if self.print_autotuning:
+                print(
+                    "[WARNING] Failed to parse {}, fallback to {}.".format(
+                        parser_name, fallback_value
+                    )
+                )
             return fallback_value
 
     def _parse_reduction_axes_with_fallback(self) -> List[str]:
@@ -1952,8 +1953,7 @@ class AutoTilingTuner(Autotuner):
             return list(dsl_result.missing_tunable)
         except ValueError:
             raise
-        except Exception as exc:
-            npu_tuning.warn_fallback(self, 'tunable_analysis', exc=exc)
+        except Exception:
             constexpr_names = set(self._get_constexpr_candidates())
             fallback = [
                 arg_name for arg_name in required_missing_params
@@ -2010,9 +2010,15 @@ class AutoTilingTuner(Autotuner):
                 )
             return result
         except Exception as exc:
+            if self.print_autotuning:
+                print(
+                    "Ascend autotuning vector v2 parse failed: {}: {}".format(
+                        type(exc).__name__,
+                        exc,
+                    )
+                )
             self.vv_parse_result_v2 = None
             self.vv_adapter_result_v2 = None
-            npu_tuning.warn_fallback(self, 'vector_v2_parser', exc=exc)
             return None
 
     def _gen_tile_configs(
@@ -2103,7 +2109,7 @@ class AutoTilingTuner(Autotuner):
 
     def _rough_bench_once(self, fn) -> float:
         di = triton.runtime.driver.active.get_device_interface()
-        di.synchronize()
+        di.synchronize()  
         try:
             start_event = di.Event(enable_timing=True)
             end_event = di.Event(enable_timing=True)
@@ -2326,7 +2332,8 @@ class AutoTilingTuner(Autotuner):
                 ub_fn = self._make_kernel_call(*args, config=config, **kwargs)
                 run_fns[config] = functools.partial(ub_fn, warmup=False)
         except Exception as e:
-            npu_tuning.warn_fallback(self, 'ubtuner_failure', exc=e)
+            if self.print_autotuning:
+                print(f"[WARN] encounter exception when try ubtune, Details: {e}")
 
     def _batch_bench(self, *args, configs, _report_sink=None, **kwargs):
         from triton.compiler.errors import CompileTimeAssertionFailure, MLIRCompilationError
@@ -2369,7 +2376,6 @@ class AutoTilingTuner(Autotuner):
             except Exception as e:
                 # ignore exception from __exit__() of AsyncCompileMode
                 triton.runtime._async_compile.active_mode.set(None)
-                npu_tuning.warn_fallback(self, 'parallel_compile_failure', exc=e)
         else:
             for config, fn in kernels_call.items():
                 try:
@@ -2512,7 +2518,7 @@ class AutoTilingTuner(Autotuner):
         from ..testing import do_bench_npu
 
         if self.npu_bench_options is not None:
-            npu_tuning.warn_fallback(self, 'extra_profile_options')
+            npu_tuning.warn_extra_profile_options(self)
         kernel_call = self._make_kernel_call(*args, config=config, **meta)
         fn = functools.partial(kernel_call, warmup=False)
         do_bench_npu(
@@ -2971,7 +2977,6 @@ class BaseAutotuner:
         self.validation_rules = validation_rules
 
     def validate_parameters(self, **kwargs):
-        npu_tuning.warn_generator_parameters(self.operator_name, kwargs, self.supported_params)
         # Check for unsupported parameters
         invalid_params = [k for k in kwargs.keys() if k not in _ALL_PARAMS]
         if invalid_params:
@@ -3079,10 +3084,6 @@ def get_autotune_vector_config(**kwargs: Any) -> List[triton.Config]:
     return VectorAutotuner.get_configs(**kwargs)
 
 
-def _check_max_config_parameters(kernel_type, tuning_params):
-    npu_tuning.check_max_config_parameters(kernel_type, tuning_params, _CUBE_PARAMS, _VECTOR_PARAMS, _MIXCV_PARAMS)
-
-
 def get_max_configs(config, kernel_type="mixcv", **kwargs):
     """
     Expand a single base Config by combining it with tuning parameters.
@@ -3094,11 +3095,6 @@ def get_max_configs(config, kernel_type="mixcv", **kwargs):
                    or from the defaults.
     :return: List of expanded Config objects.
     """
-    _check_max_config_parameters(kernel_type, kwargs)
-    return _expand_max_configs(config, kernel_type, kwargs)
-
-
-def _expand_max_configs(config, kernel_type, kwargs):
     # Determine the set of parameters supported by the current kernel_type
     if kernel_type == "cube":
         supported = _CUBE_PARAMS
@@ -3106,6 +3102,11 @@ def _expand_max_configs(config, kernel_type, kwargs):
         supported = _VECTOR_PARAMS
     else:
         supported = _MIXCV_PARAMS
+
+    # Warn about unsupported parameters provided in kwargs
+    unsupported = [k for k in kwargs if k not in supported and k in _ALL_PARAMS]
+    if unsupported:
+        print(f"[WARNING] The following parameters are not supported for kernel_type '{kernel_type}': {unsupported}. They will be ignored.")
 
     # Build value lists for each parameter (priority: kwargs > base config > defaults)
     param_values = {}
@@ -3202,11 +3203,10 @@ def max_autotune(configs, key, kernel_type="mixcv", prune_configs_by=None, reset
         if not configs or len(configs) == 0:
             raise ValueError("[max_autotune] The argument 'configs' cannot be empty. "
                              "Please provide at least one base config. ")
-        _check_max_config_parameters(kernel_type, tuning_params)
         # Expand each base config with the provided tuning parameters
         expanded_configs = []
         for cfg in configs:
-            expanded = _expand_max_configs(cfg, kernel_type, tuning_params)
+            expanded = get_max_configs(cfg, kernel_type=kernel_type, **tuning_params)
             expanded_configs.extend(expanded)
 
         # Call the original autotune decorator with the expanded configs
