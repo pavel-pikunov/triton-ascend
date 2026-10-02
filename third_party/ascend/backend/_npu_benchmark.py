@@ -49,7 +49,8 @@ def _inactive_option_messages(options, arguments=None):
     if options.measure_budget_ms is None and "calibration_runs" in fields:
         yield ("inactive_calibration", "calibration_runs is ignored because measure_budget_ms is unset. "
                "Set measure_budget_ms to enable calibration.")
-    slow_fields = sorted(fields & {"slow_config_runs", "slow_config_recheck_runs", "slow_config_factor"})
+    slow_fields = sorted(
+        fields & {"slow_config_runs", "slow_config_recheck_runs", "slow_config_factor", "slow_config_recheck_delay_s"})
     if not options.filter_slow_configs and slow_fields:
         yield ("inactive_slow_filter", f"{', '.join(slow_fields)} are ignored because filter_slow_configs=False. "
                "Set filter_slow_configs=True to use these fields.")
@@ -69,6 +70,7 @@ class NpuBenchmarkOptions:
     slow_config_runs: int = 20
     slow_config_recheck_runs: int = 40
     slow_config_factor: float = 5.0
+    slow_config_recheck_delay_s: float = 0.5
     verbose: bool | None = None
 
     @property
@@ -81,7 +83,8 @@ class NpuBenchmarkOptions:
         if self.measure_budget_ms is None:
             del policy["calibration_runs"]
         if not self.filter_slow_configs:
-            for name in ("slow_config_runs", "slow_config_recheck_runs", "slow_config_factor"):
+            for name in ("slow_config_runs", "slow_config_recheck_runs", "slow_config_factor",
+                         "slow_config_recheck_delay_s"):
                 del policy[name]
         return tuple(sorted(policy.items()))
 
@@ -128,7 +131,7 @@ def resolve_options(arguments=None):
         try:
             if name in COUNT_MINIMUMS:
                 value = int(value)
-            elif name in float_fields:
+            elif name in float_fields or name == "slow_config_recheck_delay_s":
                 value = float(value)
             elif name in {"quality_check", "filter_slow_configs", "verbose"}:
                 normalized = value.strip().lower()
@@ -159,11 +162,14 @@ def resolve_options(arguments=None):
             raise ValueError(f"{name} must be finite and positive")
     if values["slow_config_factor"] < 1:
         raise ValueError("slow_config_factor must be >= 1 to retain the fastest candidate")
+    delay = values["slow_config_recheck_delay_s"]
+    if isinstance(delay, bool) or not isinstance(delay, (int, float)) or not math.isfinite(delay) or delay < 0:
+        raise ValueError("slow_config_recheck_delay_s must be finite and nonnegative")
     return NpuBenchmarkOptions(**values)
 
 
 def filter_slow_configs(funcs, synchronize, options):
-    """Conservatively reject slow candidates using the best rough host time."""
+    """Recheck slow candidates in a later round using the best rough host time."""
     if len(funcs) < 2:
         return list(range(len(funcs)))
     for fn in funcs:
@@ -181,10 +187,13 @@ def filter_slow_configs(funcs, synchronize, options):
 
     first = [measure(fn, options.slow_config_runs) for fn in funcs]
     threshold = min(first) * options.slow_config_factor
-    return [
-        i for i, value in enumerate(first)
-        if value <= threshold or measure(funcs[i], options.slow_config_recheck_runs) <= threshold
-    ]
+    suspects = [i for i, value in enumerate(first) if value > threshold]
+    if not suspects:
+        return list(range(len(funcs)))
+    if options.slow_config_recheck_delay_s:
+        time.sleep(options.slow_config_recheck_delay_s)
+    rechecked = {i: measure(funcs[i], options.slow_config_recheck_runs) for i in suspects}
+    return [i for i, value in enumerate(first) if value <= threshold or rechecked[i] <= threshold]
 
 
 def benchmark_with_options(measure, funcs, names, options, *, warmup, active, prof_root, synchronize, verbose=False,

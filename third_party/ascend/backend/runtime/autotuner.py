@@ -2837,7 +2837,8 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
         TRITON_NPU_BENCH_* independently: cache_mode ('hot'/'cold'), warmup,
         active (launch counts), quality_check, max_retries (additional attempts),
         measure_budget_ms, calibration_runs, filter_slow_configs,
-        slow_config_runs, slow_config_recheck_runs, slow_config_factor, and verbose.
+        slow_config_runs, slow_config_recheck_runs, slow_config_factor,
+        slow_config_recheck_delay_s (seconds, default 0.5), and verbose.
         Explicit active or measure_budget_ms bypasses the existing CV count
         calculation and time-limit pruning. A budget sets a per-candidate count
         with active as the minimum (30 when unspecified).

@@ -55,6 +55,18 @@ def test_argument_overrides_environment_per_field(backend, monkeypatch):
     assert options.filter_slow_configs is False
 
 
+@pytest.mark.parametrize("arguments,environment,expected", [
+    ({}, None, 0.5),
+    ({}, "0.2", 0.2),
+    ({"slow_config_recheck_delay_s": None}, "0.3", 0.3),
+    ({"slow_config_recheck_delay_s": 0}, "invalid but overridden", 0),
+])
+def test_slow_recheck_delay_priority(backend, monkeypatch, arguments, environment, expected):
+    if environment is not None:
+        monkeypatch.setenv(backend.policy.ENV_PREFIX + "SLOW_CONFIG_RECHECK_DELAY_S", environment)
+    assert backend.policy.resolve_options(arguments).slow_config_recheck_delay_s == expected
+
+
 @pytest.mark.parametrize("options", [
     dict(quality_check=1),
     dict(active=True),
@@ -68,6 +80,11 @@ def test_argument_overrides_environment_per_field(backend, monkeypatch):
     dict(slow_config_factor=0.5),
     dict(slow_config_runs=0),
     dict(slow_config_recheck_runs=0),
+    dict(slow_config_recheck_delay_s=-1),
+    dict(slow_config_recheck_delay_s=float("nan")),
+    dict(slow_config_recheck_delay_s=float("inf")),
+    dict(slow_config_recheck_delay_s=True),
+    dict(slow_config_recheck_delay_s="0.5"),
     dict(calibration_runs=1),
 ])
 def test_invalid_options(backend, options):
@@ -373,16 +390,25 @@ def test_profiler_preserves_default_order_and_composes_explicit_cold(backend, mo
         assert "evict" not in events
 
 
-def test_slow_config_filter_rechecks_candidates_and_preserves_result_alignment(backend, monkeypatch, run_policy,
-                                                                               sample):
-    clock, calls = [0.0], [0, 0]
+@pytest.mark.parametrize("delay", [None, 0, 0.125])
+def test_slow_config_filter_rechecks_candidates_and_preserves_result_alignment(backend, monkeypatch, run_policy, sample,
+                                                                               delay):
+    clock, calls, sleeps = [0.0], [0, 0, 0], []
     monkeypatch.setattr(backend.policy.time, "perf_counter", lambda: clock[0])
 
-    def candidate(index, duration):
+    def sleep(seconds):
+        # All first-round samples must precede the single pause.
+        assert calls == [3, 3, 3]
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(backend.policy.time, "sleep", sleep)
+
+    def candidate(index):
 
         def call():
             calls[index] += 1
-            clock[0] += duration
+            # Candidate 1 recovers after the pause; candidate 2 stays slow.
+            clock[0] += 1 if index == 0 or (index == 1 and sleeps) else 8
 
         return call
 
@@ -390,16 +416,39 @@ def test_slow_config_filter_rechecks_candidates_and_preserves_result_alignment(b
 
     def measure(funcs, names, *args):
         measured.append(names)
-        return [sample()]
+        return [sample() for _ in funcs]
 
-    costs = run_policy(measure, dict(filter_slow_configs=True, slow_config_runs=2, slow_config_recheck_runs=3),
-                       funcs=[candidate(0, 1), candidate(1, 8)])
-    assert costs == [0.01, float("inf")]
-    assert measured == [["a"]] and calls == [3, 6]
+    costs = run_policy(
+        measure,
+        dict(filter_slow_configs=True, slow_config_runs=2, slow_config_recheck_runs=3,
+             slow_config_recheck_delay_s=delay), funcs=[candidate(i) for i in range(3)], names=["a", "b", "c"])
+    assert sleeps == ([] if delay == 0 else [0.5 if delay is None else delay])
+    assert costs == [0.01, float("inf") if delay == 0 else 0.01, float("inf")]
+    assert measured == ([["a"]] if delay == 0 else [["a", "b"]])
+    assert calls == [3, 6, 6]
+
+
+@pytest.mark.parametrize("durations", [[], [8], [1, 2]])
+def test_slow_filter_without_suspects_does_not_pause(backend, monkeypatch, durations):
+    clock = [0.0]
+    monkeypatch.setattr(backend.policy.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(backend.policy.time, "sleep", lambda *args: pytest.fail("unexpected recheck pause"))
+
+    def candidate(duration):
+
+        def call():
+            clock[0] += duration
+
+        return call
+
+    options = backend.policy.resolve_options({"filter_slow_configs": True})
+    assert backend.policy.filter_slow_configs([candidate(d) for d in durations], lambda: None,
+                                              options) == list(range(len(durations)))
 
 
 def test_disabled_slow_filter_is_not_called(backend, monkeypatch, run_policy, sample):
     monkeypatch.setattr(backend.policy, "filter_slow_configs", lambda *args: pytest.fail("filter unexpectedly enabled"))
+    monkeypatch.setattr(backend.policy.time, "sleep", lambda *args: pytest.fail("unexpected recheck pause"))
     assert run_policy(lambda *args: [sample(), sample()], dict(quality_check=True)) == [0.01, 0.01]
 
 
@@ -434,7 +483,7 @@ def test_slow_filter_operates_on_candidates_remaining_after_cv_estimate(backend,
 
 
 INACTIVE_OPTIONS = dict(verbose=True, calibration_runs=27, slow_config_runs=31, slow_config_recheck_runs=53,
-                        slow_config_factor=7)
+                        slow_config_factor=7, slow_config_recheck_delay_s=0.25)
 
 
 def test_verbose_only_changes_profiler_output(backend, monkeypatch, capsys):
@@ -577,7 +626,8 @@ def test_inactive_fields_preserve_priority_route_and_cache(backend, monkeypatch,
     if policy.get("measure_budget_ms"):
         fields.pop("calibration_runs")
     if policy.get("filter_slow_configs"):
-        for name in ("slow_config_runs", "slow_config_recheck_runs", "slow_config_factor"):
+        for name in ("slow_config_runs", "slow_config_recheck_runs", "slow_config_factor",
+                     "slow_config_recheck_delay_s"):
             fields.pop(name)
     baseline = backend.policy.resolve_options(policy)
     if source == "environment":
@@ -593,6 +643,8 @@ def test_inactive_fields_preserve_priority_route_and_cache(backend, monkeypatch,
     if warning_fields:
         assert len(diagnostics) == len(warning_fields)
         assert all(field in str(item.message) for field, item in zip(warning_fields, diagnostics))
+        if "slow_config_runs" in warning_fields:
+            assert "slow_config_recheck_delay_s" in str(diagnostics[-1].message)
     assert resolved.is_default == baseline.is_default
     assert resolved.cache_key() == baseline.cache_key()
     tensor = torch.empty(1)
@@ -618,12 +670,15 @@ def test_inactive_fields_preserve_priority_route_and_cache(backend, monkeypatch,
     assert profiles == ([] if count == 1 else [(8, 50)] if existing_counts else [(5, 30)])
 
 
-def test_enabled_fields_participate_in_cache_key(backend):
+@pytest.mark.parametrize("policy,field,value", [
+    ({"measure_budget_ms": 5}, "calibration_runs", 27),
+    ({"filter_slow_configs": True}, "slow_config_runs", 31),
+    ({"filter_slow_configs": True}, "slow_config_recheck_delay_s", 0),
+    ({"filter_slow_configs": True}, "slow_config_recheck_delay_s", 0.25),
+])
+def test_enabled_fields_participate_in_cache_key(backend, policy, field, value):
     resolve = backend.policy.resolve_options
-    assert resolve({"measure_budget_ms": 5}).cache_key() != resolve({"measure_budget_ms": 5, "calibration_runs":
-                                                                     27}).cache_key()
-    assert resolve({"filter_slow_configs":
-                    True}).cache_key() != resolve({"filter_slow_configs": True, "slow_config_runs": 31}).cache_key()
+    assert resolve(policy).cache_key() != resolve(dict(policy, **{field: value})).cache_key()
 
 
 @pytest.mark.parametrize("source,counts,filter_slow,count", [
