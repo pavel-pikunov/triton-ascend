@@ -284,11 +284,8 @@ def vector_kernel(...):
 arguments as `autotune`. See [Optional NPU benchmark policies](autotune_guide.md#optional-npu-benchmark-policies)
 for the option table, defaults, cache behavior, and limitations.
 
-Unsupported expansion parameters emit `RuntimeWarning` before expansion and
-are ignored; an unknown `kernel_type` warns and uses `mixcv`. Invalid values of
-supported parameters still fail validation. During tuning, ignored measurement
-settings and runtime fallbacks warn once per reason per tuner, at the kernel's
-definition. Python warning filters apply.
+Ignored NPU measurement settings warn once per reason per tuner, at the
+kernel's definition. Python warning filters apply.
 
 ## Summary
 

@@ -389,8 +389,8 @@ configuration. `calibration_runs` is inactive without a budget; slow-filter
 fields are inactive when `filter_slow_configs=False`. These inactive fields and
 `verbose` do not change measurement routing or cache keys.
 
-Parser and compilation fallbacks, failed UBTuner recovery, missing profiler CSV,
-and non-finite final scores also warn with the fallback and a suggested action.
+Missing NPU profiler CSV and non-finite final scores from the built-in NPU
+benchmarker also warn with the fallback and a suggested action.
 The optional `auto_prof_dir` winner profile uses environment settings and warns
 when explicit `npu_bench_options` are not forwarded to it. Cleanup and report
 diagnostics preserve an exception already in flight, even with warnings as errors.

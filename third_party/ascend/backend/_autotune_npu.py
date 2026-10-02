@@ -87,6 +87,8 @@ def append_policy_key(key, options):
 
 
 def check_scores(tuner, timings):
+    if tuner._npu_benchmark_options is None:
+        return
     if not any(math.isfinite(cost[0] if isinstance(cost, Sequence) else cost) for cost in timings.values()):
         tuner._warn_once(
             "unusable_measurements", "All final benchmark scores are non-finite; "
@@ -150,59 +152,8 @@ def finish_profile(run_fns, costs, reports, report_sink):
     return dict(zip(run_fns, costs))
 
 
-def warn_generator_parameters(operator_name, params, supported):
-    unsupported = sorted(params.keys() - supported)
-    if unsupported:
-        warnings.warn(
-            f"Config generator '{operator_name}' does not support parameters {unsupported}. "
-            "Known unsupported keys are ignored; unknown keys fail validation. "
-            "Remove them or use a generator that supports them.", RuntimeWarning, stacklevel=4)
-
-
-def check_max_config_parameters(kernel_type, tuning_params, cube_params, vector_params, mixcv_params):
-    if kernel_type not in ("cube", "mixcv", "vector"):
-        warnings.warn(
-            f"Unknown kernel_type {kernel_type!r}; falling back to 'mixcv'. "
-            "Use 'cube', 'mixcv', or 'vector'.", RuntimeWarning, stacklevel=4)
-    supported = cube_params if kernel_type == "cube" else vector_params if kernel_type == "vector" else mixcv_params
-    unsupported = sorted(tuning_params.keys() - supported)
-    if unsupported:
-        warnings.warn(
-            f"Config expansion for kernel_type {kernel_type!r} ignores parameters {unsupported}. "
-            "Remove unknown keys or choose a kernel_type that supports them.", RuntimeWarning, stacklevel=4)
-
-
-_FALLBACK_MESSAGES = {
-    'extra_profile_options':
-    ('The additional winner _profile does not receive explicit npu_bench_options; it uses '
-     'TRITON_NPU_BENCH_* environment settings and defaults. Set those environment variables for this '
-     'profile or omit auto_prof_dir.'),
-    'kernel_classification_parse':
-    ('Kernel classification parsing failed: {exception_type}: {exception}; using the kernel_type hint '
-     'or vector fallback. Check kernel code or supply a kernel_type hint.'),
-    'kernel_dot_analysis': ('Kernel dot-site analysis failed: {exception_type}: {exception}; keeping classification '
-                            '{kernel_type!r}. Supply a kernel_type hint if needed.'),
-    'vector_parser': ('Parsing {parser_name} failed: {exception_type}: {exception}; using fallback {fallback_value!r}. '
-                      'Check kernel code or supply axis hints.'),
-    'tunable_analysis': ('Tunable-parameter analysis failed: {exception_type}: {exception}; using missing constexpr '
-                         'parameters as fallback. Supply tunable_parameter hints.'),
-    'vector_v2_parser':
-    ('Vector v2 parsing failed: {exception_type}: {exception}; using the legacy vector parser fallback. '
-     'Check kernel code or supply axis hints.'),
-    'ubtuner_failure': ('UBTuner recovery failed: {exception_type}: {exception}; continuing with available candidates. '
-                        'Check UBTuner settings and kernel resources.'),
-    'constexpr_axis_analysis':
-    ('Constexpr analysis for vector axes failed: {exception_type}: {exception}; treating all arguments '
-     'as runtime arguments. Check kernel annotations or supply axis hints.'),
-    'parallel_compile_failure':
-    ('Parallel compilation failed: {exception_type}: {exception}; continuing with available candidates '
-     'after resetting active_mode. Check compilation errors or set TRITON_AUTOTUNE_PARALLEL_COMPILE=0.'),
-}
-
-
-def warn_fallback(tuner, reason, *, exc=None, parser_name=None, fallback_value=None, kernel_type=None):
-    message = _FALLBACK_MESSAGES[reason].format(exception_type=type(exc).__name__, exception=exc,
-                                                parser_name=parser_name, fallback_value=fallback_value,
-                                                kernel_type=kernel_type)
-    warning_reason = f"vector_parser_{parser_name}" if reason == "vector_parser" else reason
-    tuner._warn_once(warning_reason, message)
+def warn_extra_profile_options(tuner):
+    tuner._warn_once(
+        "extra_profile_options", "The additional winner _profile does not receive explicit "
+        "npu_bench_options; it uses TRITON_NPU_BENCH_* environment settings and defaults. "
+        "Set those environment variables for this profile or omit auto_prof_dir.")
