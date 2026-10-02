@@ -69,7 +69,7 @@ def test_csv_report_retains_all_values_and_uses_existing_row_selection(backend, 
 def test_report_formats_full_config_and_unabridged_csv(backend, tmp_path, capsys, write_profile):
     write_profile(tmp_path, [("winner", "10.0000")], 1, 75)
     reports = []
-    backend.testing._read_profile_samples(tmp_path, ["winner"], 1, 75, True, _report_sink=reports.extend)
+    backend.profiler._read_profile_samples(tmp_path, ["winner"], 1, 75, True, _report_sink=reports.extend)
     configs = [Config({}), Config({}), Config({})]
     selected = configs[2]
     selected.kwargs = {"BLOCK": 128}
@@ -186,7 +186,7 @@ def test_diagnostic_failure_does_not_change_measurements_or_retry(backend, monke
     # must not turn it into a profiler acquisition failure.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        samples = backend.testing._read_profile_samples(tmp_path, ["a"], 0, 2, True, _report_sink=fail)
+        samples = backend.profiler._read_profile_samples(tmp_path, ["a"], 0, 2, True, _report_sink=fail)
     assert samples[0][1].tolist() == [10, 10]
 
 
