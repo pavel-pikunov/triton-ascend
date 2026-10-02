@@ -337,6 +337,7 @@ time estimate may derive its own counts). Standalone `do_bench_npu` retains its 
 | `slow_config_runs` | `TRITON_NPU_BENCH_SLOW_CONFIG_RUNS` | `20`; initial rough launches for slow-configuration filtering. |
 | `slow_config_recheck_runs` | `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_RUNS` | `40`; recheck slow candidates before excluding them. |
 | `slow_config_factor` | `TRITON_NPU_BENCH_SLOW_CONFIG_FACTOR` | `5.0`, >= 1; candidates above this multiple of the best rough time are rechecked. |
+| `slow_config_recheck_delay_s` | `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_DELAY_S` | `0.5`; finite seconds >= 0 between the first rough-measurement round and the recheck round. `0` disables the pause. |
 | `verbose` | `TRITON_NPU_BENCH_VERBOSE` | Inherit `TRITON_PRINT_AUTOTUNING`; print policy and per-attempt diagnostics. |
 
 Boolean environment values accept `0`, `1`, `false`, and `true`. Generic
@@ -357,6 +358,14 @@ Slow-configuration filtering is independent of count selection. If enabled,
 it runs on the remaining candidates before calibration and profiling. It uses
 the best rough host time, including synchronization, and rechecks candidates
 above `slow_config_factor` times the best candidate's time before excluding them.
+The first round measures all remaining candidates. If any require rechecking,
+one pause of `slow_config_recheck_delay_s` seconds separates the completed first
+round from the recheck round, reducing the chance that both sample the same
+period of temporary degradation. Only suspect candidates are rechecked. No
+pause is taken with fewer than two candidates or when no recheck is needed.
+The delay is configurable independently of launch counts; it is inactive when
+filtering is disabled and affects the cache key only when filtering is enabled.
+This wall-clock pause is separate from the optional device-time measurement budget.
 
 With a budget, calibration determines `duration_i_ms` for each candidate, then
 `active_i = max(active, ceil(measure_budget_ms / duration_i_ms))`. For example,
