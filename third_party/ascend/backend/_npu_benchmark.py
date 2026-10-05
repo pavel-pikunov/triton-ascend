@@ -14,6 +14,8 @@ from pathlib import Path
 
 import numpy as np
 
+from ._autotune_report import log_stage, report_safely, timing_stage, yellow_warning
+
 ENV_PREFIX = "TRITON_NPU_BENCH_"
 COUNT_MINIMUMS = {
     "warmup": 0,
@@ -71,7 +73,7 @@ class NpuBenchmarkOptions:
     slow_config_recheck_runs: int = 40
     slow_config_factor: float = 5.0
     slow_config_recheck_delay_s: float = 0.5
-    verbose: bool | None = None
+    log_level: str = "off"
 
     @property
     def is_default(self):
@@ -79,7 +81,7 @@ class NpuBenchmarkOptions:
 
     def _effective_policy(self):
         policy = asdict(self)
-        del policy["verbose"]
+        del policy["log_level"]
         if self.measure_budget_ms is None:
             del policy["calibration_runs"]
         if not self.filter_slow_configs:
@@ -133,7 +135,7 @@ def resolve_options(arguments=None):
                 value = int(value)
             elif name in float_fields or name == "slow_config_recheck_delay_s":
                 value = float(value)
-            elif name in {"quality_check", "filter_slow_configs", "verbose"}:
+            elif name in {"quality_check", "filter_slow_configs"}:
                 normalized = value.strip().lower()
                 if normalized not in {"0", "1", "false", "true"}:
                     raise ValueError("expected 0, 1, false or true")
@@ -146,7 +148,9 @@ def resolve_options(arguments=None):
 
     if values["cache_mode"] not in (None, "hot", "cold"):
         raise ValueError("cache_mode must be 'hot' or 'cold'")
-    for name in ("quality_check", "filter_slow_configs", "verbose"):
+    if values["log_level"] not in ("off", "brief", "detailed"):
+        raise ValueError("log_level must be 'off', 'brief' or 'detailed'")
+    for name in ("quality_check", "filter_slow_configs"):
         if values[name] is not None and not isinstance(values[name], bool):
             raise ValueError(f"{name} must be a boolean")
     for name, minimum in COUNT_MINIMUMS.items():
@@ -171,7 +175,9 @@ def resolve_options(arguments=None):
 def filter_slow_configs(funcs, synchronize, options):
     """Recheck slow candidates in a later round using the best rough host time."""
     if len(funcs) < 2:
+        log_stage(options.log_level, "Slow filter", f"{len(funcs)}/{len(funcs)} candidates retained; no second round")
         return list(range(len(funcs)))
+    log_stage(options.log_level, "Slow filter", f"First round: {len(funcs)} candidates")
     for fn in funcs:
         fn()
         synchronize()
@@ -188,16 +194,23 @@ def filter_slow_configs(funcs, synchronize, options):
     first = [measure(fn, options.slow_config_runs) for fn in funcs]
     threshold = min(first) * options.slow_config_factor
     suspects = [i for i, value in enumerate(first) if value > threshold]
+    log_stage(options.log_level, "Slow filter", f"Second round needed: {len(suspects)}/{len(funcs)} candidates")
+    log_stage(
+        options.log_level, "Slow filter settings", f"rough_times_s={first}, threshold_s={threshold}, "
+        f"suspects={suspects}, pause_s={options.slow_config_recheck_delay_s}", detailed=True)
     if not suspects:
+        log_stage(options.log_level, "Slow filter", f"{len(funcs)}/{len(funcs)} candidates retained")
         return list(range(len(funcs)))
     if options.slow_config_recheck_delay_s:
         time.sleep(options.slow_config_recheck_delay_s)
     rechecked = {i: measure(funcs[i], options.slow_config_recheck_runs) for i in suspects}
-    return [i for i, value in enumerate(first) if value <= threshold or rechecked[i] <= threshold]
+    kept = [i for i, value in enumerate(first) if value <= threshold or rechecked[i] <= threshold]
+    log_stage(options.log_level, "Slow filter", f"{len(kept)}/{len(funcs)} candidates retained")
+    return kept
 
 
-def benchmark_with_options(measure, funcs, names, options, *, warmup, active, prof_root, synchronize, verbose=False,
-                           keep_res=False, _report_sink=None):
+def benchmark_with_options(measure, funcs, names, options, *, warmup, active, prof_root, synchronize, keep_res=False,
+                           _report_sink=None, _timing_sink=None):
     """Wrap the existing profiler with optional filtering, calibration and retries.
 
     measure returns device timestamps and durations (microseconds) per callable.
@@ -207,14 +220,9 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
         raise ValueError("quality_check requires active >= 2")
     if options.quality_check:
         from ._benchmark_quality import evaluate_quality
-    verbose = verbose if options.verbose is None else options.verbose
-
-    def log(message):
-        if verbose:
-            print(f"npu benchmark: {message}")
-
-    indices = (filter_slow_configs(funcs, synchronize, options) if options.filter_slow_configs else list(
-        range(len(funcs))))
+    with timing_stage(_timing_sink, "slow_filter"):
+        indices = (filter_slow_configs(funcs, synchronize, options) if options.filter_slow_configs else list(
+            range(len(funcs))))
     active_counts = [active] * len(funcs)
     costs = [float("inf")] * len(funcs)
     best_failures = [[] for _ in funcs]
@@ -222,7 +230,7 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
     root = Path(prof_root)
     root.mkdir(parents=True, exist_ok=True)
 
-    def collect(selected, warmup_count, active_count, reports=None):
+    def collect(selected, warmup_count, active_count, reports=None, counts=None):
         execution_failed = False
         failed = False
 
@@ -242,8 +250,11 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
 
         directory = tempfile.mkdtemp(prefix="npu_bench_", dir=root)
         try:
+            diagnostics = {"_report_sink": reports.extend} if reports is not None else {}
+            if counts is not None:
+                diagnostics["_active_counts"] = counts
             return measure([track(funcs[i]) for i in selected], [names[i] for i in selected], warmup_count,
-                           active_count, directory, **({"_report_sink": reports.extend} if reports is not None else {}))
+                           active_count, directory, **diagnostics)
         except (RuntimeError, OSError) as exc:
             failed = True
             if execution_failed:
@@ -261,62 +272,58 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
                         raise
                     _warn_secondary("NPU profile cleanup failed", exc)
 
-    log(f"configs={len(funcs)}, kept={indices}, warmup={warmup}, active={active}")
-    if options.measure_budget_ms is not None:
-        for attempt in range(options.max_retries + 1):
-            try:
-                calibration = collect(indices, 0, options.calibration_runs)
-                break
-            except ProfilerAcquisitionError as exc:
-                log(f"calibration attempt={attempt + 1}: {exc}")
-                if attempt == options.max_retries:
-                    raise RuntimeError("NPU benchmark: no usable calibration samples") from exc
-        for index, (_, durations) in zip(indices, calibration):
-            required = options.measure_budget_ms * 1000 / float(np.mean(durations))
-            if not math.isfinite(required):
-                raise ValueError("Unrepresentable NPU benchmark sample count")
-            active_counts[index] = max(active, math.ceil(required))
-        log(f"budget_ms={options.measure_budget_ms}, active_per_config={active_counts}")
+    with timing_stage(_timing_sink, "calibration"):
+        if options.measure_budget_ms is not None:
+            active_counts = calibrate_counts(collect, indices, options, active_counts, active)
 
     pending = indices
     last_acquisition_error = None
-    for attempt in range(options.max_retries + 1):
-        groups = {}
-        for index in pending:
-            groups.setdefault(active_counts[index], []).append(index)
-        retry = []
-        for active_count, selected in groups.items():
+    with timing_stage(_timing_sink, "measurements"):
+        for attempt in range(options.max_retries + 1):
+            selected = pending
+            counts = [active_counts[index] for index in selected]
+            log_stage(options.log_level, "Profiler measurement", f"Attempt {attempt + 1}: {len(selected)} candidates")
+            log_stage(options.log_level, "Measurement settings", f"configs={selected}, warmup={warmup}, "
+                      f"active_per_config={counts}", detailed=True)
             reports = [] if _report_sink is not None else None
             try:
-                samples = collect(selected, warmup, active_count, reports)
+                samples = collect(selected, warmup, active, reports,
+                                  counts=counts if options.measure_budget_ms is not None else None)
             except ProfilerAcquisitionError as exc:
                 last_acquisition_error = exc
-                log(f"attempt={attempt + 1}, configs={selected}, active={active_count}: {exc}")
-                retry.extend(selected)
-                continue
-            for position, (index, (times, durations)) in enumerate(zip(selected, samples)):
-                # Keep the existing NPU arithmetic mean for configuration ranking.
-                cost = float(np.mean(durations)) / 1000
-                metrics, failures = evaluate_quality(times, durations) if options.quality_check else ({}, [])
-                if cost < costs[index]:
-                    costs[index], best_failures[index] = cost, failures
-                    if best_reports is not None:
-                        from ._autotune_report import report_safely
+                log_stage(options.log_level, "Profiler acquisition failed", str(exc), detailed=True)
+                pending = selected
+            else:
+                retry = []
+                for position, (index, (times, durations)) in enumerate(zip(selected, samples)):
+                    # Keep the existing NPU arithmetic mean for configuration ranking.
+                    cost = float(np.mean(durations)) / 1000
+                    metrics, failures = evaluate_quality(times, durations) if options.quality_check else ({}, [])
+                    if cost < costs[index]:
+                        costs[index], best_failures[index] = cost, failures
+                        if best_reports is not None:
 
-                        def capture():
-                            best_reports[index] = None
-                            if len(reports) == len(selected) and reports[position] is not None:
-                                best_reports[index] = replace(reports[position], mean_ms=cost, attempt=attempt + 1,
-                                                              quality_failures=tuple(failures))
+                            def capture():
+                                best_reports[index] = None
+                                if len(reports) == len(selected) and reports[position] is not None:
+                                    best_reports[index] = replace(reports[position], mean_ms=cost, attempt=attempt + 1,
+                                                                  quality_failures=tuple(failures),
+                                                                  quality_checked=options.quality_check,
+                                                                  quality_metrics=metrics)
 
-                        report_safely(capture)
-                log(f"config={index}, attempt={attempt + 1}, active={active_count}, cost_ms={cost:.8g}, "
-                    f"metrics={metrics}, failures={failures}")
-                if failures:
-                    retry.append(index)
-        pending = retry
-        if not pending:
-            break
+                            report_safely(capture)
+                    log_stage(
+                        options.log_level, "Config measurement", f"config={index}, attempt={attempt + 1}, "
+                        f"active={counts[position]}, mean_ms={cost:.8g}, metrics={metrics}, failures={failures}",
+                        detailed=True)
+                    if failures:
+                        retry.append(index)
+                pending = retry
+            log_stage(
+                options.log_level, "Quality/acquisition result", f"{len(selected) - len(pending)}/{len(selected)} "
+                f"candidates passed; retry candidates={len(pending)}")
+            if not pending:
+                break
 
     if not any(math.isfinite(value) for value in costs):
         raise RuntimeError("NPU benchmark: no usable profiler measurements") from last_acquisition_error
@@ -328,8 +335,30 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
         reasons.append(f"selected config {best} uses a measurement that failed quality checks: " +
                        "; ".join(best_failures[best]))
     if reasons:
-        warnings.warn("NPU benchmark: " + "; ".join(reasons), RuntimeWarning, stacklevel=3)
+        with yellow_warning():
+            warnings.warn("NPU benchmark: " + "; ".join(reasons), RuntimeWarning, stacklevel=3)
     if _report_sink is not None:
-        from ._autotune_report import report_safely
         report_safely(lambda: _report_sink(best_reports))
     return costs
+
+
+def calibrate_counts(collect, indices, options, active_counts, active):
+    log_stage(options.log_level, "Calibration", f"Starting: {len(indices)} candidates")
+    for attempt in range(options.max_retries + 1):
+        log_stage(options.log_level, "Calibration profiler", f"Attempt {attempt + 1}: {len(indices)} candidates")
+        try:
+            calibration = collect(indices, 0, options.calibration_runs)
+            break
+        except ProfilerAcquisitionError as exc:
+            log_stage(options.log_level, "Calibration acquisition failed", str(exc), detailed=True)
+            if attempt == options.max_retries:
+                raise RuntimeError("NPU benchmark: no usable calibration samples") from exc
+            log_stage(options.log_level, "Calibration retry", f"Retry candidates={len(indices)}")
+    for index, (_, durations) in zip(indices, calibration):
+        required = options.measure_budget_ms * 1000 / float(np.mean(durations))
+        if not math.isfinite(required):
+            raise ValueError("Unrepresentable NPU benchmark sample count")
+        active_counts[index] = max(active, math.ceil(required))
+    log_stage(options.log_level, "Calibration settings", f"budget_ms={options.measure_budget_ms}, "
+              f"active_per_config={active_counts}", detailed=True)
+    return active_counts
