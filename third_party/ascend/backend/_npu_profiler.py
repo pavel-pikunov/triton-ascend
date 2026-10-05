@@ -1,16 +1,17 @@
 """Private policy routing and profiler acquisition extensions."""
 
 import csv
-import os
 import warnings
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import triton.runtime as runtime
 
+from ._autotune_report import log_stage, make_profile_report, report_safely, timing_stage
+
 
 def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name, npu_bench_options,
-              _pre_hook_scope, _report_sink):
+              _pre_hook_scope, _report_sink, _timing_sink=None):
     from ._npu_benchmark import _ResolvedOptions, _inactive_option_messages, benchmark_with_options, resolve_options
 
     options = resolve_options(npu_bench_options)
@@ -24,21 +25,26 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
     active = active if options.active is None else options.active
     if options.cache_mode is not None:
         clear_l2_cache = options.cache_mode == "cold"
-    verbose = options.verbose if options.verbose is not None else os.getenv("TRITON_PRINT_AUTOTUNING") == "1"
-    if verbose:
-        print(f"npu benchmark: cache={'cold' if clear_l2_cache else 'hot'}, warmup={warmup}, active={active}, "
-              f"quality_check={options.quality_check}, filter_slow_configs={options.filter_slow_configs}")
+    log_stage(
+        options.log_level, "Benchmark settings", f"cache={'cold' if clear_l2_cache else 'hot'}, "
+        f"warmup={warmup}, active={active}, quality_check={options.quality_check}, "
+        f"filter_slow_configs={options.filter_slow_configs}", detailed=True)
     report_kwargs = {"_report_sink": _report_sink} if _report_sink is not None else {}
     if options.is_default:
-        return profile(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name, **report_kwargs)
+        log_stage(options.log_level, "Profiler measurement", f"Attempt 1: {len(funcs)} candidates")
+        with timing_stage(_timing_sink, "measurements"):
+            return profile(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
+                           **report_kwargs)
 
     names = ([target_kernel_name] * len(funcs)
              if target_kernel_name is None or isinstance(target_kernel_name, str) else list(target_kernel_name))
     if len(names) != len(funcs) or any(name is not None and (not isinstance(name, str) or not name) for name in names):
         raise ValueError("Provide one nonempty target kernel name (or None) per function")
     if not options.needs_samples and not options.filter_slow_configs:
-        return profile(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
-                       _pre_hook_scope=_pre_hook_scope, **report_kwargs)
+        log_stage(options.log_level, "Profiler measurement", f"Attempt 1: {len(funcs)} candidates")
+        with timing_stage(_timing_sink, "measurements"):
+            return profile(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
+                           _pre_hook_scope=_pre_hook_scope, **report_kwargs)
 
     import torch
 
@@ -48,12 +54,12 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
 
     root = prof_dir if prof_dir is not None else Path(runtime.cache.get_home_dir()) / ".triton" / "profile_results"
     costs = benchmark_with_options(measure, funcs, names, options, warmup=warmup, active=active, prof_root=root,
-                                   synchronize=torch.npu.synchronize, verbose=verbose, keep_res=keep_res,
+                                   synchronize=torch.npu.synchronize, keep_res=keep_res, _timing_sink=_timing_sink,
                                    **report_kwargs)
     return costs[0] if len(funcs) == 1 else costs
 
 
-def _read_profile_samples(directory, names, warmup, active, clear_l2_cache, _report_sink=None):
+def _read_profile_samples(directory, names, warmup, active, clear_l2_cache, _report_sink=None, _active_counts=None):
     """Read validated device samples for optional quality evaluation and retries."""
     import math
     import numpy as np
@@ -81,32 +87,36 @@ def _read_profile_samples(directory, names, warmup, active, clear_l2_cache, _rep
                 rows.append((start, duration, name, row) if _report_sink is not None else (start, duration, name))
     except (OSError, ValueError, KeyError, TypeError, csv.Error) as exc:
         raise ProfilerAcquisitionError(f"Invalid profiler data: {exc}") from exc
-    total = warmup + active
-    if len(rows) != len(names) * total:
-        raise ProfilerAcquisitionError(f"Expected {len(names) * total} target rows, got {len(rows)}")
+    counts = [active] * len(names) if _active_counts is None else list(_active_counts)
+    if len(counts) != len(names) or any(
+            isinstance(count, bool) or not isinstance(count, int) or count < 1 for count in counts):
+        raise ValueError("Provide one positive active count per function")
+    expected = sum(warmup + count for count in counts)
+    if len(rows) != expected:
+        raise ProfilerAcquisitionError(f"Expected {expected} target rows, got {len(rows)}")
     rows.sort(key=lambda row: row[0])
     samples = []
-    for index, name in enumerate(names):
-        chunk = rows[index * total:(index + 1) * total]
+    measured_chunks = [] if _report_sink is not None else None
+    offset = 0
+    for index, (name, count) in enumerate(zip(names, counts)):
+        chunk = rows[offset:offset + warmup + count]
+        offset += warmup + count
         if name is not None and any(row[2] != name for row in chunk):
             raise ProfilerAcquisitionError(f"Unexpected target order for config {index}: expected {name!r}")
         times, durations = np.asarray([(row[0], row[1]) for row in chunk[warmup:]]).T
         if np.any(np.diff(times) <= 0):
             raise ProfilerAcquisitionError(f"Non-increasing device timestamps for config {index}")
         samples.append((times, durations))
+        if measured_chunks is not None:
+            measured_chunks.append(chunk[warmup:])
     if _report_sink is not None:
-        from ._autotune_report import NpuMeasurementReport, report_safely
 
         def capture():
             reports = [
-                NpuMeasurementReport(
-                    columns,
-                    tuple(row[3] for row in rows[index * total + warmup:(index + 1) * total]),
-                    warmup,
-                    active,
-                    "cold" if clear_l2_cache else "hot",
-                    float(durations.mean()) / 1000,
-                ) for index, (_, durations) in enumerate(samples)
+                make_profile_report(columns, [row[3]
+                                              for row in measured_chunks[index]], warmup, counts[index], clear_l2_cache,
+                                    float(durations.mean()) / 1000)
+                for index, (_, durations) in enumerate(samples)
             ]
             _report_sink(reports)
 
@@ -114,8 +124,11 @@ def _read_profile_samples(directory, names, warmup, active, clear_l2_cache, _rep
     return samples
 
 
-def collect_samples(directory, funcs, names, warmup, active, clear_l2_cache, return_samples, report_sink):
-    samples = _read_profile_samples(directory, names, warmup, active, clear_l2_cache, _report_sink=report_sink)
+def collect_samples(directory, funcs, names, warmup, active, clear_l2_cache, return_samples, report_sink,
+                    active_counts=None):
+    names = [names] * len(funcs) if names is None or isinstance(names, str) else names
+    samples = _read_profile_samples(directory, names, warmup, active, clear_l2_cache, _report_sink=report_sink,
+                                    _active_counts=active_counts)
     if return_samples:
         return samples
     costs = [float(durations.mean()) / 1000 for _, durations in samples]

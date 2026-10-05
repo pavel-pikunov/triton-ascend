@@ -50,6 +50,7 @@ def do_bench_npu(
     npu_bench_options=None,
     _pre_hook_scope=None,
     _report_sink=None,
+    _timing_sink=None,
 ):
     """Profile NPU kernels, optionally controlling L2, quality and retries.
 
@@ -60,7 +61,7 @@ def do_bench_npu(
     """
     from ._npu_profiler import bench_npu
     return bench_npu(_profile_npu, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
-                     npu_bench_options, _pre_hook_scope, _report_sink)
+                     npu_bench_options, _pre_hook_scope, _report_sink, _timing_sink)
 
 
 def _profile_npu(
@@ -75,6 +76,7 @@ def _profile_npu(
     _return_samples: bool = False,
     _pre_hook_scope=None,
     _report_sink=None,
+    _active_counts=None,
 ):
     import torch
     import torch_npu
@@ -113,7 +115,6 @@ def _profile_npu(
         buffer.sum()
         torch.npu.synchronize()  # shake out of any npu error
 
-    total = warmup + active
     scope = profile_scope(buffer if clear_l2_cache else None, torch.npu.synchronize, _pre_hook_scope,
                           lambda: _rm_dic(keep_res, torch_path))
     with scope, torch_npu.profiler.profile(
@@ -126,7 +127,8 @@ def _profile_npu(
             with_modules=False,
             experimental_config=experimental_config,
     ):
-        for fn in funcs:
+        for index, fn in enumerate(funcs):
+            total = warmup + (active if _active_counts is None else _active_counts[index])
             for _ in builtins.range(total):
                 if clear_l2_cache and _pre_hook_scope is None:
                     buffer.sum()  # use buffer read to clear l2 cache
@@ -145,6 +147,7 @@ def _profile_npu(
             target_kernel_name=target_kernel_name,
             clear_l2_cache=clear_l2_cache,
             _return_samples=_return_samples,
+            **({"_active_counts": _active_counts} if _active_counts is not None else {}),
             **({"_report_sink": _report_sink} if _report_sink is not None else {}),
         )
 
@@ -167,6 +170,7 @@ def _collect_prof_result(
     clear_l2_cache: bool = False,
     _return_samples: bool = False,
     _report_sink=None,
+    _active_counts=None,
 ):
     """
     Collect kernel performance from kernel_details.csv, returned in millisecond.
@@ -184,10 +188,10 @@ def _collect_prof_result(
     :type target_kernel_name: Optional[str]
     """
 
-    if _return_samples or isinstance(target_kernel_name, (list, tuple)):
+    if _return_samples or _active_counts is not None or isinstance(target_kernel_name, (list, tuple)):
         from ._npu_profiler import collect_samples
         return collect_samples(base_dir, funcs, target_kernel_name, num_warmup, num_active, clear_l2_cache,
-                               _return_samples, _report_sink)
+                               _return_samples, _report_sink, _active_counts)
 
     import numpy as np
     import pandas as pd
@@ -228,8 +232,7 @@ def _collect_prof_result(
 
     if _report_sink is not None:
         from ._autotune_report import capture_profile_report
-        capture_profile_report(kernel_details_file, filter_df, time_cost, num_warmup, num_active, clear_l2_cache,
-                               _report_sink)
+        capture_profile_report(filter_df, time_cost, num_warmup, num_active, clear_l2_cache, _report_sink)
 
     if num_funcs == 1:
         return time_cost[0]
