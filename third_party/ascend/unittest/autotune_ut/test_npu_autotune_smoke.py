@@ -14,7 +14,7 @@ from triton.backends.ascend.runtime import autotuner
 @pytest.mark.parametrize("decorator", ["autotune", "max_autotune"])
 def test_npu_vector_tuning_and_cache(monkeypatch, capsys, tmp_path, decorator):
     for name in tuple(os.environ):
-        if name.startswith("TRITON_NPU_BENCH_") or name == "TRITON_PRINT_AUTOTUNING":
+        if name.startswith("TRITON_NPU_BENCH_") or name in {"TRITON_PRINT_AUTOTUNING", "TRITON_AUTOTUNE_REPORT_TIMING"}:
             monkeypatch.delenv(name)
     monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
     monkeypatch.setenv("TRITON_AUTOTUNE_PARALLEL_COMPILE", "0")
@@ -47,6 +47,7 @@ def test_npu_vector_tuning_and_cache(monkeypatch, capsys, tmp_path, decorator):
         ["N"],
         npu_bench_options={"cache_mode": "hot", "warmup": 0, "active": 2},
         report_best_config=True,
+        report_timing=True,
         **kwargs,
     )(add_one)
     assert len(kernel.configs) == 2
@@ -58,11 +59,12 @@ def test_npu_vector_tuning_and_cache(monkeypatch, capsys, tmp_path, decorator):
     torch.testing.assert_close(y, x + 1)
     assert len(profiles) == len(reports) == 1
     measurement = reports[0]
-    assert measurement is not None and len(measurement.rows) == 2
+    assert measurement is not None and measurement.sample_count == 2
     assert measurement.cache_mode == "hot" and measurement.warmup == 0 and measurement.active == 2
     assert math.isfinite(measurement.mean_ms) and measurement.mean_ms > 0
-    assert all(row["Name"] and float(row["Duration(us)"]) > 0 for row in measurement.rows)
-    assert "Selected config:" in capsys.readouterr().out
+    assert measurement.metrics["Name"][0] and measurement.metrics["Duration(us)"][0] > 0
+    output = capsys.readouterr().out
+    assert "Selected config:" in output and output.count("Triton autotuning timing") == 1
     selected = kernel.best_config
     y.zero_()
     kernel[grid](x, y, x.numel())

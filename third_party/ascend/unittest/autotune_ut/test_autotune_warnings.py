@@ -1,6 +1,8 @@
 """NPU measurement settings, profiler failures and selected-config diagnostics."""
 
 import builtins
+import io
+import sys
 import warnings
 
 import pytest
@@ -9,7 +11,12 @@ import torch
 from triton import Config
 
 
-@pytest.mark.parametrize("policy", [{}, {"verbose": True}, {"active": 30}, {"cache_mode": "hot"}])
+def write_warning(message, category, filename, lineno, file=None, line=None):
+    stream = file if file is not None else sys.stderr
+    stream.write(warnings.formatwarning(message, category, filename, lineno, line))
+
+
+@pytest.mark.parametrize("policy", [{}, {"log_level": "brief"}, {"active": 30}, {"cache_mode": "hot"}])
 def test_single_pruned_config_skips_measurements_and_keeps_execution(monkeypatch, policy, configure_run):
     configs = [Config({}), Config({})]
     tuner = configure_run(configs[1], configs, False)
@@ -166,3 +173,42 @@ def test_ignored_options_warn_without_validation_or_scipy(backend, monkeypatch, 
     assert len(diagnostics) == 1
     assert ("quality_check" if source == "argument" else "active") in str(diagnostics[0].message)
     assert "REPORT_BEST_CONFIG" not in str(diagnostics[0].message)
+
+
+@pytest.mark.parametrize("tty", [False, True])
+def test_exhausted_retry_warning_color_and_single_emission(backend, monkeypatch, tty, run_policy, sample):
+    stream = io.StringIO()
+    monkeypatch.setattr(stream, "isatty", lambda: tty)
+    monkeypatch.setattr(sys, "stderr", stream)
+    monkeypatch.setattr(warnings, "showwarning", write_warning)
+    monkeypatch.setattr(backend.quality, "evaluate_quality", lambda *args: ({}, ["bad"]))
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        assert run_policy(lambda *args: [sample()], {"quality_check": True}, funcs=[lambda: None]) == [.01]
+    output = stream.getvalue()
+    assert output.count("RuntimeWarning:") == 1 and "exhausted" in output
+    assert ("\033[33m" in output) is tty
+
+
+@pytest.mark.parametrize("action", ["ignore", "error"])
+def test_exhausted_warning_respects_filters_and_restores_handler(backend, monkeypatch, action, run_policy, sample):
+    monkeypatch.setattr(backend.quality, "evaluate_quality", lambda *args: ({}, ["bad"]))
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter(action)
+        original = warnings.showwarning
+        if action == "error":
+            with pytest.raises(RuntimeWarning, match="exhausted"):
+                run_policy(lambda *args: [sample()], {"quality_check": True}, funcs=[lambda: None])
+        else:
+            assert run_policy(lambda *args: [sample()], {"quality_check": True}, funcs=[lambda: None]) == [.01]
+        assert warnings.showwarning is original and not captured
+
+
+def test_warning_redirected_to_file_has_no_ansi(backend, monkeypatch):
+    terminal, file = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(terminal, "isatty", lambda: True)
+    monkeypatch.setattr(sys, "stderr", terminal)
+    monkeypatch.setattr(warnings, "showwarning", write_warning)
+    with backend.report.yellow_warning():
+        warnings.showwarning("exhausted", RuntimeWarning, "test.py", 1, file=file)
+    assert "exhausted" in file.getvalue() and "\033" not in file.getvalue() and not terminal.getvalue()

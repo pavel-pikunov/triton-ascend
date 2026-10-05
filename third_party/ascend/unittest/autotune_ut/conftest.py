@@ -23,7 +23,8 @@ def backend(monkeypatch, tmp_path):
 
     for name in tuple(os.environ):
         if name.startswith(_npu_benchmark.ENV_PREFIX) or name in {
-                "TRITON_PRINT_AUTOTUNING", "TRITON_ENABLE_UBTUNER", "TRITON_AUTOTUNE_PARALLEL_COMPILE"
+                "TRITON_PRINT_AUTOTUNING", "TRITON_ENABLE_UBTUNER", "TRITON_AUTOTUNE_PARALLEL_COMPILE",
+                "TRITON_AUTOTUNE_REPORT_TIMING"
         }:
             monkeypatch.delenv(name)
     monkeypatch.setenv("TRITON_BENCH_METHOD", "default")
@@ -122,7 +123,7 @@ def fake_profiler(backend, monkeypatch):
 @pytest.fixture
 def write_profile():
 
-    def write(path, groups, warmup, active):
+    def write(path, groups, warmup, active, active_counts=None):
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         columns = ("Name", "Type", "Start Time(us)", "Duration(us)", "Unexpected metric(%)", "Task ID")
@@ -132,8 +133,9 @@ def write_profile():
             writer.writerow(["hook", "Other", 0, 1, "unused", "0000"])
             writer.writerow(["flush", "ReduceSum", 1, 1, "unused", "0001"])
             timestamp = 2
-            for name, duration in groups:
-                for iteration in range(warmup + active):
+            for index, (name, duration) in enumerate(groups):
+                count = active if active_counts is None else active_counts[index]
+                for iteration in range(warmup + count):
                     writer.writerow([
                         name, "Kernel", timestamp, "999.000" if iteration < warmup else duration,
                         "warmup" if iteration < warmup else "001.2300", f"{timestamp:04d}"

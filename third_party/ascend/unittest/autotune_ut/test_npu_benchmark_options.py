@@ -30,7 +30,7 @@ options = policy.resolve_options({"max_retries": 1, "measure_budget_ms": 1})
 options.cache_key()
 with tempfile.TemporaryDirectory() as directory:
     costs = policy.benchmark_with_options(
-        lambda funcs, names, warmup, active, path: [(np.arange(active), np.full(active, 100.))],
+        lambda funcs, names, warmup, active, path, **kw: [(np.arange(active), np.full(active, 100.))],
         [lambda: None], ["kernel"], options, warmup=0, active=2,
         prof_root=directory, synchronize=lambda: None)
 assert costs == [0.1]
@@ -92,6 +92,42 @@ def test_invalid_options(backend, options):
         backend.policy.resolve_options(options)
 
 
+@pytest.mark.parametrize("argument,environment,expected", [(None, None, "off"), (None, "brief", "brief"),
+                                                           (None, "DETAILED", "detailed"), ("off", "invalid", "off"),
+                                                           ("brief", "detailed", "brief")])
+def test_log_level_priority_and_policy_key(backend, monkeypatch, argument, environment, expected):
+    baseline = backend.policy.resolve_options()
+    if environment is not None:
+        monkeypatch.setenv(backend.policy.ENV_PREFIX + "LOG_LEVEL", environment)
+    options = backend.policy.resolve_options({"log_level": argument})
+    assert options.log_level == expected and options.is_default
+    assert options.cache_key() == baseline.cache_key()
+
+
+@pytest.mark.parametrize("options", [{"log_level": "verbose"}, {"log_level": True}, {"verbose": True}])
+def test_invalid_or_removed_log_options(backend, options):
+    with pytest.raises(ValueError):
+        backend.policy.resolve_options(options)
+
+
+@pytest.mark.parametrize("level", ["off", "brief", "detailed"])
+def test_logs_do_not_inherit_legacy_print_or_print_launches(backend, monkeypatch, tmp_path, capsys, level, sample):
+    monkeypatch.setenv("TRITON_PRINT_AUTOTUNING", "1")
+    calls = []
+
+    def measure(funcs, names, warmup, active, directory):
+        calls.append(1)
+        return [sample() for _ in funcs]
+
+    options = backend.policy.resolve_options({"log_level": level, "quality_check": True})
+    assert backend.policy.benchmark_with_options(measure, [lambda: None] * 2, ["a", "b"], options, warmup=1, active=30,
+                                                 prof_root=tmp_path, synchronize=lambda: None) == [.01, .01]
+    output = capsys.readouterr().out
+    assert ("Attempt 1: 2 candidates" in output) is (level != "off")
+    assert ("mean_ms=" in output) is (level == "detailed")
+    assert "Duration(us)" not in output and len(output.splitlines()) < 25 and calls == [1]
+
+
 def test_only_failed_candidates_are_remeasured(backend, tmp_path, monkeypatch, run_policy, sample):
     calls = []
 
@@ -110,7 +146,8 @@ def test_quality_check_does_not_enable_budget_or_retries(backend, monkeypatch, r
     calls = []
     monkeypatch.setattr(backend.quality, "evaluate_quality", lambda t, d: ({}, ["bad"]))
 
-    def measure(funcs, names, warmup, active, directory):
+    def measure(funcs, names, warmup, active, directory, _active_counts=None):
+        active = active if _active_counts is None else _active_counts[0]
         calls.append((warmup, active))
         return [sample() for _ in funcs]
 
@@ -123,7 +160,8 @@ def test_budget_calibrates_without_enabling_quality(backend, monkeypatch, run_po
     calls = []
     monkeypatch.setattr(backend.quality, "evaluate_quality", lambda *args: pytest.fail("quality unexpectedly enabled"))
 
-    def measure(funcs, names, warmup, active, directory):
+    def measure(funcs, names, warmup, active, directory, _active_counts=None):
+        active = active if _active_counts is None else _active_counts[0]
         calls.append((warmup, active))
         return [sample() for _ in funcs]
 
@@ -131,63 +169,65 @@ def test_budget_calibrates_without_enabling_quality(backend, monkeypatch, run_po
     assert calls == [(0, 10), (5, 100)]
 
 
-def test_budget_groups_individual_counts_and_preserves_candidate_order(tmp_path, run_policy, sample):
+def test_budget_batches_individual_counts_and_preserves_candidate_order(tmp_path, run_policy, sample):
     durations = {"a": 10, "b": 1000, "c": 10}
     calls, executed = [], []
 
-    def measure(funcs, names, warmup, active, directory):
-        calls.append((names, warmup, active))
+    def measure(funcs, names, warmup, active, directory, _active_counts=None):
+        counts = _active_counts or [active] * len(funcs)
+        calls.append((names, warmup, counts))
         for fn in funcs:
             fn()
-        return [sample(durations[name], count=active) for name in names]
+        return [sample(durations[name], count=count) for name, count in zip(names, counts)]
 
     result = run_policy(measure, dict(measure_budget_ms=5),
                         funcs=[lambda name=name: executed.append(name) for name in durations], names=list(durations))
     assert result == [0.01, 1, 0.01]
-    assert calls == [(["a", "b", "c"], 0, 10), (["a", "c"], 5, 500), (["b"], 5, 30)]
-    assert executed == ["a", "b", "c", "a", "c", "b"]
+    assert calls == [(["a", "b", "c"], 0, [10] * 3), (["a", "b", "c"], 5, [500, 30, 500])]
+    assert executed == ["a", "b", "c"] * 2
     assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("failure", ["quality", "acquisition"])
-@pytest.mark.parametrize("failed_group", ["small", "large"])
-def test_budget_retries_only_failed_candidates_with_their_counts(backend, tmp_path, monkeypatch, failure, failed_group,
-                                                                 run_policy, sample):
+@pytest.mark.parametrize("failed_duration", [10, 1000])
+def test_budget_retries_failed_candidates_with_their_counts(backend, tmp_path, monkeypatch, failure, failed_duration,
+                                                            run_policy, sample):
     durations = {"a": 10, "b": 1000, "c": 10}
     calls = []
-    failure_call = 2 if failed_group == "small" else 3
-    failure_duration = 10 if failed_group == "small" else 1000
     monkeypatch.setattr(backend.quality, "evaluate_quality", lambda t, d:
-                        ({}, ["bad"] if d[0] == failure_duration and len(calls) == failure_call else []))
+                        ({}, ["bad"] if d[0] == failed_duration and len(calls) == 2 else []))
 
-    def measure(funcs, names, warmup, active, directory):
-        calls.append((names, warmup, active))
-        if failure == "acquisition" and len(calls) == failure_call:
+    def measure(funcs, names, warmup, active, directory, _active_counts=None):
+        counts = _active_counts or [active] * len(funcs)
+        calls.append((names, warmup, counts))
+        if failure == "acquisition" and len(calls) == 2:
             raise backend.policy.ProfilerAcquisitionError("missing rows")
-        return [sample(durations[name], count=active) for name in names]
+        return [sample(durations[name], count=count) for name, count in zip(names, counts)]
 
     warning = (pytest.warns(RuntimeWarning, match="selected config 0")
-               if failure == "quality" and failed_group == "small" else nullcontext())
+               if failure == "quality" and failed_duration == 10 else nullcontext())
     with warning:
         result = run_policy(measure, dict(measure_budget_ms=5, quality_check=failure == "quality", max_retries=1),
                             funcs=[lambda: None] * 3, names=["a", "b", "c"])
     assert result == [0.01, 1, 0.01]
-    expected_retry = (["a", "c"], 5, 500) if failed_group == "small" else (["b"], 5, 30)
-    assert calls == [(["a", "b", "c"], 0, 10), (["a", "c"], 5, 500), (["b"], 5, 30), expected_retry]
+    expected_retry = ((["a", "b", "c"], 5, [500, 30, 500]) if failure == "acquisition" else
+                      (["a", "c"], 5, [500, 500]) if failed_duration == 10 else (["b"], 5, [30]))
+    assert calls == [(["a", "b", "c"], 0, [10] * 3), (["a", "b", "c"], 5, [500, 30, 500]), expected_retry]
     assert list(tmp_path.iterdir()) == []
 
 
 def test_budget_calibration_retries_acquisition_failure(backend, tmp_path, run_policy, sample):
     calls = []
 
-    def measure(funcs, names, warmup, active, directory):
-        calls.append((names, warmup, active))
+    def measure(funcs, names, warmup, active, directory, _active_counts=None):
+        counts = _active_counts or [active] * len(funcs)
+        calls.append((names, warmup, counts))
         if len(calls) == 1:
             raise backend.policy.ProfilerAcquisitionError("missing calibration")
-        return [sample(10 if name == "a" else 1000, count=active) for name in names]
+        return [sample(10 if name == "a" else 1000, count=count) for name, count in zip(names, counts)]
 
     assert run_policy(measure, dict(measure_budget_ms=5, max_retries=1)) == [0.01, 1]
-    assert calls == [(["a", "b"], 0, 10), (["a", "b"], 0, 10), (["a"], 5, 500), (["b"], 5, 30)]
+    assert calls == [(["a", "b"], 0, [10, 10]), (["a", "b"], 0, [10, 10]), (["a", "b"], 5, [500, 30])]
     assert list(tmp_path.iterdir()) == []
 
 
@@ -482,11 +522,11 @@ def test_slow_filter_operates_on_candidates_remaining_after_cv_estimate(backend,
     assert kept == [configs[1], configs[11 if explicit_counts else 9]]
 
 
-INACTIVE_OPTIONS = dict(verbose=True, calibration_runs=27, slow_config_runs=31, slow_config_recheck_runs=53,
+INACTIVE_OPTIONS = dict(log_level="detailed", calibration_runs=27, slow_config_runs=31, slow_config_recheck_runs=53,
                         slow_config_factor=7, slow_config_recheck_delay_s=0.25)
 
 
-def test_verbose_only_changes_profiler_output(backend, monkeypatch, capsys):
+def test_log_level_only_changes_profiler_output(backend, monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(backend.testing, "_profile_npu", lambda *a, **k: calls.append((a, k)) or 7)
     fn = lambda: None
@@ -495,7 +535,7 @@ def test_verbose_only_changes_profiler_output(backend, monkeypatch, capsys):
         assert backend.testing.do_bench_npu(fn, npu_bench_options=INACTIVE_OPTIONS) == 7
     assert len(diagnostics) == 2
     assert calls[0] == calls[1]
-    assert "npu benchmark:" in capsys.readouterr().out
+    assert "NPU autotune:" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("warnings_as_errors", [False, True])
@@ -589,7 +629,8 @@ def test_budget_retains_all_10000_launches_and_samples(backend, monkeypatch, run
     calls, launches, checked = [], [], []
     values = np.random.default_rng(42).normal(1000, 2, 10000)
 
-    def measure(funcs, names, warmup, active, directory):
+    def measure(funcs, names, warmup, active, directory, _active_counts=None):
+        active = active if _active_counts is None else _active_counts[0]
         calls.append((warmup, active))
         for _ in range(active):
             funcs[0]()
