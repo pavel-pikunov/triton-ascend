@@ -280,7 +280,7 @@ def vector_kernel(...):
 
 ## NPU measurement policies and diagnostics
 
-`max_autotune` accepts the same `npu_bench_options` and `report_best_config`
+`max_autotune` accepts the same `npu_bench_options`, `report_best_config` and `report_timing`
 arguments as `autotune`. See [Optional NPU benchmark policies](autotune_guide.md#optional-npu-benchmark-policies)
 for the option table, defaults, cache behavior, and limitations.
 

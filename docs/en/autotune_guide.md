@@ -338,7 +338,7 @@ time estimate may derive its own counts). Standalone `do_bench_npu` retains its 
 | `slow_config_recheck_runs` | `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_RUNS` | `40`; recheck slow candidates before excluding them. |
 | `slow_config_factor` | `TRITON_NPU_BENCH_SLOW_CONFIG_FACTOR` | `5.0`, >= 1; candidates above this multiple of the best rough time are rechecked. |
 | `slow_config_recheck_delay_s` | `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_DELAY_S` | `0.5`; finite seconds >= 0 between the first rough-measurement round and the recheck round. `0` disables the pause. |
-| `verbose` | `TRITON_NPU_BENCH_VERBOSE` | Inherit `TRITON_PRINT_AUTOTUNING`; print policy and per-attempt diagnostics. |
+| `log_level` | `TRITON_NPU_BENCH_LOG_LEVEL` | `off`; `brief` prints stages and candidate counts, `detailed` also prints configuration and quality diagnostics. |
 
 Boolean environment values accept `0`, `1`, `false`, and `true`. Generic
 `prune_configs` still runs first. Without explicit `active` or
@@ -370,8 +370,12 @@ This wall-clock pause is separate from the optional device-time measurement budg
 With a budget, calibration determines `duration_i_ms` for each candidate, then
 `active_i = max(active, ceil(measure_budget_ms / duration_i_ms))`. For example,
 `active=30` and a `5 ms` budget give candidates taking `0.01 ms` and `1 ms`
-respectively **500 and 30 measured launches**. Candidates with the same count
-are profiled together; retries retain each candidate's calculated count.
+respectively **500 and 30 measured launches**. All current candidates share one
+profiler session per attempt, each with its own count. The common CSV is read
+once and split by cumulative launch counts in candidate order, including when
+kernel names are identical. Warmup rows are excluded per candidate. Calibration
+also uses a single batch; retries retain each candidate's calculated count.
+A failure to acquire the common CSV retries the entire current batch.
 
 An explicit `cache_mode="cold"` composes cache eviction after the autotuner's
 existing preparation hooks during profiling. Those hooks and the `kernel_call`
@@ -396,7 +400,7 @@ apply. Explicit measurement settings are diagnosed when ignored by another
 benchmark method, a custom `do_bench`, or selection with only one surviving
 configuration. `calibration_runs` is inactive without a budget; slow-filter
 fields are inactive when `filter_slow_configs=False`. These inactive fields and
-`verbose` do not change measurement routing or cache keys.
+`log_level` do not change measurement routing or cache keys.
 
 Missing NPU profiler CSV and non-finite final scores from the built-in NPU
 benchmarker also warn with the fallback and a suggested action.
@@ -404,12 +408,32 @@ The optional `auto_prof_dir` winner profile uses environment settings and warns
 when explicit `npu_bench_options` are not forwarded to it. Cleanup and report
 diagnostics preserve an exception already in flight, even with warnings as errors.
 
+### Stage logging
+
+`log_level="brief"` prints the initial combination count, stage starts, compilation
+and pruning results, whether the slow filter needs a second round, profiler
+attempt numbers, and retry candidate counts. `detailed` additionally prints
+settings, per-candidate launch counts, mean durations, quality metrics and failure
+reasons. Neither level prints individual launches or raw CSV rows. The default
+is `off`; an explicit field overrides `TRITON_NPU_BENCH_LOG_LEVEL`.
+This log is independent of `TRITON_PRINT_AUTOTUNING`, which retains its existing
+debug behavior. Disable that legacy flag when using these examples:
+
+```bash
+export TRITON_PRINT_AUTOTUNING=0
+export TRITON_NPU_BENCH_LOG_LEVEL=brief
+```
+
+Retry-exhaustion diagnostics remain `RuntimeWarning` and respect Python warning
+filters. An emitted warning is yellow only on a TTY; redirected files contain
+no ANSI color codes and the log does not print a duplicate warning.
+
 ### Selected-configuration report
 
 To print a detailed report after selecting a configuration, set
 `report_best_config=True` on `autotune` or `max_autotune`, or set
 `TRITON_NPU_BENCH_REPORT_BEST_CONFIG=1`. This diagnostic option is separate from
-`npu_bench_options` and `verbose`. An explicit argument overrides the environment;
+`npu_bench_options` and `log_level`. An explicit argument overrides the environment;
 the default is disabled. Environment values accept `0`, `1`, `false`, and `true`.
 
 ```python
@@ -429,21 +453,50 @@ list before pruning**, all configuration fields (including defaults and `None`),
 and `ubtune_cfg` when present. With NPU profiler data available, it also prints
 the profiler kernel name, mean duration in microseconds and milliseconds, cache
 mode, warmup and measured launch counts, and the selected measurement attempt.
-The complete measured rows from `kernel_details.csv` follow as CSV, preserving
-every column, its original value, and column order without truncation. Warmup
-rows and unrelated operations are excluded using the benchmark's row selection.
+Numeric profiler metrics are averaged from the already-read measured rows of
+that attempt. IDs and absolute timestamps are never averaged. Constant text
+fields appear once; changing text fields appear as `varies`. Incomplete metrics
+show the number of available values, without substituting zeros. Raw rows are
+not retained for reporting, and the CSV is not read again.
 
-CSV columns depend on the profiler's settings
-and version. No additional metrics or profiling runs are enabled by reporting.
-With retries, the report describes the attempt whose mean was retained for
-ranking, including any failed quality checks. It does not combine attempts.
+CSV columns depend on the profiler's settings and version. Reporting enables
+no additional metrics or profiling runs. With retries, the report describes the
+attempt whose mean was retained for ranking, including its quality metrics and
+any failed checks. It does not combine attempts.
 
-Reporting does not change launch counts, pruning, configuration selection, or
-autotune cache keys. Cache hits do not print the report again. If selection did
-not capture NPU profiler data (for example, a single candidate needed no tuning
-or a custom benchmarker was used), the report prints the configuration and
-states that profiler measurements are unavailable. Temporary files retain their
-existing cleanup behavior; captured rows are released after reporting.
+For the ordinary benchmarker the report prints the returned median and 20%/80%
+quantiles. For a custom `do_bench` it prints the returned score without assigning
+units or interpreting its meaning. When measurements were skipped or unavailable,
+the report states that explicitly and performs no additional measurement.
+Reporting does not change launch counts, pruning, selection or autotune cache
+keys. Cache hits do not repeat it. Temporary files retain their cleanup behavior.
+
+### Autotune timing report
+
+Set `report_timing=True` on either decorator, or
+`TRITON_AUTOTUNE_REPORT_TIMING=1`, to print one final block after configuration
+selection. An explicit argument overrides the environment; the default is off.
+This control is independent of `log_level`, `report_best_config`, and benchmarker.
+
+The block lists total wall time, generation/pruning, compilation, slow filtering,
+calibration, main measurements including retries, and other expenses. Measurements
+include profiler completion, CSV reading and quality checks. Stages do not overlap;
+other expenses are the remaining total. The timing ends at selection and excludes
+the optional extra winner profile, final kernel invocation and reporting itself.
+There are no intermediate timing blocks and cache hits remain silent.
+
+```python
+@triton.autotune(
+    configs=configs,
+    key=["N"],
+    npu_bench_options={"log_level": "brief", "measure_budget_ms": 5},
+    report_best_config=True,
+    report_timing=True,
+)
+@triton.jit
+def kernel(x, y, N, BLOCK: tl.constexpr):
+    ...
+```
 
 ## Summary
 
