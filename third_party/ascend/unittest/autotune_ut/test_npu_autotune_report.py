@@ -531,6 +531,26 @@ def test_reporting_and_logging_preserve_actual_cache_key(backend, monkeypatch, m
     assert tuner.generate_key_and_configs(tensor) == key
 
 
+def test_detailed_config_formatting_failure_preserves_selection(backend, monkeypatch, configure_run):
+
+    class Hook:
+
+        def __call__(self, args):
+            pass
+
+        def __repr__(self):
+            raise ValueError("log formatting failed")
+
+    monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
+    configs = [Config({}), Config({}, pre_hook=Hook())]
+    tuner = configure_run(configs[1], configs, False, options={"log_level": "detailed"})
+    tuner.parser_mode = "vector"
+    monkeypatch.setattr(backend.testing, "_profile_npu", lambda *args, **kwargs: [.01, .02])
+    with pytest.warns(RuntimeWarning, match="log formatting failed"):
+        assert tuner.run(torch.empty(1)) == "result"
+    assert tuner.best_config is configs[1]
+
+
 def test_single_candidate_timing_reports_skipped_stages(capsys, configure_run):
     config = Config({})
     tuner = configure_run(config, [config], False, report_timing=True)
