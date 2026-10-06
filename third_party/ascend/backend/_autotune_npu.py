@@ -6,7 +6,7 @@ import math
 import os
 import time
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict
 
@@ -108,12 +108,21 @@ def warn_once(tuner, reason, message):
 def get_options(tuner):
     from ._npu_benchmark import _inactive_option_messages, _supplied_option_fields, resolve_options
 
-    if not tuner.user_defined_do_bench and os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu":
+    method = os.getenv("TRITON_BENCH_METHOD", "default").lower()
+    if not tuner.user_defined_do_bench and method == "npu":
         options = resolve_options(tuner.npu_bench_options)
         for reason, message in _inactive_option_messages(options, tuner.npu_bench_options):
             tuner._warn_once(reason, message)
         return options
     fields = _supplied_option_fields(tuner.npu_bench_options)
+    if not tuner.user_defined_do_bench and not tuner.use_cuda_graph and method == "default":
+        # The test branch's event benchmarker applies these environment fields.
+        # Explicit npu_bench_options are still NPU-profiler-only.
+        applied_env_fields = {"cache_mode", "active"}
+        if isinstance(tuner.npu_bench_options, Mapping):
+            applied_env_fields.difference_update(name for name, value in tuner.npu_bench_options.items()
+                                                 if value is not None)
+        fields.difference_update(applied_env_fields)
     if fields or tuner.npu_bench_options is not None:
         reason = ("a custom do_bench was provided"
                   if tuner.user_defined_do_bench else "TRITON_BENCH_METHOD is not set to 'npu'")
