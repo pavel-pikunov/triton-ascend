@@ -112,10 +112,12 @@ def _read_profile_samples(directory, names, warmup, active, clear_l2_cache, _rep
     if _report_sink is not None:
 
         def capture():
+            from ._benchmark_quality import central_50_mean
+
             reports = [
                 make_profile_report(columns, [row[3]
                                               for row in measured_chunks[index]], warmup, counts[index], clear_l2_cache,
-                                    float(durations.mean()) / 1000)
+                                    float(durations.mean()) / 1000, score_ms=central_50_mean(durations) / 1000)
                 for index, (_, durations) in enumerate(samples)
             ]
             _report_sink(reports)
@@ -131,8 +133,21 @@ def collect_samples(directory, funcs, names, warmup, active, clear_l2_cache, ret
                                     _active_counts=active_counts)
     if return_samples:
         return samples
-    costs = [float(durations.mean()) / 1000 for _, durations in samples]
+    from ._benchmark_quality import central_50_mean
+    costs = [central_50_mean(durations) / 1000 for _, durations in samples]
     return costs[0] if len(funcs) == 1 else costs
+
+
+def profile_costs(filter_df, num_funcs, warmup, active):
+    """Score already-read profiler rows, excluding each candidate's warmup."""
+    from ._benchmark_quality import central_50_mean
+
+    durations = filter_df["Duration(us)"]
+    total = warmup + active
+    return [
+        central_50_mean(durations.iloc[range(index * total + warmup, (index + 1) * total)].to_numpy()) / 1000
+        for index in range(num_funcs)
+    ]
 
 
 def warn_missing_csv(directory):

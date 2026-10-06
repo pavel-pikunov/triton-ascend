@@ -57,7 +57,8 @@ def do_bench_npu(
     npu_bench_options overrides TRITON_NPU_BENCH_* per field. Unspecified
     fields inherit the existing arguments. Counts are launches, budget is ms,
     and max_retries counts additional attempts after the initial measurement.
-    The result remains a scalar for one callable and a list for multiple ones.
+    The result is the mean of the central 50% of measured durations, as a scalar
+    for one callable and a list for multiple ones.
     """
     from ._npu_profiler import bench_npu
     return bench_npu(_profile_npu, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
@@ -174,7 +175,8 @@ def _collect_prof_result(
 ):
     """
     Collect kernel performance from kernel_details.csv, returned in millisecond.
-    The first `num_warmup` rows of each function are warmup data and will be ignored, the next `num_active` rows will be averaged.
+    The first `num_warmup` rows of each function are warmup data and will be ignored.
+    The score is the mean of the central 50% of the next `num_active` durations.
 
     :param base_dir: the profiler path
     :type base_dir: str
@@ -193,7 +195,6 @@ def _collect_prof_result(
         return collect_samples(base_dir, funcs, target_kernel_name, num_warmup, num_active, clear_l2_cache,
                                _return_samples, _report_sink, _active_counts)
 
-    import numpy as np
     import pandas as pd
 
     kernel_details_file = None
@@ -223,12 +224,8 @@ def _collect_prof_result(
     if target_kernel_name is not None and actual_rows != expected_rows:
         raise ProfilerResultMismatchError(target_kernel_name, expected_rows, actual_rows)
 
-    time_cost = [0] * num_funcs
-    for func_idx in np.arange(0, num_funcs):
-        for active_index in np.arange(0, num_active):
-            row_index = func_idx * (num_warmup + num_active) + num_warmup + active_index
-            time_cost[func_idx] += filter_df.iloc[row_index]["Duration(us)"]
-    time_cost = [x / num_active / 1e3 for x in time_cost]
+    from ._npu_profiler import profile_costs
+    time_cost = profile_costs(filter_df, num_funcs, num_warmup, num_active)
 
     if _report_sink is not None:
         from ._autotune_report import capture_profile_report

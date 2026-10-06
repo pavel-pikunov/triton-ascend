@@ -216,6 +216,8 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
     measure returns device timestamps and durations (microseconds) per callable.
     Profiling errors can be retried; callable execution errors always propagate.
     """
+    from ._benchmark_quality import central_50_mean
+
     if options.quality_check and active < 2:
         raise ValueError("quality_check requires active >= 2")
     if options.quality_check:
@@ -296,8 +298,8 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
             else:
                 retry = []
                 for position, (index, (times, durations)) in enumerate(zip(selected, samples)):
-                    # Keep the existing NPU arithmetic mean for configuration ranking.
-                    cost = float(np.mean(durations)) / 1000
+                    cost = central_50_mean(durations) / 1000
+                    mean = float(np.mean(durations)) / 1000
                     metrics, failures = evaluate_quality(times, durations) if options.quality_check else ({}, [])
                     if cost < costs[index]:
                         costs[index], best_failures[index] = cost, failures
@@ -306,16 +308,16 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
                             def capture():
                                 best_reports[index] = None
                                 if len(reports) == len(selected) and reports[position] is not None:
-                                    best_reports[index] = replace(reports[position], mean_ms=cost, attempt=attempt + 1,
-                                                                  quality_failures=tuple(failures),
+                                    best_reports[index] = replace(reports[position], mean_ms=mean, score_ms=cost,
+                                                                  attempt=attempt + 1, quality_failures=tuple(failures),
                                                                   quality_checked=options.quality_check,
                                                                   quality_metrics=metrics)
 
                             report_safely(capture)
                     log_stage(
                         options.log_level, "Config measurement", f"config={index}, attempt={attempt + 1}, "
-                        f"active={counts[position]}, mean_ms={cost:.8g}, metrics={metrics}, failures={failures}",
-                        detailed=True)
+                        f"active={counts[position]}, score_ms={cost:.8g}, mean_ms={mean:.8g}, "
+                        f"metrics={metrics}, failures={failures}", detailed=True)
                     if failures:
                         retry.append(index)
                 pending = retry
