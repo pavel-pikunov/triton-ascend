@@ -29,6 +29,7 @@ class NpuMeasurementReport:
     quality_failures: tuple = ()
     quality_checked: bool = False
     quality_metrics: dict = field(default_factory=dict)
+    score_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -126,9 +127,9 @@ def aggregate_profile_rows(columns, rows):
     return metrics
 
 
-def make_profile_report(columns, rows, warmup, active, clear_l2_cache, cost):
+def make_profile_report(columns, rows, warmup, active, clear_l2_cache, cost, *, score_ms=None):
     return NpuMeasurementReport(aggregate_profile_rows(columns, rows), len(rows), warmup, active,
-                                "cold" if clear_l2_cache else "hot", cost)
+                                "cold" if clear_l2_cache else "hot", cost, score_ms=score_ms)
 
 
 def print_best_config_report(function_name, configs, config, measurement=None):
@@ -153,6 +154,11 @@ def print_best_config_report(function_name, configs, config, measurement=None):
         else:
             stream.write(f"Returned score: {measurement.score!r}; median and quantiles unavailable.\n")
     else:
+        if measurement.score_ms is not None:
+            stream.write(f"Central 50% score: {measurement.score_ms * 1000:.12g} us "
+                         f"({measurement.score_ms:.12g} ms)\n")
+        else:
+            stream.write("Central 50% score unavailable.\n")
         stream.write(f"Mean duration: {measurement.mean_ms * 1000:.12g} us ({measurement.mean_ms:.12g} ms)\n")
         stream.write(f"cache={measurement.cache_mode}, warmup={measurement.warmup}, "
                      f"active={measurement.active}, selected attempt={measurement.attempt}\n")
@@ -176,9 +182,12 @@ def capture_profile_report(filter_df, time_cost, num_warmup, num_active, clear_l
     def capture():
         total = num_warmup + num_active
         reports = [
-            make_profile_report(tuple(filter_df.columns),
-                                filter_df.iloc[index * total + num_warmup:(index + 1) * total].to_dict("records"),
-                                num_warmup, num_active, clear_l2_cache, cost) for index, cost in enumerate(time_cost)
+            make_profile_report(
+                tuple(filter_df.columns),
+                filter_df.iloc[index * total + num_warmup:(index + 1) * total].to_dict("records"), num_warmup,
+                num_active, clear_l2_cache,
+                float(filter_df["Duration(us)"].iloc[index * total + num_warmup:(index + 1) * total].mean()) / 1000,
+                score_ms=cost) for index, cost in enumerate(time_cost)
         ]
         report_sink(reports)
 
