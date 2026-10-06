@@ -74,8 +74,9 @@ def compilation_result(tuner, configs, run_fns):
         for config in configs:
             number = next((i for i, candidate in enumerate(tuner.configs, 1) if candidate is config), None)
             status = "compiled" if config in run_fns else "failed"
-            report_module.log_stage(options.log_level, "Config compilation", f"config={number}, status={status}, "
-                                    f"parameters={vars(config)}", detailed=True)
+            report_module.report_safely(lambda: report_module.log_stage(
+                options.log_level, "Config compilation", f"config={number}, status={status}, "
+                f"parameters={vars(config)}", detailed=True))
 
 
 def bench_events(tuner, run_fns, report_sink):
