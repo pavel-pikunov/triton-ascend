@@ -2862,6 +2862,13 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
         report_best_config. Cache hits do not repeat the report.
     """
 
+    if os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu_legacy":
+        from ._legacy_autotuner import autotune as legacy_autotune
+        return legacy_autotune(configs, key, prune_configs_by=prune_configs_by, reset_to_zero=reset_to_zero,
+                               restore_value=restore_value, pre_hook=pre_hook, post_hook=post_hook, warmup=warmup,
+                               rep=rep, use_cuda_graph=use_cuda_graph, do_bench=do_bench, auto_prof_dir=auto_prof_dir,
+                               hints=hints)
+
     def decorator(fn):
         return AutoTilingTuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                                post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
@@ -3213,6 +3220,13 @@ def max_autotune(configs, key, kernel_type="mixcv", prune_configs_by=None, reset
                           Each value must be a list; the Cartesian product of these lists
                           will be combined with each base config.
     """
+    if os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu_legacy":
+        from ._legacy_autotuner import max_autotune as legacy_max_autotune
+        return legacy_max_autotune(configs, key, kernel_type=kernel_type, prune_configs_by=prune_configs_by,
+                                   reset_to_zero=reset_to_zero, restore_value=restore_value, pre_hook=pre_hook,
+                                   post_hook=post_hook, warmup=warmup, rep=rep, use_cuda_graph=use_cuda_graph,
+                                   do_bench=do_bench, **tuning_params)
+
     def decorator(fn):
         if not configs or len(configs) == 0:
             raise ValueError("[max_autotune] The argument 'configs' cannot be empty. "

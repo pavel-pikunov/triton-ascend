@@ -60,6 +60,11 @@ def do_bench_npu(
     The result is the mean of the central 50% of measured durations, as a scalar
     for one callable and a list for multiple ones.
     """
+    if os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu_legacy":
+        from ._legacy_testing import do_bench_npu as legacy_do_bench_npu
+        return legacy_do_bench_npu(funcs, warmup=warmup, active=active, clear_l2_cache=clear_l2_cache,
+                                   prof_dir=prof_dir, keep_res=keep_res, target_kernel_name=target_kernel_name)
+
     from ._npu_profiler import bench_npu
     return bench_npu(_profile_npu, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
                      npu_bench_options, _pre_hook_scope, _report_sink, _timing_sink)

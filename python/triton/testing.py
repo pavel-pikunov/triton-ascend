@@ -114,17 +114,38 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
 
     di = runtime.driver.active.get_device_interface()
 
+    # Test branch: apply only the shared cache/count controls, only on Ascend.
+    clear_l2_cache = True
+    active_count = None
+    cache_mode = os.getenv("TRITON_NPU_BENCH_CACHE_MODE")
+    active_override = os.getenv("TRITON_NPU_BENCH_ACTIVE")
+    if ((cache_mode is not None or active_override is not None)
+            and runtime.driver.active.get_current_target().backend == "npu"):
+        if cache_mode is not None:
+            cache_mode = cache_mode.strip().lower()
+            if cache_mode not in ("hot", "cold"):
+                raise ValueError("TRITON_NPU_BENCH_CACHE_MODE must be 'hot' or 'cold'")
+            clear_l2_cache = cache_mode == "cold"
+        if active_override is not None:
+            try:
+                active_count = int(active_override)
+            except ValueError as exc:
+                raise ValueError("TRITON_NPU_BENCH_ACTIVE must be a positive integer") from exc
+            if active_count < 1:
+                raise ValueError("TRITON_NPU_BENCH_ACTIVE must be a positive integer")
+
     fn()
     di.synchronize()
 
-    cache = runtime.driver.active.get_empty_cache_for_benchmark()
+    cache = runtime.driver.active.get_empty_cache_for_benchmark() if clear_l2_cache else None
 
     # Estimate the runtime of the function
     start_event = di.Event(enable_timing=True)
     end_event = di.Event(enable_timing=True)
     start_event.record()
     for _ in range(5):
-        cache.zero_()
+        if clear_l2_cache:
+            cache.zero_()
         fn()
     end_event.record()
     di.synchronize()
@@ -132,7 +153,7 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
 
     # compute number of warmup and repeat
     n_warmup = max(1, int(warmup / estimate_ms))
-    n_repeat = max(1, int(rep / estimate_ms))
+    n_repeat = active_count if active_count is not None else max(1, int(rep / estimate_ms))
     start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
     end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
     # Warm-up
@@ -147,7 +168,8 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
             for x in grad_to_none:
                 x.grad = None
         # we clear the L2 cache before each run
-        cache.zero_()
+        if clear_l2_cache:
+            cache.zero_()
         # record time of `fn`
         start_event[i].record()
         fn()
