@@ -21,13 +21,57 @@ def initialize(tuner, options, report, report_timing=None):
     tuner.report_timing = report_module.resolve_report_timing(report_timing)
     tuner._autotune_timing = None
     tuner._autotune_selection = None
+    tuner._autotune_runs, tuner._autotune_csv_dir = report_module.resolve_comparison_options()
+    tuner._autotune_comparison = None
+
+
+def comparison_enabled(tuner):
+    return tuner._autotune_runs > 1 or tuner._autotune_csv_dir is not None
+
+
+def repeat_autotune(tuner, args, kwargs):
+    if tuner.user_defined_do_bench:
+        raise ValueError("Autotune CSV comparison requires a built-in benchmarker with scores in milliseconds")
+    comparison = report_module.AutotuneComparison(tuner._autotune_runs, tuner._autotune_csv_dir)
+    tuner._autotune_comparison = comparison
+    try:
+        for index in range(comparison.runs):
+            result = tuner.run(*args, _comparison_pass=True, _comparison_tune_only=index + 1 < comparison.runs,
+                               **kwargs)
+            if comparison.cache_hit:
+                return result
+            if index + 1 < comparison.runs:
+                # Retain all JIT/compiler caches and choices for other input keys.
+                tuner.cache.pop(comparison.key, None)
+        if comparison.directory is not None:
+            path = comparison.write_csv(tuner.base_fn.__name__)
+            print(f"Triton autotune comparison: {comparison.completed} runs; CSV: {path}")
+        else:
+            print(f"Triton autotune comparison: {comparison.completed} runs")
+        return result
+    except BaseException:
+        if comparison.key is not None:
+            tuner.cache.pop(comparison.key, None)
+        raise
+    finally:
+        tuner._autotune_comparison = None
+        tuner._autotune_selection = None
+        tuner._autotune_timing = None
+        tuner.nargs = None
 
 
 def capture_selection(tuner, key, cache_miss):
     tuner._autotune_selection = None
-    if cache_miss and tuner.report_best_config:
+    if tuner._autotune_comparison is not None:
+        tuner._autotune_selection = tuner._autotune_comparison.prepare(tuner.configs, key, cache_miss)
+    elif cache_miss and tuner.report_best_config:
         tuner._autotune_selection = report_module.report_safely(
             lambda: report_module.snapshot_candidates(tuner.configs, key))
+
+
+def record_comparison(tuner, config, timings, cache_miss):
+    if cache_miss and tuner._autotune_comparison is not None:
+        tuner._autotune_comparison.record(tuner._autotune_selection, config, timings)
 
 
 def record_scored_candidates(tuner, configs):
