@@ -1,6 +1,7 @@
 """Private policy routing and profiler acquisition extensions."""
 
 import csv
+import time
 import warnings
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -55,7 +56,7 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
     root = prof_dir if prof_dir is not None else Path(runtime.cache.get_home_dir()) / ".triton" / "profile_results"
     costs = benchmark_with_options(measure, funcs, names, options, warmup=warmup, active=active, prof_root=root,
                                    synchronize=torch.npu.synchronize, keep_res=keep_res, _timing_sink=_timing_sink,
-                                   **report_kwargs)
+                                   clear_l2_cache=clear_l2_cache, _pre_hook_scope=_pre_hook_scope, **report_kwargs)
     return costs[0] if len(funcs) == 1 else costs
 
 
@@ -136,6 +137,44 @@ def collect_samples(directory, funcs, names, warmup, active, clear_l2_cache, ret
     from ._benchmark_quality import central_50_mean
     costs = [central_50_mean(durations) / 1000 for _, durations in samples]
     return costs[0] if len(funcs) == 1 else costs
+
+
+@contextmanager
+def event_timer(clear_l2_cache, pre_hook_scope):
+    """Measure host and event time together, restoring preparation before profiling."""
+    import torch
+
+    start, end = (torch.npu.Event(enable_timing=True) for _ in range(2))
+    start.record()
+    end.record()
+    torch.npu.synchronize()
+    buffer = runtime.driver.active.get_empty_cache_for_benchmark().float() if clear_l2_cache else None
+    scoped = buffer is not None and pre_hook_scope is not None
+
+    def prepare():
+        if buffer is not None:
+            buffer.sum()
+            torch.npu.synchronize()
+        start.record()
+
+    def measure(fn, count):
+        best, total_ms = float("inf"), 0.0
+        for _ in range(count):
+            if not scoped:
+                prepare()
+            began = time.perf_counter()
+            fn()
+            end.record()
+            torch.npu.synchronize()
+            best = min(best, time.perf_counter() - began)
+            total_ms += start.elapsed_time(end)
+        return best, total_ms / count
+
+    try:
+        with pre_hook_scope(prepare) if scoped else nullcontext():
+            yield measure
+    finally:
+        buffer = None
 
 
 def profile_costs(filter_df, num_funcs, warmup, active):
