@@ -332,7 +332,7 @@ time estimate may derive its own counts). Standalone `do_bench_npu` retains its 
 | `quality_check` | `TRITON_NPU_BENCH_QUALITY_CHECK` | `False`; evaluate predefined sample-quality metrics. |
 | `max_retries` | `TRITON_NPU_BENCH_MAX_RETRIES` | `0`; additional attempts for failed quality checks or unusable profiler data. |
 | `measure_budget_ms` | `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | Unset; optional minimum accumulated device time per candidate, not a wall-clock timeout. |
-| `calibration_runs` | `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; used only when a measurement budget is supplied. |
+| `calibration_runs` | `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; event calibration launches with a budget when no slow-filter estimate is available. |
 | `filter_slow_configs` | `TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS` | `False`; independently exclude especially slow candidates using rough host timings. |
 | `slow_config_runs` | `TRITON_NPU_BENCH_SLOW_CONFIG_RUNS` | `20`; initial rough launches for slow-configuration filtering. |
 | `slow_config_recheck_runs` | `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_RUNS` | `40`; recheck slow candidates before excluding them. |
@@ -374,7 +374,17 @@ respectively **500 and 30 measured launches**. All current candidates share one
 profiler session per attempt, each with its own count. The common CSV is read
 once and split by cumulative launch counts in candidate order, including when
 kernel names are identical. Warmup rows are excluded per candidate. Calibration
-also uses a single batch; retries retain each candidate's calculated count.
+uses NPU events, without a profiler session or CSV. With slow filtering enabled,
+event times are collected in the same rough-measurement rounds and reused for
+surviving candidates; rechecked candidates use their second round's event mean.
+Otherwise, one preliminary call and `calibration_runs` event measurements are
+performed per candidate. A single candidate skipped by the slow filter also
+uses this short event calibration. Event preparation follows the requested
+hot/cold cache policy, excluding explicit eviction from the device event span.
+Event estimates control launch counts only; final scores still come from the
+profiler. When filter samples are reused, their time is counted in `Slow filter`,
+and `Calibration` contains count calculation only. Retries retain each
+candidate's calculated count, without recalibration.
 A failure to acquire the common CSV retries the entire current batch.
 
 An explicit `cache_mode="cold"` composes cache eviction after the autotuner's
@@ -384,7 +394,7 @@ L2; it means that the benchmark does not evict it between measured launches.
 
 Quality checks cover tail contamination, gaps, multimodality, drift, and change
 points, using the predefined thresholds in `_benchmark_quality.py`. Candidate
-ranking keeps the existing arithmetic mean of kernel durations. Only failing
+ranking uses the mean of the central 50% of measured kernel durations. Only failing
 candidates are remeasured. After exhausting retries, the fastest collected
 measurement remains eligible, with a warning if quality checks failed or some
 candidates still lack usable data. If no usable measurements were collected,

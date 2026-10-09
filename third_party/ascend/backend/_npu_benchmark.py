@@ -9,6 +9,7 @@ import tempfile
 import time
 import warnings
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -100,7 +101,7 @@ class NpuBenchmarkOptions:
         if self.quality_check:
             from ._benchmark_quality import THRESHOLDS
             thresholds = tuple(sorted(THRESHOLDS.items()))
-        return ("npu-benchmark", 2, policy, thresholds)
+        return ("npu-benchmark", 3 if self.measure_budget_ms is not None else 2, policy, thresholds)
 
 
 def _warn_secondary(message, error):
@@ -172,7 +173,7 @@ def resolve_options(arguments=None):
     return NpuBenchmarkOptions(**values)
 
 
-def filter_slow_configs(funcs, synchronize, options):
+def filter_slow_configs(funcs, synchronize, options, *, _measure=None):
     """Recheck slow candidates in a later round using the best rough host time."""
     if len(funcs) < 2:
         log_stage(options.log_level, "Slow filter", f"{len(funcs)}/{len(funcs)} candidates retained; no second round")
@@ -182,16 +183,18 @@ def filter_slow_configs(funcs, synchronize, options):
         fn()
         synchronize()
 
-    def measure(fn, count):
+    def measure(index, count):
+        if _measure is not None:
+            return _measure(index, count)
         best = float("inf")
         for _ in range(count):
             start = time.perf_counter()
-            fn()
+            funcs[index]()
             synchronize()
             best = min(best, time.perf_counter() - start)
         return best
 
-    first = [measure(fn, options.slow_config_runs) for fn in funcs]
+    first = [measure(index, options.slow_config_runs) for index in range(len(funcs))]
     threshold = min(first) * options.slow_config_factor
     suspects = [i for i, value in enumerate(first) if value > threshold]
     log_stage(options.log_level, "Slow filter", f"Second round needed: {len(suspects)}/{len(funcs)} candidates")
@@ -203,29 +206,60 @@ def filter_slow_configs(funcs, synchronize, options):
         return list(range(len(funcs)))
     if options.slow_config_recheck_delay_s:
         time.sleep(options.slow_config_recheck_delay_s)
-    rechecked = {i: measure(funcs[i], options.slow_config_recheck_runs) for i in suspects}
+    rechecked = {i: measure(i, options.slow_config_recheck_runs) for i in suspects}
     kept = [i for i, value in enumerate(first) if value <= threshold or rechecked[i] <= threshold]
     log_stage(options.log_level, "Slow filter", f"{len(kept)}/{len(funcs)} candidates retained")
     return kept
 
 
 def benchmark_with_options(measure, funcs, names, options, *, warmup, active, prof_root, synchronize, keep_res=False,
-                           _report_sink=None, _timing_sink=None):
+                           clear_l2_cache=False, _pre_hook_scope=None, _report_sink=None, _timing_sink=None):
     """Wrap the existing profiler with optional filtering, calibration and retries.
 
     measure returns device timestamps and durations (microseconds) per callable.
     Profiling errors can be retried; callable execution errors always propagate.
     """
     from ._benchmark_quality import central_50_mean
+    from ._npu_profiler import event_timer
 
     if options.quality_check and active < 2:
         raise ValueError("quality_check requires active >= 2")
     if options.quality_check:
         from ._benchmark_quality import evaluate_quality
-    with timing_stage(_timing_sink, "slow_filter"):
-        indices = (filter_slow_configs(funcs, synchronize, options) if options.filter_slow_configs else list(
-            range(len(funcs))))
     active_counts = [active] * len(funcs)
+    budget = options.measure_budget_ms
+    durations_ms = {}
+    with (event_timer(clear_l2_cache, _pre_hook_scope) if budget is not None else nullcontext()) as timed:
+
+        def rough_measure(index, count):
+            host_time, durations_ms[index] = timed(funcs[index], count)
+            return host_time
+
+        with timing_stage(_timing_sink, "slow_filter"):
+            indices = (filter_slow_configs(funcs, synchronize, options,
+                                           **({"_measure": rough_measure} if timed is not None else {}))
+                       if options.filter_slow_configs else list(range(len(funcs))))
+        with timing_stage(_timing_sink, "calibration"):
+            if budget is not None:
+                reused = sum(index in durations_ms for index in indices)
+                log_stage(
+                    options.log_level, "Calibration", f"Reusing slow-filter events: {reused}/{len(indices)}; "
+                    f"event calibration: {len(indices) - reused} candidates")
+                for index in indices:
+                    if index not in durations_ms:
+                        funcs[index]()
+                        synchronize()
+                        rough_measure(index, options.calibration_runs)
+                    duration = durations_ms[index]
+                    if not math.isfinite(duration) or duration <= 0:
+                        raise ValueError(f"Invalid NPU event calibration time for config {index}: {duration}")
+                    required = budget / duration
+                    if not math.isfinite(required):
+                        raise ValueError("Unrepresentable NPU benchmark sample count")
+                    active_counts[index] = max(active, math.ceil(required))
+                log_stage(options.log_level, "Calibration settings", f"budget_ms={budget}, "
+                          f"event_mean_ms={durations_ms}, active_per_config={active_counts}", detailed=True)
+
     costs = [float("inf")] * len(funcs)
     best_failures = [[] for _ in funcs]
     best_reports = [None] * len(funcs) if _report_sink is not None else None
@@ -273,10 +307,6 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
                     if not failed:
                         raise
                     _warn_secondary("NPU profile cleanup failed", exc)
-
-    with timing_stage(_timing_sink, "calibration"):
-        if options.measure_budget_ms is not None:
-            active_counts = calibrate_counts(collect, indices, options, active_counts, active)
 
     pending = indices
     last_acquisition_error = None
@@ -342,25 +372,3 @@ def benchmark_with_options(measure, funcs, names, options, *, warmup, active, pr
     if _report_sink is not None:
         report_safely(lambda: _report_sink(best_reports))
     return costs
-
-
-def calibrate_counts(collect, indices, options, active_counts, active):
-    log_stage(options.log_level, "Calibration", f"Starting: {len(indices)} candidates")
-    for attempt in range(options.max_retries + 1):
-        log_stage(options.log_level, "Calibration profiler", f"Attempt {attempt + 1}: {len(indices)} candidates")
-        try:
-            calibration = collect(indices, 0, options.calibration_runs)
-            break
-        except ProfilerAcquisitionError as exc:
-            log_stage(options.log_level, "Calibration acquisition failed", str(exc), detailed=True)
-            if attempt == options.max_retries:
-                raise RuntimeError("NPU benchmark: no usable calibration samples") from exc
-            log_stage(options.log_level, "Calibration retry", f"Retry candidates={len(indices)}")
-    for index, (_, durations) in zip(indices, calibration):
-        required = options.measure_budget_ms * 1000 / float(np.mean(durations))
-        if not math.isfinite(required):
-            raise ValueError("Unrepresentable NPU benchmark sample count")
-        active_counts[index] = max(active, math.ceil(required))
-    log_stage(options.log_level, "Calibration settings", f"budget_ms={options.measure_budget_ms}, "
-              f"active_per_config={active_counts}", detailed=True)
-    return active_counts
