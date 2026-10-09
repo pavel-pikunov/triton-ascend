@@ -133,6 +133,7 @@ class AutotuneComparison:
         self.rows = []
         self.completed = 0
         self.cache_hit = False
+        self.timings = []
 
     def prepare(self, configs, key, cache_miss):
         self.cache_hit = not cache_miss
@@ -181,7 +182,29 @@ class AutotuneComparison:
         row_for(winner)["wins"] += 1
         self.completed += 1
 
+    def record_timing(self, total, durations):
+        self.timings.append({
+            "autotune": total, **{stage: durations.get(stage, 0)
+                                  for stage in TIMING_STAGES}, "other": max(0, total - sum(durations.values()))
+        })
+
+    def timing_summary(self):
+        if not self.timings or len(self.timings) != self.completed:
+            raise RuntimeError("Autotune comparison timing count does not match completed decisions")
+        summary = {}
+        for stage in ("autotune", *TIMING_STAGES, "other"):
+            if stage == "compilation":
+                summary["compilation_s"] = self.timings[0][stage]
+            else:
+                summary[f"mean_{stage}_s"] = fmean(row[stage] for row in self.timings)
+        summary["first_autotune_s"] = self.timings[0]["autotune"]
+        repeats = self.timings[1:]
+        summary["mean_repeat_autotune_s"] = fmean(row["autotune"] for row in repeats) if repeats else None
+        return summary
+
     def write_csv(self, function_name):
+        summary = self.timing_summary()
+        timing_values = [f"{value:.12g}" if value is not None else "" for value in summary.values()]
         directory = Path(self.directory)
         directory.mkdir(parents=True, exist_ok=True)
         kernel = re.sub(r"[^A-Za-z0-9_.-]", "_", function_name)[:80]
@@ -190,14 +213,14 @@ class AutotuneComparison:
         path = directory / f"{kernel}.{method}.{key_id}.{time.time_ns()}.{os.getpid()}.csv"
         with path.open("x", encoding="utf-8", newline="") as stream:
             writer = csv.writer(stream)
-            writer.writerow(
-                ("config_index", "config", "mean_time_us", "best_time_us", "max_time_us", "best_count", "total_runs"))
+            writer.writerow(("config_index", "config", "mean_time_us", "best_time_us", "max_time_us", "best_count",
+                             "total_runs", *summary))
             for index, row in enumerate(self.rows, 1):
                 scores = row["scores"]
                 times = (fmean(scores), min(scores), max(scores)) if scores else (None, None, None)
                 parameters = json.dumps(row["config"], sort_keys=True, allow_nan=False)
                 formatted_times = [f"{value:.12g}" if value is not None else "" for value in times]
-                writer.writerow((index, parameters, *formatted_times, row["wins"], self.completed))
+                writer.writerow((index, parameters, *formatted_times, row["wins"], self.completed, *timing_values))
         return path.resolve()
 
 
@@ -422,8 +445,8 @@ def capture_profile_report(filter_df, time_cost, num_warmup, num_active, clear_l
     report_safely(capture)
 
 
-def print_timing_report(function_name, started, durations):
-    total = time.perf_counter() - started
+def print_timing_report(function_name, started, durations, *, total=None):
+    total = time.perf_counter() - started if total is None else total
     labels = ("Generation/pruning", "Compilation", "Slow filter", "Calibration", "Measurements (including retries)")
     lines = [f"Triton autotuning timing for {function_name}", "-" * 60, f"  Total: {total:.6f} s"]
     lines.extend(f"  {label}: {durations.get(stage, 0):.6f} s" for stage, label in zip(TIMING_STAGES, labels))

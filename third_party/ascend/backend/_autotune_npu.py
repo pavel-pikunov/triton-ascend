@@ -43,11 +43,13 @@ def repeat_autotune(tuner, args, kwargs):
             if index + 1 < comparison.runs:
                 # Retain all JIT/compiler caches and choices for other input keys.
                 tuner.cache.pop(comparison.key, None)
+        summary = comparison.timing_summary()
+        message = (f"Triton autotune comparison: {comparison.completed} runs; "
+                   f"mean autotune: {summary['mean_autotune_s']:.6f} s")
         if comparison.directory is not None:
             path = comparison.write_csv(tuner.base_fn.__name__)
-            print(f"Triton autotune comparison: {comparison.completed} runs; CSV: {path}")
-        else:
-            print(f"Triton autotune comparison: {comparison.completed} runs")
+            message += f"; CSV: {path}"
+        print(message)
         return result
     except BaseException:
         if comparison.key is not None:
@@ -97,7 +99,8 @@ def legacy_profile_scores(run_fns, costs, report_sink, warmup, active):
 
 
 def start_timing(tuner):
-    tuner._autotune_timing = (time.perf_counter(), {}) if tuner.report_timing else None
+    enabled = tuner.report_timing or tuner._autotune_comparison is not None
+    tuner._autotune_timing = (time.perf_counter(), {}) if enabled else None
 
 
 def add_timing(tuner, name, elapsed):
@@ -132,7 +135,12 @@ def finish_timing(tuner, cache_miss):
     timing = tuner._autotune_timing
     tuner._autotune_timing = None
     if cache_miss and timing is not None:
-        report_module.report_safely(lambda: report_module.print_timing_report(tuner.base_fn.__name__, *timing))
+        total = time.perf_counter() - timing[0]
+        if tuner._autotune_comparison is not None:
+            tuner._autotune_comparison.record_timing(total, timing[1])
+        if tuner.report_timing:
+            report_module.report_safely(
+                lambda: report_module.print_timing_report(tuner.base_fn.__name__, *timing, total=total))
 
 
 def log_candidates(tuner, title, count, total):
