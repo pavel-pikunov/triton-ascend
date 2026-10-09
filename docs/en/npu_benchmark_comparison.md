@@ -205,7 +205,7 @@ the last pass's winner. Victory counts and CSV averages never influence that
 choice. Later cache hits do not repeat autotuning, reports or CSV output.
 
 The directory flag enables CSV output even with one run. Without it, `RUNS`
-still repeats decisions and prints the completed count. Both flags are
+still repeats decisions and prints the completed count and mean autotune time. Both flags are
 independent of winner reports, timing reports and stage logs. Unset both to
 disable comparison mode. Custom `do_bench` is rejected in comparison mode
 because its score need not be a duration; its ordinary winner reports remain
@@ -226,6 +226,37 @@ separate files in the same directory.
 | `max_time_us` | Maximum of those scores, in microseconds. |
 | `best_count` | Number of passes that selected this config as winner. |
 | `total_runs` | Number of completed autotune passes for this input key. |
+| `mean_autotune_s` | Mean total autotune duration across all passes, including the first. |
+| `mean_generation_pruning_s` | Mean config generation/pruning duration per pass. |
+| `compilation_s` | Full compilation/preparation stage duration from the first pass, including cache lookup and hooks. |
+| `mean_slow_filter_s` | Mean slow-filter/CV time-limit pruning duration per pass. |
+| `mean_calibration_s` | Mean calibration duration per pass. |
+| `mean_measurements_s` | Mean main measurement duration per pass, including profiler completion, profiler CSV and quality/retries. |
+| `mean_other_s` | Mean remaining autotune overhead per pass, excluding the named stages. |
+| `first_autotune_s` | Total duration of the first autotune pass. |
+| `mean_repeat_autotune_s` | Mean total duration excluding the first pass; empty with one pass. |
+
+The added `_s` columns contain wall-clock seconds for the whole input-key
+comparison, repeated identically on every config row. They are not per-config
+costs and must not be summed across rows. Timing collection is automatic in
+comparison mode even when `TRITON_AUTOTUNE_REPORT_TIMING=0`; that flag controls
+only the individual console timing blocks. All three paths use the same
+existing stage timers and total-time boundary.
+
+The total runs from autotuner entry through selection and statistics collection,
+before optional timing/winner report formatting, final application kernel, optional extra
+profile, garbage collection and writing the aggregate CSV. Compilation is not
+forcibly disabled: the first pass may compile, and later passes retain JIT
+caches. The compilation stage still performs its original preparation/cache
+lookup calls and hooks, so its duration can remain nonzero on cache hits.
+`compilation_s` always reports the first pass's stage duration, without averaging
+or dividing it by the number of passes. The console timing blocks continue to
+show each pass's actually measured compilation/preparation duration. The other
+stage means include all passes, so adding `compilation_s` to them does not
+reconstruct `mean_autotune_s`.
+`mean_autotune_s` averages all passes; `mean_repeat_autotune_s` separates the
+repeated selection cost from the first pass's cost. Neither is a fresh-process
+compilation measurement. A stage that is not executed contributes zero.
 
 The per-pass score is the event median for default, the original mean for
 legacy, and the central-half score of the fastest measured attempt for new
