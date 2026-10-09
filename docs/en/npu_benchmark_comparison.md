@@ -19,9 +19,9 @@ switching the environment on an already-created tuner is unsupported.
 
 ## What is preserved in legacy mode
 
-`runtime/_legacy_autotuner.py` copies release `runtime/autotuner.py` with only
-three substitutions: the mode name and its two imports of the copied testing
-module. Trailing whitespace on one original line was removed.
+`runtime/_legacy_autotuner.py` copies release `runtime/autotuner.py`, with the
+mode name, its two imports of the copied testing module, and optional final
+diagnostics changed. Trailing whitespace on one original line was removed.
 `_legacy_testing.py` copies release `testing.py` with only the two environment
 overrides described below. Shared parsers, generators, UBTuner and compiler
 are unchanged from the pinned release.
@@ -29,9 +29,9 @@ are unchanged from the pinned release.
 The original common profiler session, CV pruning/count calculation, warmup,
 kernel-name filtering, CSV aggregation, synchronization, exceptions and cleanup
 are preserved. L2 eviction in legacy mode still occurs before kernel hooks.
-The new quality checks, retries, budget, slow filter, stage logs, winner report
-and timing report are not applied to legacy. Added decorator arguments
-`npu_bench_options`, `report_best_config` and `report_timing` are ignored there;
+The new quality checks, retries, budget, slow filter and stage logs are not
+applied to legacy. The `npu_bench_options` decorator argument is ignored there;
+`report_best_config` and `report_timing` are supported by all three paths.
 original `auto_prof_dir` remains supported and can perform an extra profile.
 
 Original fallbacks are also preserved: one remaining configuration uses the
@@ -99,6 +99,61 @@ The three paths use different estimators; their internal scores alone are not
 a common measurement of the selected kernels. Measure total autotuning time
 externally for all three, with compilation-cache conditions kept consistent.
 There is no additional benchmark runner in this branch.
+
+## Record selection decisions for all three paths
+
+The same independent flags work for `autotune` and `max_autotune`, including
+legacy mode. Explicit decorator arguments override the environment:
+
+```bash
+export TRITON_NPU_BENCH_REPORT_BEST_CONFIG=1
+export TRITON_AUTOTUNE_REPORT_TIMING=1
+unset TRITON_NPU_BENCH_LOG_LEVEL  # Stage logs stay off.
+
+TRITON_BENCH_METHOD=default python your_existing_case.py > default.log
+TRITON_BENCH_METHOD=npu_legacy python your_existing_case.py > legacy.log
+TRITON_BENCH_METHOD=npu python your_existing_case.py > npu.log
+```
+
+The winner report contains all config parameters and `ubtune_cfg`, its original
+1-based position before pruning, its selection score, and its stable SHA-256
+ID. The reported time is the already-measured median for events, arithmetic
+mean for legacy, or central-half score and ordinary mean of the selected attempt
+for current NPU. Custom benchmarker scores keep their original meaning. An
+unmeasured selection is explicitly marked; no additional kernel launches or
+CSV reads are performed for reporting. Legacy fallback is marked as the
+actual `default` benchmark path rather than `npu_legacy`.
+
+Each winner block also contains one machine-readable line beginning with
+`AUTOTUNE_DECISION `, followed by JSON. Extract those lines to collect decisions:
+
+```bash
+grep '^AUTOTUNE_DECISION ' default.log legacy.log npu.log
+```
+
+Compare decisions for the same `kernel` and input `key`, grouping winners by
+`config_id`, not by their list positions. `config_id` describes full config
+parameters, including `ubtune_cfg`; `candidate_id` identifies the original
+candidate before UBTuner changes. IDs exclude `pre_hook`, which is still printed
+in the full parameters. Dictionary insertion order, object addresses and
+`PYTHONHASHSEED` do not affect IDs for supported values. Unsupported values
+with process-dependent representations make the ID unavailable with a warning.
+
+`candidate_set_id` identifies the original candidate list independently of
+order, preserving duplicates; `candidate_order_id` also includes order.
+Equal set IDs with different order IDs indicate reordered candidates.
+Different set IDs indicate changed candidates or parameters. The analogous
+`scored_set_id` and `scored_order_id` describe the returned score dictionary
+after pruning, including non-finite scores. They are absent when benchmarking
+was skipped. These diagnostics observe order; they do not sort or shuffle the
+actual tuning candidates. Compare the same input key and generation settings
+when checking order between methods or processes.
+
+Timing is printed once after selection and before the final kernel execution,
+optional extra winner profile and garbage collection. Legacy reports the same
+stages as the current tuner; its CV time-limit pruning is included in the
+`Slow filter` stage and calibration remains zero. Report formatting is outside
+the measured total. Cache hits repeat neither report nor decision line.
 
 For a separate check of the current path's policies, keep `TRITON_BENCH_METHOD=npu`
 and enable only the desired options, for example:
