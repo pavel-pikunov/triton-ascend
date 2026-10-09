@@ -20,6 +20,36 @@ def initialize(tuner, options, report, report_timing=None):
     tuner.report_best_config = report_module.resolve_report_best_config(report)
     tuner.report_timing = report_module.resolve_report_timing(report_timing)
     tuner._autotune_timing = None
+    tuner._autotune_selection = None
+
+
+def capture_selection(tuner, key, cache_miss):
+    tuner._autotune_selection = None
+    if cache_miss and tuner.report_best_config:
+        tuner._autotune_selection = report_module.report_safely(
+            lambda: report_module.snapshot_candidates(tuner.configs, key))
+
+
+def record_scored_candidates(tuner, configs):
+    selection = tuner._autotune_selection
+    if selection is not None:
+        report_module.report_safely(lambda: report_module.record_scored_candidates(selection, configs))
+
+
+def legacy_profile_scores(run_fns, costs, report_sink, warmup, active):
+    if report_sink is None:
+        return
+
+    def capture():
+        count = os.getenv("TRITON_NPU_BENCH_ACTIVE")
+        count = int(count) if count is not None else active
+        cache_mode = os.getenv("TRITON_NPU_BENCH_CACHE_MODE", "cold").strip().lower()
+        reports = {}
+        for config, cost in zip(run_fns, costs):
+            reports[config] = report_module.ScoreReport(cost, False, "npu_legacy", warmup, count, cache_mode)
+        report_sink(reports)
+
+    report_module.report_safely(capture)
 
 
 def start_timing(tuner):
@@ -188,10 +218,15 @@ def warn_skipped_measurements(tuner):
 def print_winner(tuner, config, reports):
     if reports is not None:
         try:
-            report_module.report_safely(lambda: report_module.print_best_config_report(
-                tuner.base_fn.__name__, tuner.configs, config, reports.get(config)))
+
+            def print_result():
+                report_module.print_best_config_report(tuner.base_fn.__name__, tuner.configs, config,
+                                                       reports.get(config), selection=tuner._autotune_selection)
+
+            report_module.report_safely(print_result)
         finally:
             reports.clear()
+            tuner._autotune_selection = None
 
 
 def prune_candidates(tuner, run_fns, options):

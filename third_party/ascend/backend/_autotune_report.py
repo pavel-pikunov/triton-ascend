@@ -1,6 +1,8 @@
 """Optional autotune diagnostics, independent of benchmark and cache policies."""
 
+import hashlib
 import io
+import json
 import math
 import os
 import pprint
@@ -8,8 +10,10 @@ import re
 import sys
 import time
 import warnings
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from numbers import Integral, Real
 from statistics import fmean
 
 REPORT_ENV = "TRITON_NPU_BENCH_REPORT_BEST_CONFIG"
@@ -36,6 +40,112 @@ class NpuMeasurementReport:
 class ScoreReport:
     score: object
     custom: bool
+    benchmark_method: str | None = None
+    warmup: int | None = None
+    active: int | None = None
+    cache_mode: str | None = None
+
+
+def _canonical(value):
+    """Stable diagnostic data, without Python hashes or object addresses."""
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, Real):
+        value = float(value)
+        return value if math.isfinite(value) else {"float": str(value)}
+    if isinstance(value, Mapping):
+        if all(isinstance(key, str) for key in value):
+            return {key: _canonical(item) for key, item in value.items()}
+        items = [(_canonical(key), _canonical(item)) for key, item in value.items()]
+        return {"mapping": sorted(items, key=lambda pair: json.dumps(pair[0], sort_keys=True))}
+    if isinstance(value, (list, tuple)):
+        items = [_canonical(item) for item in value]
+        return items if isinstance(value, list) else {"tuple": items}
+    if isinstance(value, (set, frozenset)):
+        items = [_canonical(item) for item in value]
+        return {"set": sorted(items, key=lambda item: json.dumps(item, sort_keys=True))}
+    rendered = str(value)
+    if callable(value) or re.search(r"\bat 0x[0-9a-fA-F]+\b", rendered):
+        raise ValueError(f"Cannot create a stable config ID for {type(value).__qualname__}")
+    return {"type": f"{type(value).__module__}.{type(value).__qualname__}", "value": rendered}
+
+
+def _fingerprint(value):
+    encoded = json.dumps(_canonical(value), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _config_parameters(config, *, include_ubtune=True):
+    parameters = dict(vars(config))
+    # Hooks are still printed in full; their object identity is not a config ID.
+    parameters.pop("pre_hook", None)
+    if not include_ubtune:
+        parameters.pop("ubtune_cfg", None)
+    return parameters
+
+
+def snapshot_candidates(configs, key):
+    ids = [_fingerprint(_config_parameters(config, include_ubtune=False)) for config in configs]
+    # The NPU measurement policy is not part of the input problem's identity.
+    key = [item for item in key if not (isinstance(item, tuple) and item and item[0] == "npu-benchmark")]
+    return {
+        "key": _canonical(key),
+        "requested_method": os.getenv("TRITON_BENCH_METHOD", "default").lower(),
+        "candidate_ids": ids,
+        "positions": {id(config): index
+                      for index, config in enumerate(configs)},
+        "scored_ids": None,
+    }
+
+
+def record_scored_candidates(selection, configs):
+    ids, positions = selection["candidate_ids"], selection["positions"]
+    selection["scored_ids"] = [
+        ids[positions[id(config)]] if id(config) in positions else _fingerprint(
+            _config_parameters(config, include_ubtune=False)) for config in configs
+    ]
+
+
+def _decision_record(function_name, config, number, measurement, selection):
+    method, estimator, score = "unavailable", "unavailable", None
+    if selection is not None and selection["scored_ids"] is None:
+        method = "unmeasured"
+    if isinstance(measurement, NpuMeasurementReport):
+        method, estimator, score = "npu", "central_50_mean", measurement.score_ms
+    elif isinstance(measurement, ScoreReport):
+        method = measurement.benchmark_method or ("custom" if measurement.custom else "default")
+        if method == "npu_legacy":
+            estimator, score = "mean", measurement.score
+        elif not measurement.custom and isinstance(measurement.score, (list, tuple)) and len(measurement.score) == 3:
+            estimator, score = "median", measurement.score[0]
+        else:
+            estimator = "custom_score" if measurement.custom else "returned_score"
+    if score is not None:
+        score = float(score)
+        if not math.isfinite(score):
+            score = str(score)
+    record = {
+        "kernel": function_name,
+        "benchmark_method": method,
+        "config_id": _fingerprint(_config_parameters(config)),
+        "config": _canonical(_config_parameters(config)),
+        "original_index": number,
+        "score_kind": estimator,
+        "score_ms": score,
+    }
+    if selection is not None:
+        ids = selection["candidate_ids"]
+        position = selection["positions"].get(id(config))
+        record.update(key=selection["key"], requested_method=selection["requested_method"],
+                      candidate_id=ids[position] if position is not None else None, candidate_count=len(ids),
+                      candidate_set_id=_fingerprint(sorted(ids)), candidate_order_id=_fingerprint(ids))
+        scored = selection["scored_ids"]
+        if scored is not None:
+            record.update(scored_count=len(scored), scored_set_id=_fingerprint(sorted(scored)),
+                          scored_order_id=_fingerprint(scored))
+    return record
 
 
 def resolve_flag(argument, name, environment):
@@ -132,12 +242,28 @@ def make_profile_report(columns, rows, warmup, active, clear_l2_cache, cost, *, 
                                 "cold" if clear_l2_cache else "hot", cost, score_ms=score_ms)
 
 
-def print_best_config_report(function_name, configs, config, measurement=None):
-    number = next((i for i, candidate in enumerate(configs, 1) if candidate is config), None)
+def print_best_config_report(function_name, configs, config, measurement=None, *, selection=None):
+    if selection is not None:
+        position = selection["positions"].get(id(config))
+        number = position + 1 if position is not None else None
+        total = len(selection["candidate_ids"])
+    else:
+        number = next((i for i, candidate in enumerate(configs, 1) if candidate is config), None)
+        total = len(configs)
     stream = io.StringIO()
     stream.write(f"Triton autotuning result for {function_name}\n" + "-" * 60 + "\n")
-    stream.write(f"Selected config: {number}/{len(configs)} (1-based, before pruning)\n"
+    stream.write(f"Selected config: {number}/{total} (1-based, before pruning)\n"
                  if number is not None else "Selected config: not in the original candidate list\n")
+    decision = report_safely(lambda: _decision_record(function_name, config, number, measurement, selection))
+    if decision is not None:
+        stream.write(f"Benchmark path: {decision['benchmark_method']}\n")
+        stream.write(f"Selected config ID: {decision['config_id']}\n")
+        if selection is not None:
+            stream.write(f"Candidate set ID: {decision['candidate_set_id']}\n")
+            stream.write(f"Candidate order ID: {decision['candidate_order_id']}\n")
+            stream.write(f"Autotune key: {json.dumps(decision['key'], sort_keys=True)}\n")
+    else:
+        stream.write("Selected config ID: unavailable\n")
     parameters = dict(vars(config))
     ub_config = parameters.pop("ubtune_cfg", None)
     stream.write("Full config parameters:\n" + pprint.pformat(parameters, sort_dicts=False) + "\n")
@@ -148,6 +274,10 @@ def print_best_config_report(function_name, configs, config, measurement=None):
     elif isinstance(measurement, ScoreReport):
         if measurement.custom:
             stream.write(f"Returned score: {measurement.score!r}\n")
+        elif measurement.benchmark_method == "npu_legacy":
+            stream.write(f"Mean duration: {measurement.score * 1000:.12g} us ({measurement.score:.12g} ms)\n")
+            stream.write(f"cache={measurement.cache_mode}, warmup={measurement.warmup}, "
+                         f"active={measurement.active}; estimator=legacy mean\n")
         elif isinstance(measurement.score, (list, tuple)) and len(measurement.score) == 3:
             median, low, high = measurement.score
             stream.write(f"Median: {median!r} ms; quantiles 20%/80%: {low!r}/{high!r} ms\n")
@@ -174,6 +304,9 @@ def print_best_config_report(function_name, configs, config, measurement=None):
             formatted = f"{value:.12g}" if numeric else value
             available = f" ({count}/{measurement.sample_count} available)" if count != measurement.sample_count else ""
             stream.write(f"  {column}: {label}={formatted}{available}\n")
+    if decision is not None:
+        stream.write("AUTOTUNE_DECISION " +
+                     json.dumps(decision, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n")
     print(stream.getvalue(), end="")
 
 

@@ -2254,6 +2254,7 @@ class AutoTilingTuner(Autotuner):
         key = npu_tuning.call_stage(self, "generation_pruning", self.generate_key_and_configs, *args, **kwargs)
         cache_miss = key not in self.cache
         reports = {} if cache_miss and self.report_best_config else None
+        npu_tuning.capture_selection(self, key, cache_miss)
         if self.is_simt_mode and kwargs.get('simt_stack_limit', None) is None:
             kwargs['simt_stack_limit'] = self.simt_stack_limit
         used_cached_result = True
@@ -2279,6 +2280,7 @@ class AutoTilingTuner(Autotuner):
                 full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
                 self.pre_hook(full_nargs, reset_only=True)
                 self.configs_timings = timings
+                npu_tuning.record_scored_candidates(self, timings)
                 config = self.cache[key]
             else:
                 npu_tuning.warn_skipped_measurements(self)
@@ -2871,7 +2873,7 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
         return legacy_autotune(configs, key, prune_configs_by=prune_configs_by, reset_to_zero=reset_to_zero,
                                restore_value=restore_value, pre_hook=pre_hook, post_hook=post_hook, warmup=warmup,
                                rep=rep, use_cuda_graph=use_cuda_graph, do_bench=do_bench, auto_prof_dir=auto_prof_dir,
-                               hints=hints)
+                               hints=hints, report_best_config=report_best_config, report_timing=report_timing)
 
     def decorator(fn):
         return AutoTilingTuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
@@ -3229,7 +3231,8 @@ def max_autotune(configs, key, kernel_type="mixcv", prune_configs_by=None, reset
         return legacy_max_autotune(configs, key, kernel_type=kernel_type, prune_configs_by=prune_configs_by,
                                    reset_to_zero=reset_to_zero, restore_value=restore_value, pre_hook=pre_hook,
                                    post_hook=post_hook, warmup=warmup, rep=rep, use_cuda_graph=use_cuda_graph,
-                                   do_bench=do_bench, **tuning_params)
+                                   do_bench=do_bench, report_best_config=report_best_config,
+                                   report_timing=report_timing, **tuning_params)
 
     def decorator(fn):
         if not configs or len(configs) == 0:
