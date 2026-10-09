@@ -1,5 +1,6 @@
 """Optional autotune diagnostics, independent of benchmark and cache policies."""
 
+import csv
 import hashlib
 import io
 import json
@@ -14,10 +15,13 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from numbers import Integral, Real
+from pathlib import Path
 from statistics import fmean
 
 REPORT_ENV = "TRITON_NPU_BENCH_REPORT_BEST_CONFIG"
 TIMING_ENV = "TRITON_AUTOTUNE_REPORT_TIMING"
+RUNS_ENV = "TRITON_AUTOTUNE_RUNS"
+CSV_DIR_ENV = "TRITON_AUTOTUNE_CSV_DIR"
 TIMING_STAGES = ("generation_pruning", "compilation", "slow_filter", "calibration", "measurements")
 
 
@@ -108,6 +112,95 @@ def record_scored_candidates(selection, configs):
     ]
 
 
+def resolve_comparison_options():
+    value = os.getenv(RUNS_ENV, "1").strip()
+    if not value.isascii() or not value.isdecimal() or int(value) < 1:
+        raise ValueError(f"{RUNS_ENV} must be a positive integer, got {value!r}")
+    directory = os.getenv(CSV_DIR_ENV)
+    if directory is not None and not directory.strip():
+        raise ValueError(f"{CSV_DIR_ENV} must be a non-empty directory path")
+    return int(value), directory
+
+
+class AutotuneComparison:
+    """Statistics of independent tuning decisions, never raw kernel samples."""
+
+    def __init__(self, runs, directory):
+        self.runs = runs
+        self.directory = directory
+        self.key = None
+        self.selection = None
+        self.rows = []
+        self.completed = 0
+        self.cache_hit = False
+
+    def prepare(self, configs, key, cache_miss):
+        self.cache_hit = not cache_miss
+        if self.selection is not None and key != self.key:
+            raise RuntimeError("Autotune input key changed between comparison runs")
+        if not cache_miss:
+            if self.completed:
+                raise RuntimeError("Unexpected autotune cache hit during comparison")
+            return None
+        selection = snapshot_candidates(configs, key)
+        if len(selection["positions"]) != len(configs):
+            raise ValueError("CSV comparison requires distinct Config objects for each candidate")
+        if self.selection is None:
+            self.key = key
+            self.selection = selection
+            self.rows = [{"config": _canonical(_config_parameters(config)), "observed": False, "scores": [], "wins": 0}
+                         for config in configs]
+        elif selection["candidate_ids"] != self.selection["candidate_ids"]:
+            raise RuntimeError("Autotune candidate parameters or order changed between comparison runs")
+        selection["run_index"] = self.completed + 1
+        selection["total_runs"] = self.runs
+        return selection
+
+    def record(self, selection, winner, timings):
+        positions = selection["positions"]
+
+        def row_for(config):
+            position = positions.get(id(config))
+            if position is None:
+                raise RuntimeError("Scored config is absent from the original candidate list")
+            row = self.rows[position]
+            parameters = _canonical(_config_parameters(config))
+            if row["observed"] and parameters != row["config"]:
+                raise RuntimeError(f"Effective parameters changed for config {position + 1} between comparison runs")
+            row["config"] = parameters
+            row["observed"] = True
+            return row
+
+        for config, score in (timings or {}).items():
+            row = row_for(config)
+            # Built-in events return median/20%/80%; profiler paths return a scalar.
+            score = score[0] if isinstance(score, (list, tuple)) else score
+            score = float(score)
+            if math.isfinite(score):
+                row["scores"].append(score * 1000)
+        row_for(winner)["wins"] += 1
+        self.completed += 1
+
+    def write_csv(self, function_name):
+        directory = Path(self.directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        kernel = re.sub(r"[^A-Za-z0-9_.-]", "_", function_name)[:80]
+        method = re.sub(r"[^A-Za-z0-9_.-]", "_", self.selection["requested_method"])
+        key_id = _fingerprint(self.selection["key"])[:12]
+        path = directory / f"{kernel}.{method}.{key_id}.{time.time_ns()}.{os.getpid()}.csv"
+        with path.open("x", encoding="utf-8", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(
+                ("config_index", "config", "mean_time_us", "best_time_us", "max_time_us", "best_count", "total_runs"))
+            for index, row in enumerate(self.rows, 1):
+                scores = row["scores"]
+                times = (fmean(scores), min(scores), max(scores)) if scores else (None, None, None)
+                parameters = json.dumps(row["config"], sort_keys=True, allow_nan=False)
+                formatted_times = [f"{value:.12g}" if value is not None else "" for value in times]
+                writer.writerow((index, parameters, *formatted_times, row["wins"], self.completed))
+        return path.resolve()
+
+
 def _decision_record(function_name, config, number, measurement, selection):
     method, estimator, score = "unavailable", "unavailable", None
     if selection is not None and selection["scored_ids"] is None:
@@ -145,6 +238,8 @@ def _decision_record(function_name, config, number, measurement, selection):
         if scored is not None:
             record.update(scored_count=len(scored), scored_set_id=_fingerprint(sorted(scored)),
                           scored_order_id=_fingerprint(scored))
+        if "run_index" in selection:
+            record.update(run_index=selection["run_index"], total_runs=selection["total_runs"])
     return record
 
 

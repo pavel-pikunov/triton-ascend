@@ -2249,7 +2249,10 @@ class AutoTilingTuner(Autotuner):
     def _npu_cache_pre_hook(self, evict_cache):
         return npu_tuning.cache_pre_hook(self, evict_cache)
 
-    def run(self, *args, **kwargs):
+    def run(self, *args, _comparison_pass=False, _comparison_tune_only=False, **kwargs):
+        if not _comparison_pass and npu_tuning.comparison_enabled(self):
+            return npu_tuning.repeat_autotune(self, args, kwargs)
+        timings = None
         npu_tuning.start_timing(self)
         key = npu_tuning.call_stage(self, "generation_pruning", self.generate_key_and_configs, *args, **kwargs)
         cache_miss = key not in self.cache
@@ -2297,8 +2300,14 @@ class AutoTilingTuner(Autotuner):
                 f"{self.bench_time:.2f}s; best config selected: {self.best_config};"
             )
 
+        npu_tuning.record_comparison(self, config, timings, cache_miss)
         npu_tuning.finish_timing(self, cache_miss)
         npu_tuning.print_winner(self, config, reports)
+
+        if _comparison_tune_only and cache_miss:
+            self.nargs = None
+            gc.collect()
+            return None
 
         if not used_cached_result and self.auto_profile_dir is not None:
             self._profile(*args, config=self.best_config, **kwargs)

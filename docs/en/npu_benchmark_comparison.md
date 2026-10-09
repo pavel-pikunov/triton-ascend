@@ -76,6 +76,7 @@ for name in "${!TRITON_NPU_BENCH_@}"; do unset "$name"; done
 export TRITON_PRINT_AUTOTUNING=0
 export TRITON_DEBUG=0
 export TRITON_AUTOTUNE_REPORT_TIMING=0
+unset TRITON_AUTOTUNE_RUNS TRITON_AUTOTUNE_CSV_DIR
 export PYTHONWARNINGS=default
 export TRITON_NPU_BENCH_CACHE_MODE=hot  # Repeat the comparison with cold.
 export TRITON_NPU_BENCH_ACTIVE=1000
@@ -172,3 +173,78 @@ This is a policy check with potentially multiple attempts, separate from the
 single-attempt comparison above. The minimum score across measured attempts
 remains the selection criterion regardless of quality; the winner report shows
 that score and its attempt's ordinary mean separately.
+
+## Repeat autotuning and save per-config CSV statistics
+
+These test-branch controls apply to all three built-in benchmark paths and both
+decorators. Set them before constructing the decorators:
+
+```bash
+export TRITON_AUTOTUNE_RUNS=100
+export TRITON_AUTOTUNE_CSV_DIR=/tmp/autotune-comparison
+export TRITON_NPU_BENCH_REPORT_BEST_CONFIG=1  # Optional: each decision and its ID.
+export TRITON_AUTOTUNE_REPORT_TIMING=1       # Optional: each tuning pass.
+
+TRITON_BENCH_METHOD=default python your_existing_case.py
+TRITON_BENCH_METHOD=npu_legacy python your_existing_case.py
+TRITON_BENCH_METHOD=npu python your_existing_case.py
+```
+
+`RUNS` is the total number of independent autotune decisions per uncached input
+key, including the first decision (default: 1). Every pass repeats config
+generation, pruning, calibration where applicable, measurements, retries and
+winner selection. Between passes only that key's selected-config cache entry
+is removed. JIT/compiler caches remain intact: successful configurations are
+reused from those caches. The original compilation preparation calls still
+run, including their hooks; compilation failures can be attempted again.
+There is no process restart or extra compilation-cache reset.
+
+Kernel calls needed by each benchmark retain their original behavior. The
+final application kernel and optional extra winner profile run once, using
+the last pass's winner. Victory counts and CSV averages never influence that
+choice. Later cache hits do not repeat autotuning, reports or CSV output.
+
+The directory flag enables CSV output even with one run. Without it, `RUNS`
+still repeats decisions and prints the completed count. Both flags are
+independent of winner reports, timing reports and stage logs. Unset both to
+disable comparison mode. Custom `do_bench` is rejected in comparison mode
+because its score need not be a duration; its ordinary winner reports remain
+supported.
+
+One new CSV is created for each kernel/input-key/method comparison. Its filename
+contains the kernel name, requested method, logical input-key ID and a unique
+run suffix; existing files are not overwritten. The saved absolute path is
+printed after completion. Separate method invocations therefore produce
+separate files in the same directory.
+
+| Column | Meaning |
+| --- | --- |
+| `config_index` | Original 1-based position before pruning. |
+| `config` | Stable JSON of config parameters, including `ubtune_cfg` when present, excluding `pre_hook`. |
+| `mean_time_us` | Mean of this config's finite selection scores across autotune passes, in microseconds. |
+| `best_time_us` | Minimum of those scores, in microseconds. |
+| `max_time_us` | Maximum of those scores, in microseconds. |
+| `best_count` | Number of passes that selected this config as winner. |
+| `total_runs` | Number of completed autotune passes for this input key. |
+
+The per-pass score is the event median for default, the original mean for
+legacy, and the central-half score of the fastest measured attempt for new
+NPU, irrespective of its quality status. Original event fallback scores are
+used when fallback occurs. This CSV aggregates selection scores, not raw
+kernel launches and not all retry attempts. The mean column does not replace
+the estimator used to choose each winner.
+
+All original candidates get a row, including pruned or failed configurations.
+Missing/non-finite scores are excluded from time aggregates, without zero
+substitution. All three time cells are empty when no finite score is available;
+`total_runs` still counts decisions, not the number of available measurements
+for that row. A single surviving config can be selected without measurements.
+The sum of `best_count` equals `total_runs`.
+
+Within a comparison, changes to the original candidate parameters/order,
+input key or already-observed effective parameters stop collection with an
+explicit error rather than combining incompatible configurations. Each
+candidate must be a distinct `Config` object. When winner reporting is enabled,
+`AUTOTUNE_DECISION` also includes `run_index` and `total_runs`; stable set/order
+IDs still allow comparison across fresh processes. No completed CSV is emitted
+if tuning fails before all requested passes finish.
