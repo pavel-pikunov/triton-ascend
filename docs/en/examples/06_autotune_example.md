@@ -280,6 +280,12 @@ def triton_func(input_ptr, output_ptr, ...):
 
 ## More Functions
 
+### NPU Measurement Policies and Diagnostics
+
+`autotune` and `max_autotune` accept `npu_bench_options`, `report_best_config`, and
+`report_timing`. See [NPU autotune policies and diagnostics](../npu_autotune_guide.md)
+for measurement controls, central-half scoring, stage logs, and final reports.
+
 ### Automatically Generating the Profiling Result of the Optimal Configuration
 
 ```Python

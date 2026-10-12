@@ -46,9 +46,42 @@ def do_bench_npu(
     prof_dir=None,
     keep_res=False,
     target_kernel_name: Optional[str] = None,
+    *,
+    npu_bench_options=None,
+    _pre_hook_scope=None,
+    _report_sink=None,
+    _timing_sink=None,
+):
+    """Profile NPU kernels, optionally controlling L2, quality and retries.
+
+    npu_bench_options overrides TRITON_NPU_BENCH_* per field. Unspecified
+    fields inherit the existing arguments. Counts are launches, budget is ms,
+    and max_retries counts additional attempts after the initial measurement.
+    The result is the mean of the central 50% of measured durations, as a scalar
+    for one callable and a list for multiple ones.
+    """
+    from ._npu_profiler import bench_npu
+    return bench_npu(_profile_npu, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
+                     npu_bench_options, _pre_hook_scope, _report_sink, _timing_sink)
+
+
+def _profile_npu(
+    funcs,
+    warmup=5,
+    active=30,
+    clear_l2_cache=False,
+    prof_dir=None,
+    keep_res=False,
+    target_kernel_name=None,
+    *,
+    _return_samples: bool = False,
+    _pre_hook_scope=None,
+    _report_sink=None,
+    _active_counts=None,
 ):
     import torch
     import torch_npu
+    from ._npu_profiler import profile_scope, result_scope
 
     if not isinstance(funcs, list):
         funcs = [funcs]
@@ -83,20 +116,22 @@ def do_bench_npu(
         buffer.sum()
         torch.npu.synchronize()  # shake out of any npu error
 
-    total = warmup + active
-    with torch_npu.profiler.profile(
-        activities=[torch_npu.profiler.ProfilerActivity.NPU],
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-        with_flops=False,
-        with_modules=False,
-        experimental_config=experimental_config,
-    ) as prof:
-        for fn in funcs:
+    scope = profile_scope(buffer if clear_l2_cache else None, torch.npu.synchronize, _pre_hook_scope,
+                          lambda: _rm_dic(keep_res, torch_path))
+    with scope, torch_npu.profiler.profile(
+            activities=[torch_npu.profiler.ProfilerActivity.NPU],
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+            with_flops=False,
+            with_modules=False,
+            experimental_config=experimental_config,
+    ):
+        for index, fn in enumerate(funcs):
+            total = warmup + (active if _active_counts is None else _active_counts[index])
             for _ in builtins.range(total):
-                if clear_l2_cache:
+                if clear_l2_cache and _pre_hook_scope is None:
                     buffer.sum()  # use buffer read to clear l2 cache
                     torch.npu.synchronize()
                 fn()
@@ -104,7 +139,7 @@ def do_bench_npu(
     if clear_l2_cache:
         del buffer
 
-    try:
+    with result_scope(lambda: _rm_dic(keep_res, torch_path)):
         return _collect_prof_result(
             torch_path,
             funcs,
@@ -112,9 +147,10 @@ def do_bench_npu(
             active,
             target_kernel_name=target_kernel_name,
             clear_l2_cache=clear_l2_cache,
+            _return_samples=_return_samples,
+            **({"_active_counts": _active_counts} if _active_counts is not None else {}),
+            **({"_report_sink": _report_sink} if _report_sink is not None else {}),
         )
-    finally:
-        _rm_dic(keep_res, torch_path)
 
 
 def _rm_dic(keep_res, torch_path):
@@ -133,10 +169,14 @@ def _collect_prof_result(
     num_active: int,
     target_kernel_name: Optional[str] = None,
     clear_l2_cache: bool = False,
+    _return_samples: bool = False,
+    _report_sink=None,
+    _active_counts=None,
 ):
     """
     Collect kernel performance from kernel_details.csv, returned in millisecond.
-    The first `num_warmup` rows of each function are warmup data and will be ignored, the next `num_active` rows will be averaged.
+    The first `num_warmup` rows of each function are warmup data and will be ignored.
+    The score is the mean of the central 50% of the next `num_active` durations.
 
     :param base_dir: the profiler path
     :type base_dir: str
@@ -150,7 +190,11 @@ def _collect_prof_result(
     :type target_kernel_name: Optional[str]
     """
 
-    import numpy as np
+    if _return_samples or _active_counts is not None or isinstance(target_kernel_name, (list, tuple)):
+        from ._npu_profiler import collect_samples
+        return collect_samples(base_dir, funcs, target_kernel_name, num_warmup, num_active, clear_l2_cache,
+                               _return_samples, _report_sink, _active_counts)
+
     import pandas as pd
 
     kernel_details_file = None
@@ -161,6 +205,8 @@ def _collect_prof_result(
                 break
     num_funcs = len(funcs)
     if kernel_details_file is None:
+        from ._npu_profiler import warn_missing_csv
+        warn_missing_csv(base_dir)
         if num_funcs == 1:
             return float("inf")
         else:
@@ -178,12 +224,12 @@ def _collect_prof_result(
     if target_kernel_name is not None and actual_rows != expected_rows:
         raise ProfilerResultMismatchError(target_kernel_name, expected_rows, actual_rows)
 
-    time_cost = [0] * num_funcs
-    for func_idx in np.arange(0, num_funcs):
-        for active_index in np.arange(0, num_active):
-            row_index = func_idx * (num_warmup + num_active) + num_warmup + active_index
-            time_cost[func_idx] += filter_df.iloc[row_index]["Duration(us)"]
-    time_cost = [x / num_active / 1e3 for x in time_cost]
+    from ._npu_profiler import profile_costs
+    time_cost = profile_costs(filter_df, num_funcs, num_warmup, num_active)
+
+    if _report_sink is not None:
+        from ._autotune_report import capture_profile_report
+        capture_profile_report(filter_df, time_cost, num_warmup, num_active, clear_l2_cache, _report_sink)
 
     if num_funcs == 1:
         return time_cost[0]
