@@ -30,8 +30,8 @@ export TRITON_PRINT_AUTOTUNING=0
 | `TRITON_NPU_BENCH_QUALITY_CHECK` | `0`; evaluate the predefined sample-quality metrics. |
 | `TRITON_NPU_BENCH_MAX_RETRIES` | `0`; additional attempts for failing quality checks or unusable profiler data. |
 | `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | Unset; estimated accumulated device-time budget per candidate, finite and positive, in milliseconds. |
-| `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; short event-calibration launch count when no slow-filter result is available; integer >= 2. |
-| `TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS` | `0`; enable preliminary filtering through ordinary `triton.testing.do_bench`. |
+| `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; measured launches per short event estimate, used by filtering and budget calibration; integer >= 2. |
+| `TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS` | `0`; enable preliminary filtering through NPU events under the selected cache policy. |
 | `TRITON_NPU_BENCH_SLOW_CONFIG_ROUNDS` | `2`; total filtering rounds, including the first round; integer >= 1. |
 | `TRITON_NPU_BENCH_SLOW_CONFIG_FACTOR` | `5.0`; recheck candidates above this multiple of the best first-round time; finite and >= 1. |
 | `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_DELAY_S` | `0.5`; finite, nonnegative pause before each needed subsequent round. `0` disables the pause. |
@@ -49,8 +49,11 @@ Standalone profiling retains its existing `warmup`, `active`, and
 
 ## Slow filtering and calibration
 
-The first filtering round benchmarks every candidate with ordinary `do_bench`
-and its default warmup/repetition time budgets, returning the mean event duration.
+The first filtering round benchmarks every candidate through NPU events, returning
+the mean event duration. Each estimate uses one preliminary call followed by
+`CALIBRATION_RUNS` measured launches. All filtering rounds, budget calibration and
+main profiler measurements use the same selected `CACHE_MODE`. Cold event estimates
+evict L2 before recording each measured launch; hot estimates do not explicitly evict it.
 The threshold is the best first-round duration multiplied by `SLOW_CONFIG_FACTOR`.
 Subsequent rounds benchmark only candidates still above that threshold. A candidate
 that recovers is retained and is not measured in later filtering rounds. Candidates
@@ -59,12 +62,10 @@ immediate filtering; the default two rounds provide one recheck.
 
 There is one pause before each needed recheck round. No pause or recheck occurs
 without suspects, with fewer than two candidates, or with one configured round.
-`SLOW_CONFIG_RUNS` and `SLOW_CONFIG_RECHECK_RUNS` are not used: ordinary `do_bench`
-derives launch counts from time budgets, rather than those former launch counts.
-
-Ordinary `do_bench` clears L2 independently of the main profiler cache policy.
-Thus filtering uses its standard cold-cache event measurements even if the main
-profiler uses `CACHE_MODE=hot`.
+`SLOW_CONFIG_RUNS` and `SLOW_CONFIG_RECHECK_RUNS` are not used; `CALIBRATION_RUNS`
+controls the short event estimates. The ordinary and custom benchmarkers are unchanged.
+The release CV time-limit pruning also retains its original implementation; explicit
+`ACTIVE` or `MEASURE_BUDGET_MS` bypasses that separate pruning and count calculation.
 
 A measurement budget sets
 `active_i = max(active, ceil(measure_budget_ms / estimated_duration_i_ms))`.
@@ -102,9 +103,9 @@ unconfigured tuner retains its existing event fallback on target-row mismatch;
 explicit measurement policies do not fall back to different measurement conditions.
 
 Effective measurement policies participate in the selection-cache key. Logging
-and reports do not. Calibration settings are inactive without a budget; filtering
-settings are inactive when filtering is disabled. A recheck delay is inactive with
-one filtering round. No additional warnings are emitted for inactive settings.
+and reports do not. `CALIBRATION_RUNS` is inactive unless a budget or filtering is
+enabled; other filtering settings are inactive when filtering is disabled. A recheck
+delay is inactive with one filtering round. No additional warnings are emitted for inactive settings.
 
 ## Console diagnostics
 

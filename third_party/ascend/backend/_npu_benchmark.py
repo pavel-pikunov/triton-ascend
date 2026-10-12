@@ -59,7 +59,7 @@ class NpuBenchmarkOptions:
             "log_level": False,
             "report_best_config": False,
             "report_timing": False,
-            "calibration_runs": self.measure_budget_ms is not None,
+            "calibration_runs": self.measure_budget_ms is not None or self.filter_slow_configs,
             "slow_config_rounds": self.filter_slow_configs,
             "slow_config_factor": self.filter_slow_configs,
             "slow_config_recheck_delay_s": self.filter_slow_configs and self.slow_config_rounds > 1,
@@ -75,7 +75,7 @@ class NpuBenchmarkOptions:
         if self.quality_check:
             from ._benchmark_quality import THRESHOLDS
             thresholds = tuple(sorted(THRESHOLDS.items()))
-        return ("npu-benchmark", 4, self.effective_policy(), thresholds)
+        return ("npu-benchmark", 5, self.effective_policy(), thresholds)
 
 
 def resolve_options():
@@ -285,28 +285,27 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
     return results
 
 
-def filter_slow_configs(funcs, options):
+def filter_slow_configs(funcs, options, clear_l2_cache, pre_hook_scope):
     """Benchmark everyone once, then recheck only persistent suspects."""
-    from triton.testing import do_bench
-
     indices = list(range(len(funcs)))
     if len(funcs) < 2:
         return indices, {}
     log_stage(options.log_level, "Slow filter", f"Round 1/{options.slow_config_rounds}: {len(funcs)} candidates")
-    durations = {index: do_bench(fn, return_mode="mean") for index, fn in enumerate(funcs)}
-    threshold = min(durations.values()) * options.slow_config_factor
-    suspects = [index for index in indices if durations[index] > threshold]
-    log_stage(options.log_level, "Slow filter", f"Further rounds needed: {len(suspects)}/{len(funcs)} candidates")
-    for round_index in range(1, options.slow_config_rounds):
-        if not suspects:
-            break
-        if options.slow_config_recheck_delay_s:
-            time.sleep(options.slow_config_recheck_delay_s)
-        log_stage(options.log_level, "Slow filter", f"Round {round_index + 1}/{options.slow_config_rounds}: "
-                  f"{len(suspects)} suspects")
-        for index in suspects:
-            durations[index] = do_bench(funcs[index], return_mode="mean")
-        suspects = [index for index in suspects if durations[index] > threshold]
+    with event_timer(clear_l2_cache, pre_hook_scope) as measure:
+        durations = {index: measure(fn, options.calibration_runs) for index, fn in enumerate(funcs)}
+        threshold = min(durations.values()) * options.slow_config_factor
+        suspects = [index for index in indices if durations[index] > threshold]
+        log_stage(options.log_level, "Slow filter", f"Further rounds needed: {len(suspects)}/{len(funcs)} candidates")
+        for round_index in range(1, options.slow_config_rounds):
+            if not suspects:
+                break
+            if options.slow_config_recheck_delay_s:
+                time.sleep(options.slow_config_recheck_delay_s)
+            log_stage(options.log_level, "Slow filter", f"Round {round_index + 1}/{options.slow_config_rounds}: "
+                      f"{len(suspects)} suspects")
+            for index in suspects:
+                durations[index] = measure(funcs[index], options.calibration_runs)
+            suspects = [index for index in suspects if durations[index] > threshold]
     kept = [index for index in indices if index not in suspects]
     log_stage(options.log_level, "Slow filter", f"{len(kept)}/{len(funcs)} candidates retained")
     log_stage(options.log_level, "Slow filter settings", f"event_mean_ms={durations}, threshold_ms={threshold}",
@@ -316,7 +315,7 @@ def filter_slow_configs(funcs, options):
 
 @contextmanager
 def event_timer(clear_l2_cache, pre_hook_scope):
-    """Short event calibration when ordinary slow-filter measurements are unavailable."""
+    """Short event estimates under the same cache policy as profiler measurements."""
     import torch
 
     start, end = (torch.npu.Event(enable_timing=True) for _ in range(2))
@@ -333,6 +332,8 @@ def event_timer(clear_l2_cache, pre_hook_scope):
         start.record()
 
     def measure(fn, count):
+        fn()
+        torch.npu.synchronize()
         total_ms = 0.0
         for _ in range(count):
             if not scoped:
@@ -359,12 +360,8 @@ def calibrate_counts(funcs, indices, durations, options, active, clear_l2_cache,
         options.log_level, "Calibration", f"Reusing slow-filter events: {len(indices) - len(missing)}/"
         f"{len(indices)}; event calibration: {len(missing)} candidates")
     if missing:
-        import torch
-
         with event_timer(clear_l2_cache, pre_hook_scope) as measure:
             for index in missing:
-                funcs[index]()
-                torch.npu.synchronize()
                 durations[index] = measure(funcs[index], options.calibration_runs)
     for index in indices:
         duration = durations[index]
@@ -425,6 +422,7 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
     warmup = warmup if options.warmup is None else options.warmup
     active = active if options.active is None else options.active
     clear_l2_cache = clear_l2_cache if options.cache_mode is None else options.cache_mode == "cold"
+    options = replace(options, warmup=warmup, active=active, cache_mode="cold" if clear_l2_cache else "hot")
     if options.quality_check and active < 2:
         raise ValueError("quality_check requires active >= 2")
     log_stage(
@@ -442,13 +440,24 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
              if target_kernel_name is None or isinstance(target_kernel_name, str) else list(target_kernel_name))
     if len(names) != len(funcs):
         raise ValueError("Provide one target kernel name per function")
+    indices, durations = list(range(len(funcs))), {}
+    with timing_stage(timings, "slow_filter"):
+        if options.filter_slow_configs:
+            indices, durations = filter_slow_configs(funcs, options, clear_l2_cache, pre_hook_scope)
+    with timing_stage(timings, "calibration"):
+        if options.measure_budget_ms is None:
+            counts = [active] * len(funcs)
+        else:
+            counts = calibrate_counts(funcs, indices, durations, options, active, clear_l2_cache, pre_hook_scope)
+    measurements = _profile_with_retries(profile, funcs, names, indices, counts, options, prof_dir, keep_res,
+                                         pre_hook_scope, capture_report=report_sink is not None, timings=timings)
+    return benchmark_result(measurements, report_sink)
+
+
+def _profile_with_retries(profile, funcs, names, indices, counts, options, prof_dir, keep_res, pre_hook_scope,
+                          capture_report, timings):
     if options.quality_check:
         from ._benchmark_quality import evaluate_quality
-    with timing_stage(timings, "slow_filter"):
-        indices, durations = (filter_slow_configs(funcs, options) if options.filter_slow_configs else
-                              (list(range(len(funcs))), {}))
-    with timing_stage(timings, "calibration"):
-        counts = calibrate_counts(funcs, indices, durations, options, active, clear_l2_cache, pre_hook_scope)
     best_reports = [None] * len(funcs)
     root = Path(prof_dir) if prof_dir is not None else Path(
         runtime.cache.get_home_dir()) / ".triton" / "profile_results"
@@ -459,10 +468,11 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
         directory = tempfile.mkdtemp(prefix="npu_bench_", dir=root)
         with result_scope(lambda: shutil.rmtree(directory) if not keep_res else None):
             try:
-                return profile([funcs[index] for index in selected], warmup, active, clear_l2_cache, directory, True,
-                               [names[index] for index in selected], _return_samples=True,
+                return profile([funcs[index]
+                                for index in selected], options.warmup, options.active, options.cache_mode == "cold",
+                               directory, True, [names[index] for index in selected], _return_samples=True,
                                _pre_hook_scope=pre_hook_scope, _active_counts=[counts[index] for index in selected],
-                               _execution_state=execution_state, _capture_report=report_sink is not None)
+                               _execution_state=execution_state, _capture_report=capture_report)
             except (RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 if execution_state["failed"]:
                     raise
@@ -475,7 +485,7 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
             selected = pending
             log_stage(options.log_level, "Profiler measurement", f"Attempt {attempt + 1}: {len(selected)} candidates")
             log_stage(
-                options.log_level, "Measurement settings", f"configs={selected}, warmup={warmup}, "
+                options.log_level, "Measurement settings", f"configs={selected}, warmup={options.warmup}, "
                 f"active_per_config={[counts[index] for index in selected]}", detailed=True)
             try:
                 measurements = collect(selected)
@@ -509,4 +519,4 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
         report_safely(lambda: print("NPU autotune: the fastest retained measurement failed quality checks; "
                                     "the autotuner is not confident that this is the fastest configuration. "
                                     "The selected score is unchanged. " + "; ".join(best.quality_failures)))
-    return benchmark_result(best_reports, report_sink)
+    return best_reports
