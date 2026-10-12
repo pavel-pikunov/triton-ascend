@@ -26,16 +26,7 @@ from typing import Optional
 
 import triton.runtime as runtime
 
-
-class ProfilerResultMismatchError(RuntimeError):
-    def __init__(self, target_kernel_name: str, expected_rows: int, actual_rows: int):
-        self.target_kernel_name = target_kernel_name
-        self.expected_rows = expected_rows
-        self.actual_rows = actual_rows
-        super().__init__(
-            "Profiler rows filtered by target kernel name do not match the expected count. "
-            f"target_kernel_name={target_kernel_name!r}, expected_rows={expected_rows}, actual_rows={actual_rows}"
-        )
+from ._npu_benchmark import ProfilerResultMismatchError as ProfilerResultMismatchError
 
 
 def do_bench_npu(
@@ -47,16 +38,45 @@ def do_bench_npu(
     keep_res=False,
     target_kernel_name: Optional[str] = None,
 ):
+    """Profile NPU kernels with optional TRITON_NPU_BENCH_* environment policies."""
+    from ._npu_benchmark import bench_npu
+    return bench_npu(_profile_npu, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name)
+
+
+def _profile_npu(
+    funcs,
+    warmup=5,
+    active=30,
+    clear_l2_cache=False,
+    prof_dir=None,
+    keep_res=False,
+    target_kernel_name=None,
+    *,
+    _return_samples=False,
+    _pre_hook_scope=None,
+    _report_sink=None,
+    _active_counts=None,
+    _execution_state=None,
+):
     import torch
     import torch_npu
+    from ._npu_benchmark import _collect_prof_result, profile_scope, result_scope
 
     if not isinstance(funcs, list):
         funcs = [funcs]
 
+    def run(fn):
+        try:
+            fn()
+            torch.npu.synchronize()
+        except Exception:
+            if _execution_state is not None:
+                _execution_state["failed"] = True
+            raise
+
     # warmup kernel
     for fn in funcs:
-        fn()
-        torch.npu.synchronize()
+        run(fn)
 
     experimental_config = torch_npu.profiler._ExperimentalConfig(
         aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
@@ -83,28 +103,31 @@ def do_bench_npu(
         buffer.sum()
         torch.npu.synchronize()  # shake out of any npu error
 
-    total = warmup + active
-    with torch_npu.profiler.profile(
-        activities=[torch_npu.profiler.ProfilerActivity.NPU],
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-        with_flops=False,
-        with_modules=False,
-        experimental_config=experimental_config,
-    ) as prof:
-        for fn in funcs:
-            for _ in builtins.range(total):
-                if clear_l2_cache:
-                    buffer.sum()  # use buffer read to clear l2 cache
-                    torch.npu.synchronize()
-                fn()
-                torch.npu.synchronize()
-    if clear_l2_cache:
-        del buffer
-
     try:
+        scope = profile_scope(buffer if clear_l2_cache else None, torch.npu.synchronize, _pre_hook_scope,
+                              lambda: _rm_dic(keep_res, torch_path))
+        with scope, torch_npu.profiler.profile(
+                activities=[torch_npu.profiler.ProfilerActivity.NPU],
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+                with_flops=False,
+                with_modules=False,
+                experimental_config=experimental_config,
+        ):
+            for index, fn in enumerate(funcs):
+                total = warmup + (active if _active_counts is None else _active_counts[index])
+                for _ in builtins.range(total):
+                    if clear_l2_cache and _pre_hook_scope is None:
+                        buffer.sum()  # use buffer read to clear l2 cache
+                        torch.npu.synchronize()
+                    run(fn)
+    finally:
+        if clear_l2_cache:
+            del buffer
+
+    with result_scope(lambda: _rm_dic(keep_res, torch_path)):
         return _collect_prof_result(
             torch_path,
             funcs,
@@ -112,9 +135,10 @@ def do_bench_npu(
             active,
             target_kernel_name=target_kernel_name,
             clear_l2_cache=clear_l2_cache,
+            _return_samples=_return_samples,
+            _report_sink=_report_sink,
+            _active_counts=_active_counts,
         )
-    finally:
-        _rm_dic(keep_res, torch_path)
 
 
 def _rm_dic(keep_res, torch_path):
@@ -124,68 +148,3 @@ def _rm_dic(keep_res, torch_path):
 
     if os.path.exists(torch_path):
         shutil.rmtree(torch_path)
-
-
-def _collect_prof_result(
-    base_dir: str,
-    funcs,
-    num_warmup: int,
-    num_active: int,
-    target_kernel_name: Optional[str] = None,
-    clear_l2_cache: bool = False,
-):
-    """
-    Collect kernel performance from kernel_details.csv, returned in millisecond.
-    The first `num_warmup` rows of each function are warmup data and will be ignored, the next `num_active` rows will be averaged.
-
-    :param base_dir: the profiler path
-    :type base_dir: str
-    :param funcs: a list of Callable being profiled
-    :type funcs: List[Callable]
-    :param num_warmup: warmup count in kernel_details.csv of each fn
-    :type num_warmup: int
-    :param num_active: active count in kernel_details.csv of each fn
-    :type num_active: int
-    :param target_kernel_name: target triton kernel name reported by profiler
-    :type target_kernel_name: Optional[str]
-    """
-
-    import numpy as np
-    import pandas as pd
-
-    kernel_details_file = None
-    for root, _, files in os.walk(base_dir):
-        for file in files:
-            if file == "kernel_details.csv":
-                kernel_details_file = os.path.join(root, file)
-                break
-    num_funcs = len(funcs)
-    if kernel_details_file is None:
-        if num_funcs == 1:
-            return float("inf")
-        else:
-            return [float("inf")] * num_funcs
-
-    df = pd.read_csv(kernel_details_file)
-    # filter out l2 cache clearing operation
-    filter_cond = (not clear_l2_cache) | ~df["Type"].str.contains(r"^ReduceSum$", case=False, na=False)
-    filter_df = df[filter_cond]
-    if target_kernel_name is not None:
-        filter_df = filter_df[filter_df["Name"] == target_kernel_name]
-
-    expected_rows = num_funcs * (num_warmup + num_active)
-    actual_rows = len(filter_df)
-    if target_kernel_name is not None and actual_rows != expected_rows:
-        raise ProfilerResultMismatchError(target_kernel_name, expected_rows, actual_rows)
-
-    time_cost = [0] * num_funcs
-    for func_idx in np.arange(0, num_funcs):
-        for active_index in np.arange(0, num_active):
-            row_index = func_idx * (num_warmup + num_active) + num_warmup + active_index
-            time_cost[func_idx] += filter_df.iloc[row_index]["Duration(us)"]
-    time_cost = [x / num_active / 1e3 for x in time_cost]
-
-    if num_funcs == 1:
-        return time_cost[0]
-    else:
-        return time_cost

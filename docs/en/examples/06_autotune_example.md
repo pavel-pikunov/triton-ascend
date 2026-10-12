@@ -280,6 +280,12 @@ def triton_func(input_ptr, output_ptr, ...):
 
 ## More Functions
 
+### NPU Measurement Policies and Diagnostics
+
+With `TRITON_BENCH_METHOD=npu`, environment variables control measurement policies,
+filtering rounds, and diagnostics without changing decorator arguments. See
+[NPU autotune policies and diagnostics](../npu_autotune_guide.md).
+
 ### Automatically Generating the Profiling Result of the Optimal Configuration
 
 ```Python
