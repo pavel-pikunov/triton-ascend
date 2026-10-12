@@ -19,19 +19,13 @@ def start_timing(tuner):
     tuner._npu_timing = (time.perf_counter(), {}) if options is not None and options.report_timing else None
 
 
-def add_timing(tuner, name, elapsed):
-    if tuner._npu_timing is not None:
-        durations = tuner._npu_timing[1]
-        durations[name] = durations.get(name, 0) + elapsed
+def durations(tuner):
+    timing = getattr(tuner, "_npu_timing", None)
+    return timing[1] if timing is not None else None
 
 
-def timing_sink(tuner):
-    return functools.partial(add_timing, tuner) if getattr(tuner, "_npu_timing", None) is not None else None
-
-
-def call_stage(tuner, name, fn, *args, **kwargs):
-    with benchmark.timing_stage(timing_sink(tuner), name):
-        return fn(*args, **kwargs)
+def stage(tuner, name):
+    return benchmark.timing_stage(durations(tuner), name)
 
 
 def begin_stage(tuner, title=None, message=""):
@@ -42,8 +36,7 @@ def begin_stage(tuner, title=None, message=""):
 
 
 def end_stage(tuner, name, started):
-    if started is not None:
-        add_timing(tuner, name, time.perf_counter() - started)
+    benchmark.record_timing(durations(tuner), name, started)
 
 
 def log_candidates(tuner, title, count, total):
@@ -92,17 +85,15 @@ def profile_candidates(tuner, kernels_call, run_fns, warmup, active, report_sink
     from .testing import _profile_npu
 
     options = tuner._npu_options
-    reports = [] if report_sink is not None else None
     names = (tuner._resolve_target_kernel_name(kernels_call, run_fns.keys()) if options.is_default else
              [getattr(kernels_call[config], "target_kernel_name", None) for config in run_fns])
     costs = benchmark.bench_npu(
         _profile_npu, list(run_fns.values()), warmup, active, True, None, False, names, options=options,
         pre_hook_scope=functools.partial(cache_pre_hook, tuner) if options.cache_mode == "cold" else None,
-        report_sink=reports.extend if reports is not None else None, timing_sink=timing_sink(tuner))
+        report_sink=(lambda records: report_sink(dict(zip(run_fns, records)))) if report_sink is not None else None,
+        timings=durations(tuner))
     costs = [costs] if len(run_fns) == 1 else costs
     assert len(costs) == len(run_fns)
-    if report_sink is not None:
-        benchmark.report_safely(lambda: report_sink(dict(zip(run_fns, reports))))
     return dict(zip(run_fns, costs))
 
 

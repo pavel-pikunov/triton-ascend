@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import math
 import os
 import pprint
@@ -10,7 +9,7 @@ import re
 import shutil
 import tempfile
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from statistics import fmean
@@ -56,17 +55,16 @@ class NpuBenchmarkOptions:
     report_timing: bool = False
 
     def effective_policy(self):
-        policy = asdict(self)
-        for name in ("log_level", "report_best_config", "report_timing"):
-            del policy[name]
-        if self.measure_budget_ms is None:
-            del policy["calibration_runs"]
-        if not self.filter_slow_configs:
-            for name in ("slow_config_rounds", "slow_config_factor", "slow_config_recheck_delay_s"):
-                del policy[name]
-        elif self.slow_config_rounds == 1:
-            del policy["slow_config_recheck_delay_s"]
-        return tuple(sorted(policy.items()))
+        enabled = {
+            "log_level": False,
+            "report_best_config": False,
+            "report_timing": False,
+            "calibration_runs": self.measure_budget_ms is not None,
+            "slow_config_rounds": self.filter_slow_configs,
+            "slow_config_factor": self.filter_slow_configs,
+            "slow_config_recheck_delay_s": self.filter_slow_configs and self.slow_config_rounds > 1,
+        }
+        return tuple(sorted((name, value) for name, value in asdict(self).items() if enabled.get(name, True)))
 
     @property
     def is_default(self):
@@ -91,10 +89,7 @@ def resolve_options():
             continue
         try:
             if isinstance(default, bool):
-                normalized = value.strip().lower()
-                if normalized not in {"0", "1", "false", "true"}:
-                    raise ValueError("expected 0, 1, false or true")
-                value = normalized in {"1", "true"}
+                value = {"0": False, "1": True, "false": False, "true": True}[value.strip().lower()]
             elif name in COUNT_MINIMUMS:
                 value = int(value)
                 if value < COUNT_MINIMUMS[name]:
@@ -109,7 +104,7 @@ def resolve_options():
                 allowed = {"hot", "cold"} if name == "cache_mode" else {"off", "brief", "detailed"}
                 if value not in allowed:
                     raise ValueError(f"expected one of {sorted(allowed)}")
-        except ValueError as exc:
+        except (ValueError, KeyError) as exc:
             raise ValueError(f"Invalid {environment}: {value!r}") from exc
         values[name] = value
     if values["quality_check"] and values["active"] is not None and values["active"] < 2:
@@ -131,14 +126,19 @@ def log_stage(level, title, message, *, detailed=False):
 
 
 @contextmanager
-def timing_stage(sink, name):
-    started = time.perf_counter() if sink is not None else None
+def timing_stage(durations, name):
+    started = time.perf_counter() if durations is not None else None
     try:
         yield
     finally:
-        if sink is not None:
-            elapsed = time.perf_counter() - started
-            report_safely(lambda: sink(name, elapsed))
+        record_timing(durations, name, started)
+
+
+def record_timing(durations, name, started):
+    if started is not None:
+        elapsed = time.perf_counter() - started
+        with suppress(Exception):
+            durations[name] = durations.get(name, 0) + elapsed
 
 
 @dataclass(frozen=True)
@@ -154,6 +154,7 @@ class NpuMeasurementReport:
     quality_failures: tuple = ()
     quality_checked: bool = False
     quality_metrics: dict = field(default_factory=dict)
+    samples: tuple | None = field(default=None, repr=False)
 
 
 def aggregate_profile_rows(frame):
@@ -180,33 +181,36 @@ def aggregate_profile_rows(frame):
 
 def print_best_config_report(function_name, configs, config, measurement):
     number = next((i for i, candidate in enumerate(configs, 1) if candidate is config), None)
-    stream = io.StringIO()
-    stream.write(f"Triton autotuning result for {function_name}\n" + "-" * 60 + "\n")
-    stream.write(f"Selected config: {number}/{len(configs)} (1-based, before pruning)\n"
-                 if number is not None else "Selected config: not in the original candidate list\n")
+    lines = [
+        f"Triton autotuning result for {function_name}", "-" * 60,
+        f"Selected config: {number}/{len(configs)} (1-based, before pruning)"
+        if number is not None else "Selected config: not in the original candidate list"
+    ]
     parameters = dict(vars(config))
     ub_config = parameters.pop("ubtune_cfg", None)
-    stream.write("Full config parameters:\n" + pprint.pformat(parameters, sort_dicts=False) + "\n")
+    lines.extend(["Full config parameters:", pprint.pformat(parameters, sort_dicts=False)])
     if ub_config is not None:
-        stream.write("ubtune_cfg:\n" + pprint.pformat(ub_config, sort_dicts=False) + "\n")
+        lines.extend(["ubtune_cfg:", pprint.pformat(ub_config, sort_dicts=False)])
     if measurement is None:
-        stream.write("NPU measurements unavailable for this selection; no extra benchmarking was run.\n")
+        lines.append("NPU measurements unavailable for this selection; no extra benchmarking was run.")
     else:
-        stream.write(f"Central 50% score: {measurement.score_ms * 1000:.12g} us ({measurement.score_ms:.12g} ms)\n")
-        stream.write(f"Mean duration: {measurement.mean_ms * 1000:.12g} us ({measurement.mean_ms:.12g} ms)\n")
-        stream.write(f"cache={measurement.cache_mode}, warmup={measurement.warmup}, active={measurement.active}, "
-                     f"selected attempt={measurement.attempt}\n")
+        lines.extend([
+            f"Central 50% score: {measurement.score_ms * 1000:.12g} us ({measurement.score_ms:.12g} ms)",
+            f"Mean duration: {measurement.mean_ms * 1000:.12g} us ({measurement.mean_ms:.12g} ms)",
+            f"cache={measurement.cache_mode}, warmup={measurement.warmup}, active={measurement.active}, "
+            f"selected attempt={measurement.attempt}"
+        ])
         quality = ("failed"
                    if measurement.quality_failures else "passed" if measurement.quality_checked else "not requested")
-        stream.write(f"Quality checks: {quality}; metrics={measurement.quality_metrics}\n")
+        lines.append(f"Quality checks: {quality}; metrics={measurement.quality_metrics}")
         if measurement.quality_failures:
-            stream.write("Failure reasons: " + "; ".join(measurement.quality_failures) + "\n")
-        stream.write(f"Profiler aggregates: {measurement.sample_count} measured launches (warmup excluded)\n")
+            lines.append("Failure reasons: " + "; ".join(measurement.quality_failures))
+        lines.append(f"Profiler aggregates: {measurement.sample_count} measured launches (warmup excluded)")
         for column, (value, count, numeric) in measurement.metrics.items():
             formatted = f"{value:.12g}" if numeric else value
             available = f" ({count}/{measurement.sample_count} available)" if count != measurement.sample_count else ""
-            stream.write(f"  {column}: {'mean' if numeric else 'value'}={formatted}{available}\n")
-    print(stream.getvalue(), end="")
+            lines.append(f"  {column}: {'mean' if numeric else 'value'}={formatted}{available}")
+    print("\n".join(lines))
 
 
 def print_timing_report(function_name, started, durations):
@@ -219,8 +223,8 @@ def print_timing_report(function_name, started, durations):
 
 
 def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_name=None, clear_l2_cache=False,
-                         _return_samples=False, _report_sink=None, _active_counts=None):
-    """Original pandas collector with cumulative counts and optional sample/report extraction."""
+                         _return_samples=False, _active_counts=None, _capture_report=False):
+    """Read one batch into measurements, optionally including validated samples and aggregates."""
     import pandas as pd
     from ._benchmark_quality import central_50_mean
 
@@ -234,7 +238,7 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
     if kernel_details_file is None:
         if _return_samples:
             raise ProfilerAcquisitionError("NPU profiler CSV kernel_details.csv was not found")
-        return float("inf") if num_funcs == 1 else [float("inf")] * num_funcs
+        return [None] * num_funcs
 
     df = pd.read_csv(kernel_details_file)
     filter_cond = (not clear_l2_cache) | ~df["Type"].str.contains(r"^ReduceSum$", case=False, na=False)
@@ -256,7 +260,7 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
     if target_kernel_name is not None and len(filter_df) != expected_rows:
         raise ProfilerResultMismatchError(target_kernel_name, expected_rows, len(filter_df))
 
-    costs, samples, reports = [], [], []
+    results = []
     offset = 0
     for index, count in enumerate(counts):
         measured = filter_df.iloc[offset + num_warmup:offset + num_warmup + count]
@@ -267,21 +271,18 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
         if names[index] is not None and not measured["Name"].eq(names[index]).all():
             raise ProfilerAcquisitionError(f"Unexpected profiler target order for config {index}")
         cost = central_50_mean(durations) / 1000
-        costs.append(cost)
+        samples = None
         if _return_samples:
             times = measured["Start Time(us)"].to_numpy(dtype=float)
             if (not np.all(np.isfinite(times)) or not np.all(np.isfinite(durations)) or np.any(durations <= 0)
                     or np.any(np.diff(times) <= 0)):
                 raise ProfilerAcquisitionError(f"Invalid profiler samples for config {index}")
-            samples.append((times, durations))
-        if _report_sink is not None:
-            reports.append(
-                report_safely(lambda: NpuMeasurementReport(aggregate_profile_rows(measured), count, num_warmup, count,
-                                                           "cold" if clear_l2_cache else "hot",
-                                                           float(np.mean(durations)) / 1000, cost)))
-    if _report_sink is not None:
-        report_safely(lambda: _report_sink(reports))
-    return samples if _return_samples else costs[0] if num_funcs == 1 else costs
+            samples = (times, durations)
+        metrics = report_safely(lambda: aggregate_profile_rows(measured)) if _capture_report else {}
+        results.append(
+            NpuMeasurementReport(metrics, count, num_warmup, count, "cold" if clear_l2_cache else "hot",
+                                 float(np.mean(durations)) / 1000, cost, samples=samples))
+    return results
 
 
 def filter_slow_configs(funcs, options):
@@ -381,18 +382,14 @@ def calibrate_counts(funcs, indices, durations, options, active, clear_l2_cache,
 @contextmanager
 def result_scope(remove):
     """Keep a primary failure if cleanup also fails."""
-    failed = False
     try:
         yield
     except BaseException:
-        failed = True
-        raise
-    finally:
-        try:
+        with suppress(Exception):
             remove()
-        except Exception:
-            if not failed:
-                raise
+        raise
+    else:
+        remove()
 
 
 @contextmanager
@@ -410,90 +407,17 @@ def profile_scope(buffer, synchronize, pre_hook_scope, remove):
             raise
 
 
-def benchmark_attempts(measure, funcs, names, options, *, warmup, active, prof_root, keep_res=False,
-                       clear_l2_cache=False, pre_hook_scope=None, report_sink=None, timing_sink=None):
-    from ._benchmark_quality import central_50_mean
-
-    if options.quality_check and active < 2:
-        raise ValueError("quality_check requires active >= 2")
-    if options.quality_check:
-        from ._benchmark_quality import evaluate_quality
-    with timing_stage(timing_sink, "slow_filter"):
-        indices, durations = (filter_slow_configs(funcs, options) if options.filter_slow_configs else
-                              (list(range(len(funcs))), {}))
-    with timing_stage(timing_sink, "calibration"):
-        counts = calibrate_counts(funcs, indices, durations, options, active, clear_l2_cache, pre_hook_scope)
-    costs = [float("inf")] * len(funcs)
-    best_failures = [[] for _ in funcs]
-    best_reports = [None] * len(funcs) if report_sink is not None else None
-    root = Path(prof_root)
-    root.mkdir(parents=True, exist_ok=True)
-
-    def collect(selected, reports):
-        execution_state = {"failed": False}
-        directory = tempfile.mkdtemp(prefix="npu_bench_", dir=root)
-        with result_scope(lambda: shutil.rmtree(directory) if not keep_res else None):
-            try:
-                return measure([funcs[index] for index in selected], [names[index] for index in selected], warmup,
-                               active, directory, _active_counts=[counts[index] for index in selected],
-                               _execution_state=execution_state,
-                               **({"_report_sink": reports.extend} if reports is not None else {}))
-            except (RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-                if execution_state["failed"]:
-                    raise
-                raise ProfilerAcquisitionError(str(exc)) from exc
-
-    pending = indices
-    last_acquisition_error = None
-    with timing_stage(timing_sink, "measurements"):
-        for attempt in range(options.max_retries + 1):
-            selected = pending
-            log_stage(options.log_level, "Profiler measurement", f"Attempt {attempt + 1}: {len(selected)} candidates")
-            log_stage(
-                options.log_level, "Measurement settings", f"configs={selected}, warmup={warmup}, "
-                f"active_per_config={[counts[index] for index in selected]}", detailed=True)
-            reports = [] if report_sink is not None else None
-            try:
-                samples = collect(selected, reports)
-            except ProfilerAcquisitionError as exc:
-                last_acquisition_error = exc
-                log_stage(options.log_level, "Profiler acquisition failed", str(exc), detailed=True)
-                continue
-            pending = []
-            for position, (index, (times, durations)) in enumerate(zip(selected, samples)):
-                cost = central_50_mean(durations) / 1000
-                metrics, failures = evaluate_quality(times, durations) if options.quality_check else ({}, [])
-                if cost < costs[index]:
-                    costs[index], best_failures[index] = cost, failures
-                    if best_reports is not None:
-                        best_reports[index] = report_safely(
-                            lambda: replace(reports[position], attempt=attempt + 1, quality_failures=tuple(failures),
-                                            quality_checked=options.quality_check, quality_metrics=metrics))
-                log_stage(
-                    options.log_level, "Config measurement", f"config={index}, attempt={attempt + 1}, "
-                    f"active={counts[index]}, score_ms={cost:.8g}, mean_ms={np.mean(durations) / 1000:.8g}, "
-                    f"metrics={metrics}, failures={failures}", detailed=True)
-                if failures:
-                    pending.append(index)
-            log_stage(
-                options.log_level, "Quality/acquisition result", f"{len(selected) - len(pending)}/"
-                f"{len(selected)} candidates passed; retry candidates={len(pending)}")
-            if not pending:
-                break
-    if not any(math.isfinite(value) for value in costs):
-        raise RuntimeError("NPU benchmark: no usable profiler measurements") from last_acquisition_error
-    best = min(range(len(costs)), key=costs.__getitem__)
-    if best_failures[best]:
-        report_safely(lambda: print("NPU autotune: the fastest retained measurement failed quality checks; "
-                                    "the autotuner is not confident that this is the fastest configuration. "
-                                    "The selected score is unchanged. " + "; ".join(best_failures[best])))
+def benchmark_result(measurements, report_sink):
     if report_sink is not None:
-        report_safely(lambda: report_sink(best_reports))
-    return costs
+        report_safely(lambda: report_sink(
+            [record if record is None or record.metrics is not None else None for record in measurements]))
+    costs = [record.score_ms if record is not None else float("inf") for record in measurements]
+    return costs[0] if len(costs) == 1 else costs
 
 
 def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name, *, options=None,
-              pre_hook_scope=None, report_sink=None, timing_sink=None):
+              pre_hook_scope=None, report_sink=None, timings=None):
+    """Run one profiler batch per attempt and retain each candidate's fastest score."""
     options = resolve_options() if options is None else options
     funcs = funcs if isinstance(funcs, list) else [funcs]
     if not funcs:
@@ -506,25 +430,83 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
     log_stage(
         options.log_level, "Benchmark settings", f"cache={'cold' if clear_l2_cache else 'hot'}, "
         f"warmup={warmup}, active={active}, quality_check={options.quality_check}", detailed=True)
-    diagnostics = {"_report_sink": report_sink} if report_sink is not None else {}
     if not (options.quality_check or options.max_retries or options.measure_budget_ms is not None
             or options.filter_slow_configs):
         log_stage(options.log_level, "Profiler measurement", f"Attempt 1: {len(funcs)} candidates")
-        with timing_stage(timing_sink, "measurements"):
-            return profile(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
-                           _pre_hook_scope=pre_hook_scope, **diagnostics)
+        with timing_stage(timings, "measurements"):
+            measurements = profile(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
+                                   _pre_hook_scope=pre_hook_scope, _capture_report=report_sink is not None)
+        return benchmark_result(measurements, report_sink)
 
     names = ([target_kernel_name] * len(funcs)
              if target_kernel_name is None or isinstance(target_kernel_name, str) else list(target_kernel_name))
     if len(names) != len(funcs):
         raise ValueError("Provide one target kernel name per function")
+    if options.quality_check:
+        from ._benchmark_quality import evaluate_quality
+    with timing_stage(timings, "slow_filter"):
+        indices, durations = (filter_slow_configs(funcs, options) if options.filter_slow_configs else
+                              (list(range(len(funcs))), {}))
+    with timing_stage(timings, "calibration"):
+        counts = calibrate_counts(funcs, indices, durations, options, active, clear_l2_cache, pre_hook_scope)
+    best_reports = [None] * len(funcs)
+    root = Path(prof_dir) if prof_dir is not None else Path(
+        runtime.cache.get_home_dir()) / ".triton" / "profile_results"
+    root.mkdir(parents=True, exist_ok=True)
 
-    def measure(callables, kernel_names, warmup_count, active_count, directory, **kwargs):
-        return profile(callables, warmup_count, active_count, clear_l2_cache, directory, True, kernel_names,
-                       _return_samples=True, _pre_hook_scope=pre_hook_scope, **kwargs)
+    def collect(selected):
+        execution_state = {"failed": False}
+        directory = tempfile.mkdtemp(prefix="npu_bench_", dir=root)
+        with result_scope(lambda: shutil.rmtree(directory) if not keep_res else None):
+            try:
+                return profile([funcs[index] for index in selected], warmup, active, clear_l2_cache, directory, True,
+                               [names[index] for index in selected], _return_samples=True,
+                               _pre_hook_scope=pre_hook_scope, _active_counts=[counts[index] for index in selected],
+                               _execution_state=execution_state, _capture_report=report_sink is not None)
+            except (RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+                if execution_state["failed"]:
+                    raise
+                raise ProfilerAcquisitionError(str(exc)) from exc
 
-    root = prof_dir if prof_dir is not None else Path(runtime.cache.get_home_dir()) / ".triton" / "profile_results"
-    costs = benchmark_attempts(measure, funcs, names, options, warmup=warmup, active=active, prof_root=root,
-                               keep_res=keep_res, clear_l2_cache=clear_l2_cache, pre_hook_scope=pre_hook_scope,
-                               report_sink=report_sink, timing_sink=timing_sink)
-    return costs[0] if len(funcs) == 1 else costs
+    pending = indices
+    last_acquisition_error = None
+    with timing_stage(timings, "measurements"):
+        for attempt in range(options.max_retries + 1):
+            selected = pending
+            log_stage(options.log_level, "Profiler measurement", f"Attempt {attempt + 1}: {len(selected)} candidates")
+            log_stage(
+                options.log_level, "Measurement settings", f"configs={selected}, warmup={warmup}, "
+                f"active_per_config={[counts[index] for index in selected]}", detailed=True)
+            try:
+                measurements = collect(selected)
+            except ProfilerAcquisitionError as exc:
+                last_acquisition_error = exc
+                log_stage(options.log_level, "Profiler acquisition failed", str(exc), detailed=True)
+                continue
+            pending = []
+            for index, measurement in zip(selected, measurements):
+                metrics, failures = evaluate_quality(*measurement.samples) if options.quality_check else ({}, [])
+                if measurement.score_ms < getattr(best_reports[index], "score_ms", float("inf")):
+                    best_reports[index] = replace(measurement, samples=None, attempt=attempt + 1,
+                                                  quality_failures=tuple(failures),
+                                                  quality_checked=options.quality_check, quality_metrics=metrics)
+                log_stage(
+                    options.log_level, "Config measurement", f"config={index}, attempt={attempt + 1}, "
+                    f"active={counts[index]}, score_ms={measurement.score_ms:.8g}, mean_ms={measurement.mean_ms:.8g}, "
+                    f"metrics={metrics}, failures={failures}", detailed=True)
+                if failures:
+                    pending.append(index)
+            log_stage(
+                options.log_level, "Quality/acquisition result", f"{len(selected) - len(pending)}/"
+                f"{len(selected)} candidates passed; retry candidates={len(pending)}")
+            if not pending:
+                break
+    measured = [record for record in best_reports if record is not None and math.isfinite(record.score_ms)]
+    if not measured:
+        raise RuntimeError("NPU benchmark: no usable profiler measurements") from last_acquisition_error
+    best = min(measured, key=lambda record: record.score_ms)
+    if best.quality_failures:
+        report_safely(lambda: print("NPU autotune: the fastest retained measurement failed quality checks; "
+                                    "the autotuner is not confident that this is the fastest configuration. "
+                                    "The selected score is unchanged. " + "; ".join(best.quality_failures)))
+    return benchmark_result(best_reports, report_sink)

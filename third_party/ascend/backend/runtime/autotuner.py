@@ -2248,7 +2248,8 @@ class AutoTilingTuner(Autotuner):
         if cache_miss:
             # prune configs
             npu_tuning.begin_stage(self, "Generation/pruning", f"Initial combinations: {len(self.configs)}")
-            pruned_configs = npu_tuning.call_stage(self, "generation_pruning", self.prune_configs, kwargs)
+            with npu_tuning.stage(self, "generation_pruning"):
+                pruned_configs = self.prune_configs(kwargs)
             npu_tuning.log_candidates(self, "Pruning result", len(pruned_configs), len(self.configs))
             if self.enable_ubtuner or len(pruned_configs) > 1:
                 used_cached_result = False
@@ -2390,7 +2391,8 @@ class AutoTilingTuner(Autotuner):
             overrides = ({"warmup": self._npu_options.warmup}
                          if self._npu_options is not None and self._npu_options.warmup is not None else {})
             candidate_count = len(run_fns)
-            run_fns = npu_tuning.call_stage(self, "slow_filter", self._prune_by_time_limit, run_fns, **overrides)
+            with npu_tuning.stage(self, "slow_filter"):
+                run_fns = self._prune_by_time_limit(run_fns, **overrides)
             npu_tuning.log_candidates(self, "Time-limit pruning result", len(run_fns), candidate_count)
 
         use_profiling = os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu"

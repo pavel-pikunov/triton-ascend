@@ -43,21 +43,9 @@ def do_bench_npu(
     return bench_npu(_profile_npu, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name)
 
 
-def _profile_npu(
-    funcs,
-    warmup=5,
-    active=30,
-    clear_l2_cache=False,
-    prof_dir=None,
-    keep_res=False,
-    target_kernel_name=None,
-    *,
-    _return_samples=False,
-    _pre_hook_scope=None,
-    _report_sink=None,
-    _active_counts=None,
-    _execution_state=None,
-):
+def _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name, *,
+                 _return_samples=False, _pre_hook_scope=None, _active_counts=None, _execution_state=None,
+                 _capture_report=False):
     import torch
     import torch_npu
     from ._npu_benchmark import _collect_prof_result, profile_scope, result_scope
@@ -136,8 +124,8 @@ def _profile_npu(
             target_kernel_name=target_kernel_name,
             clear_l2_cache=clear_l2_cache,
             _return_samples=_return_samples,
-            _report_sink=_report_sink,
             _active_counts=_active_counts,
+            _capture_report=_capture_report,
         )
 
 
