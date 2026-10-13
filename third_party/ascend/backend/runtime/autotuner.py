@@ -2822,7 +2822,7 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     :param hints: a dict of autotune hint auguments passed to AutoTilingTuner.
     """
 
-    if os.getenv('TRITON_BENCH_METHOD', 'default').lower() == 'npu_legacy':
+    if os.getenv('TRITON_BENCH_METHOD', 'default').lower() in ('default', 'npu_legacy'):
         from ._legacy_autotuner import autotune as legacy_autotune
         return legacy_autotune(configs, key, prune_configs_by=prune_configs_by, reset_to_zero=reset_to_zero,
                                restore_value=restore_value, pre_hook=pre_hook, post_hook=post_hook, warmup=warmup,
@@ -3176,7 +3176,7 @@ def max_autotune(configs, key, kernel_type="mixcv",
                           Each value must be a list; the Cartesian product of these lists
                           will be combined with each base config.
     """
-    if os.getenv('TRITON_BENCH_METHOD', 'default').lower() == 'npu_legacy':
+    if os.getenv('TRITON_BENCH_METHOD', 'default').lower() in ('default', 'npu_legacy'):
         from ._legacy_autotuner import max_autotune as legacy_max_autotune
         return legacy_max_autotune(configs, key, kernel_type=kernel_type, prune_configs_by=prune_configs_by,
                                    reset_to_zero=reset_to_zero, restore_value=restore_value, pre_hook=pre_hook,

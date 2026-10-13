@@ -298,7 +298,7 @@ See [NPU autotune policies](npu_autotune_guide.md) for defaults and behavior.
 
 This test branch additionally supports `npu_legacy`, repeated autotune decisions,
 and CSV statistics. Winner/timing reports work across all three benchmark paths;
-cache mode and active count also control the default and legacy measurements.
+measurement controls apply only to the current NPU path.
 See [Three benchmark paths](npu_benchmark_comparison.md) for comparison commands,
 stable candidate IDs, compilation-cache reuse and stage-time statistics.
 

@@ -50,22 +50,6 @@ def do_bench_npu(
     import torch
     import torch_npu
 
-    # Test branch: these two overrides are the only added measurement policies.
-    cache_mode = os.getenv("TRITON_NPU_BENCH_CACHE_MODE")
-    if cache_mode is not None:
-        cache_mode = cache_mode.strip().lower()
-        if cache_mode not in ("hot", "cold"):
-            raise ValueError("TRITON_NPU_BENCH_CACHE_MODE must be 'hot' or 'cold'")
-        clear_l2_cache = cache_mode == "cold"
-    active_override = os.getenv("TRITON_NPU_BENCH_ACTIVE")
-    if active_override is not None:
-        try:
-            active = int(active_override)
-        except ValueError as exc:
-            raise ValueError("TRITON_NPU_BENCH_ACTIVE must be a positive integer") from exc
-        if active < 1:
-            raise ValueError("TRITON_NPU_BENCH_ACTIVE must be a positive integer")
-
     if not isinstance(funcs, list):
         funcs = [funcs]
 
