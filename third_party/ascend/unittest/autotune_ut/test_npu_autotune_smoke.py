@@ -81,6 +81,8 @@ def test_npu_vector_tuning_and_cache(monkeypatch, capsys, tmp_path, decorator, m
         else:
             score = measurement.score[0] if method == "default" else measurement.score
             assert math.isfinite(score) and score > 0
+            if method == "npu_legacy":
+                assert measurement.cache_mode == "cold" and measurement.warmup == 5 and measurement.active == 30
     output = capsys.readouterr().out
     assert output.count("Selected config:") == output.count("Triton autotuning timing") == 3
     decisions = [

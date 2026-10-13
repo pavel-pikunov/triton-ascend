@@ -2,18 +2,19 @@
 
 Branch: `AutotunerBenchCompare-3.2.2`. The current NPU measurement modules are
 copied from `AutotunerNpuPolicies-3.2.2-dev` at `bb4f3c54d`; the comparison branch
-keeps its existing release base, default event benchmarker and legacy measurement code.
-The legacy implementation is pinned to release commit
-`7aa09ec5f1ba564b5544007bca4f97ce0e493182`, rather than a moving release ref.
+keeps its existing release base. The original default and legacy benchmark paths
+are pinned to `release/3.2.2-dev` commit
+`3595ed00385d8f533091b9bd50caf7bd7a7ccd24`. NPU measurement-policy environment
+variables apply only to the current `npu` path.
 
 | `TRITON_BENCH_METHOD` | Tuner and measurement path | Selection score |
 | --- | --- | --- |
-| Unset or `default` | Current tuner, original device-event `triton.testing.do_bench` | Median (autotuning requests quantiles 50%, 20%, 80%) |
-| `npu_legacy` | Copied release tuner and copied release NPU profiler | Arithmetic mean of all measured durations |
+| Unset or `default` | Copied dev tuner, original device-event `triton.testing.do_bench` | Median (autotuning requests quantiles 50%, 20%, 80%) |
+| `npu_legacy` | Copied dev tuner and copied dev NPU profiler | Arithmetic mean of all measured durations |
 | `npu` | Current tuner and current NPU profiler | Arithmetic mean by default; mean within configured quantile boundaries |
 
 Both `autotune` and `max_autotune` route to the complete copied tuner for
-`npu_legacy`, before processing the new options. Direct calls to the backend's
+`default` and `npu_legacy`, before processing the new options. Direct calls to the backend's
 public `do_bench_npu` also route to the copied profiler in this mode.
 Set the mode before imports and decorator creation, and keep it fixed for the
 process lifetime. Each comparison run must start a separate Python process;
@@ -21,12 +22,12 @@ switching the environment on an already-created tuner is unsupported.
 
 ## What is preserved in legacy mode
 
-`runtime/_legacy_autotuner.py` copies release `runtime/autotuner.py`, with the
+`runtime/_legacy_autotuner.py` copies dev `runtime/autotuner.py`, with the
 mode name, its two imports of the copied testing module, and optional final
 diagnostics changed. Trailing whitespace on one original line was removed.
-`_legacy_testing.py` copies release `testing.py` with only the two environment
-overrides described below. Shared parsers, generators, UBTuner and compiler
-are unchanged from the pinned release.
+`_legacy_testing.py` is an exact copy of dev `testing.py`.
+The standard `python/triton/testing.py` is also restored exactly from dev.
+Shared parsers, generators, UBTuner and compiler are unchanged by this restoration.
 
 The original common profiler session, CV pruning/count calculation, warmup,
 kernel-name filtering, CSV aggregation, synchronization, exceptions and cleanup
@@ -35,7 +36,7 @@ The new quality checks, retries, budget, slow filter, quantile boundaries and
 stage logs are not applied to legacy. Public decorators retain their original
 signatures: all new measurement and reporting controls are environment-only.
 Winner and timing reports remain supported by all three paths in this test branch.
-original `auto_prof_dir` remains supported and can perform an extra profile.
+The original `auto_prof_dir` remains supported and can perform an extra profile.
 
 Original fallbacks are also preserved: one remaining configuration uses the
 event benchmarker, and mismatched profiler rows issue the original
@@ -45,33 +46,29 @@ configuration before tuning can also skip measurement altogether. For a pure
 profiler comparison, use multiple surviving candidates and the built-in
 benchmarker, and inspect warnings.
 
-## Two shared controls
+## Original measurement settings
 
-| Environment variable | Default events and legacy NPU | Current NPU |
-| --- | --- | --- |
-| `TRITON_NPU_BENCH_CACHE_MODE=hot\|cold` | Override intentional L2 eviction; unset preserves original behavior | Existing cache policy, unchanged |
-| `TRITON_NPU_BENCH_ACTIVE=N` | Positive integer; exact measured launch count per candidate | Existing active policy; exact count without a budget, minimum count with a budget |
+The original paths ignore every new NPU measurement-policy environment variable,
+including `TRITON_NPU_BENCH_CACHE_MODE` and `TRITON_NPU_BENCH_ACTIVE`.
+Only the current `npu` path accepts these controls.
 
-For events these overrides apply only to the Ascend target (`backend="npu"`).
-Other backends and custom benchmarkers are not overridden. The event path
-retains its original initial call, five-call runtime estimate and warmup-count
-calculation. Hot mode disables eviction in both estimation and measurement.
-Legacy retains its original preliminary call, profiled warmup and CV pruning;
-the active override only replaces the final measured launch count.
-Warmup and estimation launches are additional to `ACTIVE`.
+Default events retain the original preliminary call, five-call estimate,
+time-based warmup/repeat calculation and L2 clearing. The ordinary defaults
+are `warmup=25` ms and `rep=100` ms; these are time targets, not launch counts.
+Legacy profiling uses cold cache and normally `warmup=5`, `active=30`; cube/mix
+CV cases retain the original count calculation and time-limit pruning.
+There is no new environment override for their cache state or launch counts.
 
-Hot means no intentional eviction; hooks, working-set size and other operations
-can still change cache contents. Cold eviction also uses the original operations
-and hook order of each path, so their cache preparation is not identical.
-No other `TRITON_NPU_BENCH_*` measurement options are resolved by events or legacy.
-The two shared controls are environment-only.
+The original arguments and custom benchmarker API remain available. Winner/timing
+reports, repeated autotune decisions and CSV recording observe these paths and
+add no measurements within an individual selection pass.
 
 ## Run an existing case in separate processes
 
 Omit custom `do_bench`, `auto_prof_dir`, explicit benchmark policies and enabled
 diagnostics from the test's decorators. Keep input data, candidate order, device,
 compiler options and device load the same for each path. For the baseline,
-clear inherited NPU policies so only cache mode and active are set:
+clear inherited NPU policies:
 
 ```bash
 for name in "${!TRITON_NPU_BENCH_@}"; do unset "$name"; done
@@ -80,8 +77,6 @@ export TRITON_DEBUG=0
 export TRITON_AUTOTUNE_REPORT_TIMING=0
 unset TRITON_AUTOTUNE_RUNS TRITON_AUTOTUNE_CSV_DIR
 export PYTHONWARNINGS=default
-export TRITON_NPU_BENCH_CACHE_MODE=hot  # Repeat the comparison with cold.
-export TRITON_NPU_BENCH_ACTIVE=1000
 
 unset TRITON_BENCH_METHOD
 python your_existing_case.py
@@ -90,7 +85,8 @@ TRITON_BENCH_METHOD=npu python your_existing_case.py
 ```
 
 Here quality checks, retries, measurement budget, slow filter and new logs/reports
-are all off by default. Do not set a budget when comparing equal measured counts.
+are all off by default. Each original path uses its native measurement count
+and cache preparation. New NPU settings do not alter the other two paths.
 The current NPU path bypasses CV time-limit pruning with explicit `ACTIVE`;
 legacy and default preserve CV pruning. Use a case where the candidate set stays
 the same, or record the actual surviving configurations when interpreting results.
@@ -289,8 +285,10 @@ if tuning fails before all requested passes finish.
 
 ## Real-device smoke
 
-The smoke file now covers both decorators and all three benchmark routes using
-environment controls. Each case makes three decisions, verifies kernel output,
+The smoke file covers both decorators and all three benchmark routes. NPU cache
+and count controls are deliberately set for every case: only current NPU uses
+them; legacy retains cold cache, five warmup rows and 30 measured rows.
+Each case makes three decisions, verifies kernel output,
 stable candidate order, CSV win counts and silent cached calls:
 
 ```bash

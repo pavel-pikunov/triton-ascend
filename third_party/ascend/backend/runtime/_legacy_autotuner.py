@@ -254,8 +254,6 @@ class AutoTilingTuner(Autotuner):
         do_bench=None,
         auto_profile_dir=None,
         hints=None,
-        report_best_config=None,
-        report_timing=None,
     ):
         """
         :param key: a list of argument names whose runtime value changes invalidate the autotune cache
@@ -285,7 +283,7 @@ class AutoTilingTuner(Autotuner):
             do_bench,
         )
         # Test-branch reports only; no new NPU measurement policies are resolved.
-        npu_tuning.initialize(self, None, report_best_config, report_timing)
+        npu_tuning.initialize(self)
         self.user_defined_do_bench = do_bench is not None
         self.hints = reserved_hints
         self.config_hints = config_hints
@@ -2249,7 +2247,6 @@ class AutoTilingTuner(Autotuner):
         if self.is_simt_mode and kwargs.get('simt_stack_limit', None) is None:
             kwargs['simt_stack_limit'] = self.simt_stack_limit
         used_cached_result = True
-        single_config_cache_pending = False
         if cache_miss:
             # prune configs
             pruned_configs = npu_tuning.call_stage(self, "generation_pruning", self.prune_configs, kwargs)
@@ -2269,7 +2266,6 @@ class AutoTilingTuner(Autotuner):
                 config = self.cache[key]
             else:
                 config = pruned_configs[0]
-                single_config_cache_pending = True
         else:
             config = self.cache[key]
 
@@ -2304,8 +2300,6 @@ class AutoTilingTuner(Autotuner):
                 *args,
                 **final_kwargs,
             )
-            if single_config_cache_pending:
-                self.cache[key] = config
             return ret
         finally:
             self.nargs = None
@@ -2767,8 +2761,7 @@ class AutoTilingTuner(Autotuner):
 
 
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
-             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, *, auto_prof_dir=None, hints=None,
-             report_best_config=None, report_timing=None):
+             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, *, auto_prof_dir=None, hints=None):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -2832,7 +2825,7 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
         return AutoTilingTuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                                post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
                                use_cuda_graph=use_cuda_graph, do_bench=do_bench, auto_profile_dir=auto_prof_dir,
-                               hints=hints, report_best_config=report_best_config, report_timing=report_timing)
+                               hints=hints)
 
     return decorator
 
@@ -3150,8 +3143,7 @@ def get_max_configs(config, kernel_type="mixcv", **kwargs):
 
 
 def max_autotune(configs, key, kernel_type="mixcv", prune_configs_by=None, reset_to_zero=None, restore_value=None,
-                 pre_hook=None, post_hook=None, warmup=None, rep=None, use_cuda_graph=False, do_bench=None, *,
-                 report_best_config=None, report_timing=None, **tuning_params):
+                 pre_hook=None, post_hook=None, warmup=None, rep=None, use_cuda_graph=False, do_bench=None, **tuning_params):
     """
     Decorator that expands each base Config with tuning parameters before auto-tuning.
 
@@ -3198,8 +3190,6 @@ def max_autotune(configs, key, kernel_type="mixcv", prune_configs_by=None, reset
             rep=rep,
             use_cuda_graph=use_cuda_graph,
             do_bench=do_bench,
-            report_best_config=report_best_config,
-            report_timing=report_timing,
         )(fn)
 
     return decorator
