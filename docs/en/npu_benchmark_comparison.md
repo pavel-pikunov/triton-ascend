@@ -12,7 +12,7 @@ override described below.
 | --- | --- | --- |
 | Unset or `default` | Copied dev tuner, original device-event `triton.testing.do_bench` | Median (autotuning requests quantiles 50%, 20%, 80%) |
 | `npu_legacy` | Copied dev tuner and copied dev NPU profiler | Arithmetic mean of all measured durations |
-| `npu` | Current tuner and current NPU profiler | Arithmetic mean by default; mean within configured quantile boundaries |
+| `npu` | Current tuner and current NPU profiler | Central-half mean by default; mean within configured quantile boundaries |
 
 Both `autotune` and `max_autotune` route to the complete copied tuner for
 `default` and `npu_legacy`, before processing the new options. Direct calls to the backend's
@@ -90,8 +90,9 @@ TRITON_BENCH_METHOD=npu_legacy python your_existing_case.py
 TRITON_BENCH_METHOD=npu python your_existing_case.py
 ```
 
-Here quality checks, retries, measurement budget, slow filter and new logs/reports
-are all off by default. Each original path uses its native measurement count.
+The original paths retain their native measurement counts and disabled report
+defaults. Current NPU uses the enabled policies and defaults listed in
+[NPU autotune settings](npu_autotune_guide.md), including active>=250 and warmup=50.
 To compare all three with hot cache, set `TRITON_NPU_BENCH_CACHE_MODE=hot` before
 the three commands. Other new NPU settings do not alter the original two paths.
 The current NPU path bypasses CV time-limit pruning with explicit `ACTIVE`;
@@ -114,7 +115,7 @@ including legacy mode:
 ```bash
 export TRITON_NPU_BENCH_REPORT_BEST_CONFIG=1
 export TRITON_AUTOTUNE_REPORT_TIMING=1
-unset TRITON_NPU_BENCH_LOG_LEVEL  # Stage logs stay off.
+export TRITON_NPU_BENCH_LOG_LEVEL=off  # Override current NPU's brief default.
 
 TRITON_BENCH_METHOD=default python your_existing_case.py > default.log
 TRITON_BENCH_METHOD=npu_legacy python your_existing_case.py > legacy.log
@@ -180,7 +181,7 @@ python your_existing_case.py
 ```
 
 This is a policy check with potentially multiple attempts, separate from the
-single-attempt comparison above. The minimum score across measured attempts
+original-path comparison above. The minimum score across measured attempts
 remains the selection criterion regardless of quality; the winner report shows
 that score and its attempt's ordinary mean separately.
 Filtering and budget calibration share minimum event estimates. A new filtering

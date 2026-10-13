@@ -40,22 +40,22 @@ class ProfilerAcquisitionError(RuntimeError):
 
 @dataclass(frozen=True)
 class NpuBenchmarkOptions:
-    cache_mode: str | None = None
-    warmup: int | None = None
-    active: int | None = None
-    lower_quantile: float = 0.0
-    upper_quantile: float = 1.0
-    quality_check: bool = False
-    max_retries: int = 0
-    measure_budget_ms: float | None = None
-    calibration_runs: int = 10
-    filter_slow_configs: bool = False
-    slow_config_rounds: int = 2
-    slow_config_factor: float = 5.0
-    slow_config_recheck_delay_s: float = 0.5
-    log_level: str = "off"
-    report_best_config: bool = False
-    report_timing: bool = False
+    cache_mode: str | None = "hot"
+    warmup: int | None = 50
+    active: int | None = 250
+    lower_quantile: float = 0.25
+    upper_quantile: float = 0.75
+    quality_check: bool = True
+    max_retries: int = 5
+    measure_budget_ms: float | None = 10.0
+    calibration_runs: int = 50
+    filter_slow_configs: bool = True
+    slow_config_rounds: int = 5
+    slow_config_factor: float = 2.0
+    slow_config_recheck_delay_s: float = 0.2
+    log_level: str = "brief"
+    report_best_config: bool = True
+    report_timing: bool = True
 
     def effective_policy(self):
         enabled = {
@@ -71,7 +71,11 @@ class NpuBenchmarkOptions:
 
     @property
     def is_default(self):
-        return self.effective_policy() == NpuBenchmarkOptions().effective_policy()
+        """Whether measurement policies leave the original benchmark behavior intact."""
+        return (self.cache_mode is None and self.warmup is None and self.active is None and self.lower_quantile == 0
+                and self.upper_quantile == 1
+                and not (self.quality_check or self.max_retries or self.measure_budget_ms is not None
+                         or self.filter_slow_configs))
 
     def cache_key(self):
         thresholds = ()
@@ -82,7 +86,7 @@ class NpuBenchmarkOptions:
 
 
 def resolve_options():
-    """Read the NPU environment; unset fields inherit existing call arguments."""
+    """Resolve each NPU environment setting over its explicit default."""
     values = asdict(NpuBenchmarkOptions())
     positive = {"measure_budget_ms", "slow_config_factor"}
     for name, default in values.items():
@@ -99,6 +103,9 @@ def resolve_options():
                     raise ValueError(f"expected >= {COUNT_MINIMUMS[name]}")
             elif name in positive or isinstance(default, float):
                 value = float(value)
+                if name == "measure_budget_ms" and value == 0:
+                    values[name] = None
+                    continue
                 minimum = 1 if name == "slow_config_factor" else 0
                 if not math.isfinite(value) or value < minimum or (name in positive and value == 0):
                     raise ValueError("invalid finite range")

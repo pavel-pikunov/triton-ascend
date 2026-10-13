@@ -282,9 +282,9 @@ class AutoTilingTuner(Autotuner):
             use_cuda_graph,
             do_bench,
         )
+        self.user_defined_do_bench = do_bench is not None
         # Test-branch reports only; no new NPU measurement policies are resolved.
         npu_tuning.initialize(self)
-        self.user_defined_do_bench = do_bench is not None
         self.hints = reserved_hints
         self.config_hints = config_hints
         self.vv_parser_v2_mode = resolve_vv_parser_v2_mode(self.hints)

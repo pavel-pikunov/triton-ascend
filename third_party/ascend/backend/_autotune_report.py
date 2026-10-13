@@ -256,23 +256,23 @@ def _decision_record(function_name, config, number, measurement, selection):
     return record
 
 
-def resolve_flag(argument, name, environment):
+def resolve_flag(argument, name, environment, default=False):
     if argument is not None:
         if not isinstance(argument, bool):
             raise ValueError(f"{name} must be a boolean or None")
         return argument
-    value = os.getenv(environment, "0").strip().lower()
+    value = os.getenv(environment, str(int(default))).strip().lower()
     if value not in {"0", "1", "false", "true"}:
         raise ValueError(f"Invalid {environment}: {value!r}")
     return value in {"1", "true"}
 
 
-def resolve_report_best_config(argument=None):
-    return resolve_flag(argument, "report_best_config", REPORT_ENV)
+def resolve_report_best_config(argument=None, default=False):
+    return resolve_flag(argument, "report_best_config", REPORT_ENV, default)
 
 
-def resolve_report_timing(argument=None):
-    return resolve_flag(argument, "report_timing", TIMING_ENV)
+def resolve_report_timing(argument=None, default=False):
+    return resolve_flag(argument, "report_timing", TIMING_ENV, default)
 
 
 def report_safely(action):

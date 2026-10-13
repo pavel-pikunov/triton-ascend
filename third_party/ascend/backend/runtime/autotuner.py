@@ -282,8 +282,8 @@ class AutoTilingTuner(Autotuner):
             use_cuda_graph,
             do_bench,
         )
-        comparison.initialize(self)
         self.user_defined_do_bench = do_bench is not None
+        comparison.initialize(self)
         self.hints = reserved_hints
         self.config_hints = config_hints
         self.vv_parser_v2_mode = resolve_vv_parser_v2_mode(self.hints)
