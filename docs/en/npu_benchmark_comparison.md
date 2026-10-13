@@ -1,7 +1,7 @@
 # Three benchmark paths (test branch only)
 
 Branch: `AutotunerBenchCompare-3.2.2`. The current NPU measurement modules are
-copied from `AutotunerNpuPolicies-3.2.2-dev` at `bb4f3c54d`; the comparison branch
+kept identical to `AutotunerNpuPolicies-3.2.2-dev`; the comparison branch
 keeps its existing release base. The original default and legacy benchmark paths
 are pinned to `release/3.2.2-dev` commit
 `3595ed00385d8f533091b9bd50caf7bd7a7ccd24`. NPU measurement-policy environment
@@ -183,6 +183,10 @@ This is a policy check with potentially multiple attempts, separate from the
 single-attempt comparison above. The minimum score across measured attempts
 remains the selection criterion regardless of quality; the winner report shows
 that score and its attempt's ordinary mean separately.
+Filtering and budget calibration share minimum event estimates. A new filtering
+winner restarts suspect rounds against its lower threshold. A budget sets one
+common active count from the fastest retained event launch; quality retries keep
+that count even when only a subset of candidates is measured.
 
 ## Repeat autotuning and save per-config CSV statistics
 
