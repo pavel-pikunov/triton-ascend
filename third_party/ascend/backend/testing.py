@@ -44,7 +44,7 @@ def do_bench_npu(
 
 
 def _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name, *,
-                 _return_samples=False, _pre_hook_scope=None, _active_counts=None, _execution_state=None,
+                 _return_samples=False, _pre_hook_scope=None, _execution_state=None,
                  _capture_report=False, _quantiles=(0.0, 1.0)):
     import torch
     import torch_npu
@@ -104,9 +104,8 @@ def _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, targ
                 with_modules=False,
                 experimental_config=experimental_config,
         ):
-            for index, fn in enumerate(funcs):
-                total = warmup + (active if _active_counts is None else _active_counts[index])
-                for _ in builtins.range(total):
+            for fn in funcs:
+                for _ in builtins.range(warmup + active):
                     if clear_l2_cache and _pre_hook_scope is None:
                         buffer.sum()  # use buffer read to clear l2 cache
                         torch.npu.synchronize()
@@ -124,7 +123,6 @@ def _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, targ
             target_kernel_name=target_kernel_name,
             clear_l2_cache=clear_l2_cache,
             _return_samples=_return_samples,
-            _active_counts=_active_counts,
             _capture_report=_capture_report,
             _quantiles=_quantiles,
         )

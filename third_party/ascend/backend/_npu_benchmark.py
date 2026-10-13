@@ -78,7 +78,7 @@ class NpuBenchmarkOptions:
         if self.quality_check:
             from ._benchmark_quality import THRESHOLDS
             thresholds = tuple(sorted(THRESHOLDS.items()))
-        return ("npu-benchmark", 6, self.effective_policy(), thresholds)
+        return ("npu-benchmark", 7, self.effective_policy(), thresholds)
 
 
 def resolve_options():
@@ -228,13 +228,13 @@ def print_timing_report(function_name, started, durations):
 
 
 def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_name=None, clear_l2_cache=False,
-                         _return_samples=False, _active_counts=None, _capture_report=False, _quantiles=(0.0, 1.0)):
+                         _return_samples=False, _capture_report=False, _quantiles=(0.0, 1.0)):
     """
     Collect per-function measurements from one kernel_details.csv read.
 
-    Split rows in profiler execution order using cumulative launch counts. Skip
-    the first num_warmup rows of each function, then collect num_active rows or
-    its individual _active_counts value. Scores and means are in milliseconds;
+    Split rows in profiler execution order into equal num_warmup + num_active
+    blocks. Skip each function's warmup rows and collect its num_active rows.
+    Scores and means are in milliseconds;
     optional sample arrays retain the CSV's microsecond units.
 
     :param base_dir: the profiler output directory
@@ -243,7 +243,7 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
     :type funcs: List[Callable]
     :param num_warmup: warmup rows to skip for each function
     :type num_warmup: int
-    :param num_active: measured rows per function when _active_counts is None
+    :param num_active: shared measured-row count per function
     :type num_active: int
     :param target_kernel_name: one shared target name, or one name per function;
         None entries mean unknown names. Filter by names only when all are known.
@@ -253,8 +253,6 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
     :param _return_samples: include validated, untrimmed start times and durations
         for quality evaluation; missing CSV then raises instead of returning None
     :type _return_samples: bool
-    :param _active_counts: individual measured-row counts, one per function
-    :type _active_counts: Optional[List[int]]
     :param _capture_report: aggregate measured CSV columns for the winner report
     :type _capture_report: bool
     :param _quantiles: lower and upper boundaries of the sorted durations averaged
@@ -291,27 +289,25 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
     if all(name is not None for name in names):
         filter_df = filter_df[filter_df["Name"].isin(names)]
 
-    counts = [num_active] * num_funcs if _active_counts is None else list(_active_counts)
-    if len(counts) != num_funcs or len(names) != num_funcs:
-        raise ValueError("Provide one kernel name and active count per function")
-    if num_warmup < 0 or any(count < 1 for count in counts):
-        raise ValueError("Warmup must be nonnegative and active counts positive")
-    expected_rows = sum(num_warmup + count for count in counts)
+    if len(names) != num_funcs:
+        raise ValueError("Provide one kernel name per function")
+    if num_warmup < 0 or num_active < 1:
+        raise ValueError("Warmup must be nonnegative and active positive")
+    expected_rows = num_funcs * (num_warmup + num_active)
     if target_kernel_name is not None and len(filter_df) != expected_rows:
         raise ProfilerResultMismatchError(target_kernel_name, expected_rows, len(filter_df))
 
     results = []
-    offset = 0
-    for index, count in enumerate(counts):
-        measured = filter_df.iloc[offset + num_warmup:offset + num_warmup + count]
-        offset += num_warmup + count
+    for index in range(num_funcs):
+        offset = index * (num_warmup + num_active) + num_warmup
+        measured = filter_df.iloc[offset:offset + num_active]
         durations = measured["Duration(us)"].to_numpy(dtype=float)
-        if len(durations) != count:
+        if len(durations) != num_active:
             raise ProfilerAcquisitionError(f"Incomplete profiler rows for config {index}")
         if names[index] is not None and not measured["Name"].eq(names[index]).all():
             raise ProfilerAcquisitionError(f"Unexpected profiler target order for config {index}")
         ranked = np.sort(durations) if _quantiles != (0.0, 1.0) else durations
-        lower, upper = int(count * _quantiles[0]), int(count * _quantiles[1])
+        lower, upper = int(num_active * _quantiles[0]), int(num_active * _quantiles[1])
         cost = float(np.mean(ranked[lower:max(lower + 1, upper)])) / 1000
         samples = None
         if _return_samples:
@@ -322,35 +318,43 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
             samples = (times, durations)
         metrics = report_safely(lambda: aggregate_profile_rows(measured)) if _capture_report else {}
         results.append(
-            NpuMeasurementReport(metrics, count, num_warmup, count, "cold" if clear_l2_cache else "hot",
+            NpuMeasurementReport(metrics, num_active, num_warmup, num_active, "cold" if clear_l2_cache else "hot",
                                  float(np.mean(durations)) / 1000, cost, samples=samples))
     return results
 
 
 def filter_slow_configs(funcs, options, clear_l2_cache, pre_hook_scope):
-    """Benchmark everyone once, then recheck only persistent suspects."""
+    """Retain minima; restart suspect rounds when another candidate becomes fastest."""
     indices = list(range(len(funcs)))
     if len(funcs) < 2:
         return indices, {}
     log_stage(options.log_level, "Slow filter", f"Round 1/{options.slow_config_rounds}: {len(funcs)} candidates")
     with event_timer(clear_l2_cache, pre_hook_scope) as measure:
         durations = {index: measure(fn, options.calibration_runs) for index, fn in enumerate(funcs)}
-        threshold = min(durations.values()) * options.slow_config_factor
-        suspects = [index for index in indices if durations[index] > threshold]
-        log_stage(options.log_level, "Slow filter", f"Further rounds needed: {len(suspects)}/{len(funcs)} candidates")
-        for round_index in range(1, options.slow_config_rounds):
-            if not suspects:
+        winner = min(indices, key=durations.get)
+        round_index = 1
+        while True:
+            threshold = durations[winner] * options.slow_config_factor
+            suspects = [index for index in indices if durations[index] > threshold]
+            log_stage(options.log_level, "Slow filter",
+                      f"Further rounds needed: {len(suspects)}/{len(funcs)} candidates")
+            if not suspects or round_index >= options.slow_config_rounds:
                 break
             if options.slow_config_recheck_delay_s:
                 time.sleep(options.slow_config_recheck_delay_s)
             log_stage(options.log_level, "Slow filter", f"Round {round_index + 1}/{options.slow_config_rounds}: "
                       f"{len(suspects)} suspects")
+            previous_winner = winner
             for index in suspects:
-                durations[index] = measure(funcs[index], options.calibration_runs)
-            suspects = [index for index in suspects if durations[index] > threshold]
+                durations[index] = min(durations[index], measure(funcs[index], options.calibration_runs))
+                if durations[index] < durations[winner]:
+                    winner = index
+            round_index = 1 if winner != previous_winner else round_index + 1
+            if winner != previous_winner:
+                log_stage(options.log_level, "Slow filter", f"New fastest config: {winner}; restarting rounds")
     kept = [index for index in indices if index not in suspects]
     log_stage(options.log_level, "Slow filter", f"{len(kept)}/{len(funcs)} candidates retained")
-    log_stage(options.log_level, "Slow filter settings", f"event_mean_ms={durations}, threshold_ms={threshold}",
+    log_stage(options.log_level, "Slow filter settings", f"event_min_ms={durations}, threshold_ms={threshold}",
               detailed=True)
     return kept, durations
 
@@ -376,15 +380,15 @@ def event_timer(clear_l2_cache, pre_hook_scope):
     def measure(fn, count):
         fn()
         torch.npu.synchronize()
-        total_ms = 0.0
+        minimum_ms = float("inf")
         for _ in range(count):
             if not scoped:
                 prepare()
             fn()
             end.record()
             torch.npu.synchronize()
-            total_ms += start.elapsed_time(end)
-        return total_ms / count
+            minimum_ms = min(minimum_ms, start.elapsed_time(end))
+        return minimum_ms
 
     try:
         with pre_hook_scope(prepare) if scoped else nullcontext():
@@ -393,10 +397,9 @@ def event_timer(clear_l2_cache, pre_hook_scope):
         buffer = None
 
 
-def calibrate_counts(funcs, indices, durations, options, active, clear_l2_cache, pre_hook_scope):
-    counts = [active] * len(funcs)
+def calibrate_active(funcs, indices, durations, options, active, clear_l2_cache, pre_hook_scope):
     if options.measure_budget_ms is None:
-        return counts
+        return active
     missing = [index for index in indices if index not in durations]
     log_stage(
         options.log_level, "Calibration", f"Reusing slow-filter events: {len(indices) - len(missing)}/"
@@ -409,13 +412,13 @@ def calibrate_counts(funcs, indices, durations, options, active, clear_l2_cache,
         duration = durations[index]
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError(f"Invalid NPU event calibration time for config {index}: {duration}")
-        required = options.measure_budget_ms / duration
-        if not math.isfinite(required):
-            raise ValueError("Unrepresentable NPU benchmark sample count")
-        counts[index] = max(active, math.ceil(required))
+    required = options.measure_budget_ms / min(durations[index] for index in indices)
+    if not math.isfinite(required):
+        raise ValueError("Unrepresentable NPU benchmark sample count")
+    active = max(active, math.ceil(required))
     log_stage(options.log_level, "Calibration settings", f"budget_ms={options.measure_budget_ms}, "
-              f"event_mean_ms={durations}, active_per_config={counts}", detailed=True)
-    return counts
+              f"event_min_ms={durations}, active={active}", detailed=True)
+    return active
 
 
 @contextmanager
@@ -489,17 +492,16 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
         if options.filter_slow_configs:
             indices, durations = filter_slow_configs(funcs, options, clear_l2_cache, pre_hook_scope)
     with timing_stage(timings, "calibration"):
-        if options.measure_budget_ms is None:
-            counts = [active] * len(funcs)
-        else:
-            counts = calibrate_counts(funcs, indices, durations, options, active, clear_l2_cache, pre_hook_scope)
-    measurements = _profile_with_retries(profile, funcs, names, indices, counts, options, prof_dir, keep_res,
-                                         pre_hook_scope, capture_report=report_sink is not None, timings=timings)
+        options = replace(
+            options, active=calibrate_active(funcs, indices, durations, options, active, clear_l2_cache,
+                                             pre_hook_scope))
+    measurements = _profile_with_retries(profile, funcs, names, indices, options, prof_dir, keep_res, pre_hook_scope,
+                                         capture_report=report_sink is not None, timings=timings)
     return benchmark_result(measurements, report_sink)
 
 
-def _profile_with_retries(profile, funcs, names, indices, counts, options, prof_dir, keep_res, pre_hook_scope,
-                          capture_report, timings):
+def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, keep_res, pre_hook_scope, capture_report,
+                          timings):
     if options.quality_check:
         from ._benchmark_quality import evaluate_quality
     best_reports = [None] * len(funcs)
@@ -512,11 +514,10 @@ def _profile_with_retries(profile, funcs, names, indices, counts, options, prof_
         directory = tempfile.mkdtemp(prefix="npu_bench_", dir=root)
         with result_scope(lambda: shutil.rmtree(directory) if not keep_res else None):
             try:
-                return profile([funcs[index]
-                                for index in selected], options.warmup, options.active, options.cache_mode == "cold",
-                               directory, True, [names[index] for index in selected], _return_samples=True,
-                               _pre_hook_scope=pre_hook_scope, _active_counts=[counts[index] for index in selected],
-                               _execution_state=execution_state, _capture_report=capture_report)
+                return profile([funcs[index] for index in selected], options.warmup, options.active,
+                               options.cache_mode == "cold", directory, True, [names[index] for index in selected],
+                               _return_samples=True, _pre_hook_scope=pre_hook_scope, _execution_state=execution_state,
+                               _capture_report=capture_report)
             except (RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 if execution_state["failed"]:
                     raise
@@ -528,9 +529,8 @@ def _profile_with_retries(profile, funcs, names, indices, counts, options, prof_
         for attempt in range(options.max_retries + 1):
             selected = pending
             log_stage(options.log_level, "Profiler measurement", f"Attempt {attempt + 1}: {len(selected)} candidates")
-            log_stage(
-                options.log_level, "Measurement settings", f"configs={selected}, warmup={options.warmup}, "
-                f"active_per_config={[counts[index] for index in selected]}", detailed=True)
+            log_stage(options.log_level, "Measurement settings", f"configs={selected}, warmup={options.warmup}, "
+                      f"active={options.active}", detailed=True)
             try:
                 measurements = collect(selected)
             except ProfilerAcquisitionError as exc:
@@ -546,7 +546,7 @@ def _profile_with_retries(profile, funcs, names, indices, counts, options, prof_
                                                   quality_checked=options.quality_check, quality_metrics=metrics)
                 log_stage(
                     options.log_level, "Config measurement", f"config={index}, attempt={attempt + 1}, "
-                    f"active={counts[index]}, score_ms={measurement.score_ms:.8g}, mean_ms={measurement.mean_ms:.8g}, "
+                    f"active={options.active}, score_ms={measurement.score_ms:.8g}, mean_ms={measurement.mean_ms:.8g}, "
                     f"metrics={metrics}, failures={failures}", detailed=True)
                 if failures:
                     pending.append(index)

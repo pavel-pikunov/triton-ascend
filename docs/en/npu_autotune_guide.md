@@ -52,15 +52,19 @@ Standalone profiling retains its existing `warmup`, `active`, and
 ## Slow filtering and calibration
 
 The first filtering round benchmarks every candidate through NPU events, returning
-the mean event duration. Each estimate uses one preliminary call followed by
+the minimum event duration. Each estimate uses one preliminary call followed by
 `CALIBRATION_RUNS` measured launches. All filtering rounds, budget calibration and
 main profiler measurements use the same selected `CACHE_MODE`. Cold event estimates
 evict L2 before recording each measured launch; hot estimates do not explicitly evict it.
-The threshold is the best first-round duration multiplied by `SLOW_CONFIG_FACTOR`.
-Subsequent rounds benchmark only candidates still above that threshold. A candidate
-that recovers is retained and is not measured in later filtering rounds. Candidates
-still slow after the configured number of rounds are excluded. One round permits
-immediate filtering; the default two rounds provide one recheck.
+Each candidate retains its lowest event duration across rounds. The threshold is
+the current winner's retained minimum multiplied by `SLOW_CONFIG_FACTOR`.
+Subsequent rounds benchmark only candidates above that threshold, excluding the
+current winner. If another candidate obtains a strictly lower minimum, it becomes
+the winner: all original candidates are reclassified and the round counter restarts
+at 1. Ties preserve the current winner. Previously retained candidates can become
+suspects under the new threshold. Candidates still slow after the configured number
+of rounds are excluded. One round permits immediate filtering; the default two
+rounds provide one recheck per winner.
 
 There is one pause before each needed recheck round. No pause or recheck occurs
 without suspects, with fewer than two candidates, or with one configured round.
@@ -70,20 +74,22 @@ The release CV time-limit pruning also retains its original implementation; expl
 `ACTIVE` or `MEASURE_BUDGET_MS` bypasses that separate pruning and count calculation.
 
 A measurement budget sets
-`active_i = max(active, ceil(measure_budget_ms / estimated_duration_i_ms))`.
-Surviving candidates reuse their latest slow-filter event means as estimates.
+one shared `active = max(active, ceil(measure_budget_ms / minimum_event_duration_ms))`
+for all surviving candidates, using the fastest retained event launch.
+Calibration reuses slow-filter minima.
 When those results are unavailable, one preliminary call and `CALIBRATION_RUNS`
 event measurements estimate each candidate under the requested profiler cache
 policy. Calibration creates no profiler session or CSV. Event estimates determine
-counts only; final ranking uses profiler kernel durations. The budget is an estimate,
+the shared count only; final ranking uses profiler kernel durations. Without a
+budget, the original active count is retained. The budget is an estimate,
 not a guarantee of accumulated kernel time or a wall-clock timeout.
 
 ## Profiler attempts and selection
 
-All current candidates share one profiler session per attempt, including when
-their active counts differ. The original pandas collector reads the common CSV
+All current candidates share one profiler session and one active count per attempt.
+The original pandas collector reads the common CSV
 once, filters target kernels and cache operations, and splits candidates by
-cumulative counts. Each candidate's warmup rows are excluded. Identical target
+equal `warmup + active` blocks. Each candidate's warmup rows are excluded. Identical target
 kernel names are supported.
 
 The selection score defaults to the arithmetic mean of all measured durations.
@@ -94,9 +100,10 @@ These settings select a range to average; `do_bench(quantiles=...)` instead retu
 quantile values. Trimming affects selection only, participates
 in the selection-cache key, and does not remove samples from quality checks.
 Quality checks cover tail contamination, gaps, multimodality, drift, and change
-points using the existing algorithms and thresholds in `_benchmark_quality.py`.
+points using the existing algorithms in `_benchmark_quality.py`. Their thresholds
+are 0.030, 0.2, 0.027, 0.275 and 0.275, respectively.
 Only failing candidates receive quality retries. Failed acquisition of the shared
-CSV retries the current batch. Counts are retained across retries without recalibration.
+CSV retries the current batch. The shared count is retained across retries without recalibration.
 Kernel execution and synchronization failures propagate without retries.
 
 Each candidate retains its minimum measured score regardless of quality. A faster

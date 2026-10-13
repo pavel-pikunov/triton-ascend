@@ -7,11 +7,11 @@ import numpy as np
 from scipy.stats import rankdata
 
 THRESHOLDS = {
-    "mean_trimmed_relative_deviation": 0.04,
-    "central_gap_ratio": 0.25,
-    "dip_statistic": 0.035,
-    "normalized_drift": 0.35,
-    "normalized_change_point": 0.35,
+    "mean_trimmed_relative_deviation": 0.030,
+    "central_gap_ratio": 0.2,
+    "dip_statistic": 0.027,
+    "normalized_drift": 0.275,
+    "normalized_change_point": 0.275,
 }
 
 
