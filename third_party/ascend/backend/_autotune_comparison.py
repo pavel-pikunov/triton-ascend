@@ -5,11 +5,15 @@ import os
 import time
 
 from . import _autotune_report as report_module
+from . import _autotune_npu as npu_tuning
 
 
 def initialize(tuner, options=None, report=None, report_timing=None):
-    tuner.report_best_config = report_module.resolve_report_best_config(report)
-    tuner.report_timing = report_module.resolve_report_timing(report_timing)
+    defaults = npu_tuning.get_options(tuner)
+    tuner.report_best_config = report_module.resolve_report_best_config(
+        report, defaults.report_best_config if defaults else False)
+    tuner.report_timing = report_module.resolve_report_timing(report_timing,
+                                                              defaults.report_timing if defaults else False)
     tuner._autotune_timing = None
     tuner._npu_timing = None
     tuner._npu_options = None
