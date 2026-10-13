@@ -2,8 +2,8 @@
 
 Set `TRITON_BENCH_METHOD=npu` before running Python to configure the built-in
 NPU profiler used by `autotune` and `max_autotune`. All new controls use environment
-variables; the decorator signatures are unchanged. Unset fields inherit existing
-benchmark settings. The ordinary and custom benchmarkers ignore these controls.
+variables; the decorator signatures are unchanged. Unset fields use the explicit
+defaults below. The ordinary and custom benchmarkers ignore these controls.
 Standalone `do_bench_npu` also reads the NPU measurement environment.
 
 ```bash
@@ -24,30 +24,27 @@ export TRITON_PRINT_AUTOTUNING=0
 
 | Environment variable | Default / meaning |
 | --- | --- |
-| `TRITON_NPU_BENCH_CACHE_MODE` | Inherit the caller's cache policy. `cold` evicts L2; `hot` does not explicitly evict it between profiler launches. |
-| `TRITON_NPU_BENCH_WARMUP` | Inherit the warmup launch count; integer >= 0. |
-| `TRITON_NPU_BENCH_ACTIVE` | Inherit the active launch count; integer >= 1, or >= 2 with quality checks. |
-| `TRITON_NPU_BENCH_LOWER_QUANTILE` | `0`; lower quantile boundary of the measured durations averaged for selection. |
-| `TRITON_NPU_BENCH_UPPER_QUANTILE` | `1`; upper quantile boundary of the measured durations averaged for selection. |
-| `TRITON_NPU_BENCH_QUALITY_CHECK` | `0`; evaluate the predefined sample-quality metrics. |
-| `TRITON_NPU_BENCH_MAX_RETRIES` | `0`; additional attempts for failing quality checks or unusable profiler data. |
-| `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | Unset; estimated accumulated device-time budget per candidate, finite and positive, in milliseconds. |
-| `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; measured launches per short event estimate, used by filtering and budget calibration; integer >= 2. |
-| `TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS` | `0`; enable preliminary filtering through NPU events under the selected cache policy. |
-| `TRITON_NPU_BENCH_SLOW_CONFIG_ROUNDS` | `2`; total filtering rounds, including the first round; integer >= 1. |
-| `TRITON_NPU_BENCH_SLOW_CONFIG_FACTOR` | `5.0`; recheck candidates above this multiple of the best first-round time; finite and >= 1. |
-| `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_DELAY_S` | `0.5`; finite, nonnegative pause before each needed subsequent round. `0` disables the pause. |
+| `TRITON_NPU_BENCH_CACHE_MODE` | `hot`; `cold` evicts L2; `hot` does not explicitly evict it between profiler launches. |
+| `TRITON_NPU_BENCH_WARMUP` | `50`; warmup launches per candidate; integer >= 0. |
+| `TRITON_NPU_BENCH_ACTIVE` | `250`; minimum measured launches per candidate; integer >= 1, or >= 2 with quality checks. |
+| `TRITON_NPU_BENCH_LOWER_QUANTILE` | `0.25`; lower quantile boundary of the measured durations averaged for selection. |
+| `TRITON_NPU_BENCH_UPPER_QUANTILE` | `0.75`; upper quantile boundary of the measured durations averaged for selection. |
+| `TRITON_NPU_BENCH_QUALITY_CHECK` | `1`; evaluate the predefined sample-quality metrics. |
+| `TRITON_NPU_BENCH_MAX_RETRIES` | `5`; additional attempts for failing quality checks or unusable profiler data; at most six attempts in total. |
+| `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | `10`; estimated accumulated device-time budget per candidate, in milliseconds. `0` disables it; other values must be finite and positive. |
+| `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `50`; measured launches per short event estimate, used by filtering and budget calibration; integer >= 2. |
+| `TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS` | `1`; enable preliminary filtering through NPU events under the selected cache policy. |
+| `TRITON_NPU_BENCH_SLOW_CONFIG_ROUNDS` | `5`; total filtering rounds per winner, including the first; integer >= 1. |
+| `TRITON_NPU_BENCH_SLOW_CONFIG_FACTOR` | `2`; recheck candidates above this multiple of the current winner's retained minimum; finite and >= 1. |
+| `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_DELAY_S` | `0.2`; finite, nonnegative pause before each needed subsequent round. `0` disables the pause. |
 
 Boolean values accept `0`, `1`, `false`, and `true`. Settings do not enable one
 another: quality checks do not automatically enable retries, filtering, or a budget.
 
-Without explicit counts, NPU autotuning normally retains `warmup=5`, `active=30`,
-and cold cache. Applicable CV cases retain their existing count calculation and
-200-second estimated measurement cap. Explicit `ACTIVE` or `MEASURE_BUDGET_MS`
-bypasses that calculation and cap; unspecified counts then use 5 and 30.
-Explicit `WARMUP` alone preserves CV count calculation and enters its estimate.
-Standalone profiling retains its existing `warmup`, `active`, and
-`clear_l2_cache=False` argument defaults. Hot mode cannot guarantee L2 residency.
+The new NPU defaults override the call's warmup, active and cache arguments,
+including standalone `do_bench_npu`, without changing public signatures.
+Fixed active counts and the budget bypass CV count calculation and its
+200-second estimated measurement cap. Hot mode cannot guarantee L2 residency.
 
 ## Slow filtering and calibration
 
@@ -63,8 +60,8 @@ current winner. If another candidate obtains a strictly lower minimum, it become
 the winner: all original candidates are reclassified and the round counter restarts
 at 1. Ties preserve the current winner. Previously retained candidates can become
 suspects under the new threshold. Candidates still slow after the configured number
-of rounds are excluded. One round permits immediate filtering; the default two
-rounds provide one recheck per winner.
+of rounds are excluded. One round permits immediate filtering; the default five
+rounds provide four rechecks per winner.
 
 There is one pause before each needed recheck round. No pause or recheck occurs
 without suspects, with fewer than two candidates, or with one configured round.
@@ -92,8 +89,8 @@ once, filters target kernels and cache operations, and splits candidates by
 equal `warmup + active` blocks. Each candidate's warmup rows are excluded. Identical target
 kernel names are supported.
 
-The selection score defaults to the arithmetic mean of all measured durations.
-Set `LOWER_QUANTILE=0.25` and `UPPER_QUANTILE=0.75` to average the middle durations.
+The selection score defaults to the mean of the central 50% of measured durations.
+Set `LOWER_QUANTILE=0` and `UPPER_QUANTILE=1` to average all measured durations.
 The finite boundaries must satisfy `0 <= LOWER_QUANTILE < UPPER_QUANTILE <= 1`.
 Sorted sample indices are rounded down, retaining at least one measurement.
 These settings select a range to average; `do_bench(quantiles=...)` instead returns
@@ -114,8 +111,8 @@ winner or raise a warning exception. No ANSI coloring or global warning handler 
 
 Existing unavailable-data behavior is retained: a simple missing-CSV result is
 `inf`; the retry path raises when no usable measurements were acquired. The
-unconfigured tuner retains its existing event fallback on target-row mismatch;
-explicit measurement policies do not fall back to different measurement conditions.
+new NPU defaults are active measurement policies: single surviving candidates
+still use profiling, and row mismatches do not silently fall back to event timing.
 
 Effective measurement policies participate in the selection-cache key. Logging
 and reports do not. `CALIBRATION_RUNS` is inactive unless a budget or filtering is
@@ -126,9 +123,9 @@ delay is inactive with one filtering round. No additional warnings are emitted f
 
 | Environment variable | Default / output |
 | --- | --- |
-| `TRITON_NPU_BENCH_LOG_LEVEL` | `off`; `brief` prints stages, candidate counts, filtering rounds, profiler attempts, and retry counts. `detailed` also prints settings, per-candidate scores/means, and quality diagnostics. |
-| `TRITON_NPU_BENCH_REPORT_BEST_CONFIG` | `0`; print the original 1-based candidate number, all configuration parameters, `ubtune_cfg`, selected-attempt score/mean, counts, quality results, and profiler aggregates. |
-| `TRITON_AUTOTUNE_REPORT_TIMING` | `0`; print one final NPU autotune time breakdown. |
+| `TRITON_NPU_BENCH_LOG_LEVEL` | `brief`; prints stages, candidate counts, filtering rounds, profiler attempts, and retry counts. `off` disables these logs; `detailed` adds settings, per-candidate scores/means, and quality diagnostics. |
+| `TRITON_NPU_BENCH_REPORT_BEST_CONFIG` | `1`; print the original 1-based candidate number, all configuration parameters, `ubtune_cfg`, selected-attempt score/mean, counts, quality results, and profiler aggregates. `0` disables it. |
+| `TRITON_AUTOTUNE_REPORT_TIMING` | `1`; print one final NPU autotune time breakdown; `0` disables it. |
 
 These controls are independent of each other and of `TRITON_PRINT_AUTOTUNING`,
 which retains its existing output. They are supported only for the built-in NPU
