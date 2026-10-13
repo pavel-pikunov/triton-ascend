@@ -50,6 +50,13 @@ def do_bench_npu(
     import torch
     import torch_npu
 
+    cache_mode = os.getenv("TRITON_NPU_BENCH_CACHE_MODE")
+    if cache_mode is not None:
+        cache_mode = cache_mode.strip().lower()
+        if cache_mode not in ("hot", "cold"):
+            raise ValueError("TRITON_NPU_BENCH_CACHE_MODE must be 'hot' or 'cold'")
+        clear_l2_cache = cache_mode == "cold"
+
     if not isinstance(funcs, list):
         funcs = [funcs]
 

@@ -5,7 +5,8 @@ copied from `AutotunerNpuPolicies-3.2.2-dev` at `bb4f3c54d`; the comparison bran
 keeps its existing release base. The original default and legacy benchmark paths
 are pinned to `release/3.2.2-dev` commit
 `3595ed00385d8f533091b9bd50caf7bd7a7ccd24`. NPU measurement-policy environment
-variables apply only to the current `npu` path.
+variables apply only to the current `npu` path, except for the shared cache-mode
+override described below.
 
 | `TRITON_BENCH_METHOD` | Tuner and measurement path | Selection score |
 | --- | --- | --- |
@@ -25,8 +26,8 @@ switching the environment on an already-created tuner is unsupported.
 `runtime/_legacy_autotuner.py` copies dev `runtime/autotuner.py`, with the
 mode name, its two imports of the copied testing module, and optional final
 diagnostics changed. Trailing whitespace on one original line was removed.
-`_legacy_testing.py` is an exact copy of dev `testing.py`.
-The standard `python/triton/testing.py` is also restored exactly from dev.
+`_legacy_testing.py` copies dev `testing.py`, adding only the cache-mode override.
+The standard `python/triton/testing.py` also adds only that override to dev.
 Shared parsers, generators, UBTuner and compiler are unchanged by this restoration.
 
 The original common profiler session, CV pruning/count calculation, warmup,
@@ -48,16 +49,21 @@ benchmarker, and inspect warnings.
 
 ## Original measurement settings
 
-The original paths ignore every new NPU measurement-policy environment variable,
-including `TRITON_NPU_BENCH_CACHE_MODE` and `TRITON_NPU_BENCH_ACTIVE`.
-Only the current `npu` path accepts these controls.
+`TRITON_NPU_BENCH_CACHE_MODE=hot|cold` is shared by all three paths on Ascend.
+Unset preserves each path's original cache preparation. Hot skips intentional
+L2 eviction in estimation and measurement; cold uses the original eviction
+operations and hook order of each path. Hot does not guarantee cache residency.
+Other backends and custom benchmarkers are not overridden.
+
+The original paths ignore all other new measurement-policy environment variables,
+including `TRITON_NPU_BENCH_ACTIVE`. Launch counts remain native to each path.
 
 Default events retain the original preliminary call, five-call estimate,
 time-based warmup/repeat calculation and L2 clearing. The ordinary defaults
 are `warmup=25` ms and `rep=100` ms; these are time targets, not launch counts.
-Legacy profiling uses cold cache and normally `warmup=5`, `active=30`; cube/mix
+Legacy profiling defaults to cold cache and normally `warmup=5`, `active=30`; cube/mix
 CV cases retain the original count calculation and time-limit pruning.
-There is no new environment override for their cache state or launch counts.
+The shared cache mode is the only added measurement override for these paths.
 
 The original arguments and custom benchmarker API remain available. Winner/timing
 reports, repeated autotune decisions and CSV recording observe these paths and
@@ -85,8 +91,9 @@ TRITON_BENCH_METHOD=npu python your_existing_case.py
 ```
 
 Here quality checks, retries, measurement budget, slow filter and new logs/reports
-are all off by default. Each original path uses its native measurement count
-and cache preparation. New NPU settings do not alter the other two paths.
+are all off by default. Each original path uses its native measurement count.
+To compare all three with hot cache, set `TRITON_NPU_BENCH_CACHE_MODE=hot` before
+the three commands. Other new NPU settings do not alter the original two paths.
 The current NPU path bypasses CV time-limit pruning with explicit `ACTIVE`;
 legacy and default preserve CV pruning. Use a case where the candidate set stays
 the same, or record the actual surviving configurations when interpreting results.
@@ -286,8 +293,9 @@ if tuning fails before all requested passes finish.
 ## Real-device smoke
 
 The smoke file covers both decorators and all three benchmark routes. NPU cache
-and count controls are deliberately set for every case: only current NPU uses
-them; legacy retains cold cache, five warmup rows and 30 measured rows.
+and count controls are deliberately set for every case: all paths use hot cache,
+but only current NPU uses the count override; legacy retains five warmup rows
+and 30 measured rows.
 Each case makes three decisions, verifies kernel output,
 stable candidate order, CSV win counts and silent cached calls:
 

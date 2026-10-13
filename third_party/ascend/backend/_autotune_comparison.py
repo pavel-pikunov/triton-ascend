@@ -1,6 +1,7 @@
 """Test-branch diagnostics and repeated decisions shared by three benchmark paths."""
 
 import functools
+import os
 import time
 
 from . import _autotune_report as report_module
@@ -79,8 +80,9 @@ def legacy_profile_scores(run_fns, costs, report_sink, warmup, active):
         return
 
     def capture():
+        cache_mode = os.getenv("TRITON_NPU_BENCH_CACHE_MODE", "cold").strip().lower()
         report_sink({
-            config: report_module.ScoreReport(cost, False, "npu_legacy", warmup, active, "cold")
+            config: report_module.ScoreReport(cost, False, "npu_legacy", warmup, active, cache_mode)
             for config, cost in zip(run_fns, costs)
         })
 
