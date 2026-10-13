@@ -229,7 +229,46 @@ def print_timing_report(function_name, started, durations):
 
 def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_name=None, clear_l2_cache=False,
                          _return_samples=False, _active_counts=None, _capture_report=False, _quantiles=(0.0, 1.0)):
-    """Read one batch into measurements, optionally including validated samples and aggregates."""
+    """
+    Collect per-function measurements from one kernel_details.csv read.
+
+    Split rows in profiler execution order using cumulative launch counts. Skip
+    the first num_warmup rows of each function, then collect num_active rows or
+    its individual _active_counts value. Scores and means are in milliseconds;
+    optional sample arrays retain the CSV's microsecond units.
+
+    :param base_dir: the profiler output directory
+    :type base_dir: str
+    :param funcs: functions in profiler execution order
+    :type funcs: List[Callable]
+    :param num_warmup: warmup rows to skip for each function
+    :type num_warmup: int
+    :param num_active: measured rows per function when _active_counts is None
+    :type num_active: int
+    :param target_kernel_name: one shared target name, or one name per function;
+        None entries mean unknown names. Filter by names only when all are known.
+    :type target_kernel_name: Optional[Union[str, List[Optional[str]]]]
+    :param clear_l2_cache: exclude ReduceSum rows when L2 eviction is enabled
+    :type clear_l2_cache: bool
+    :param _return_samples: include validated, untrimmed start times and durations
+        for quality evaluation; missing CSV then raises instead of returning None
+    :type _return_samples: bool
+    :param _active_counts: individual measured-row counts, one per function
+    :type _active_counts: Optional[List[int]]
+    :param _capture_report: aggregate measured CSV columns for the winner report
+    :type _capture_report: bool
+    :param _quantiles: lower and upper boundaries of the sorted durations averaged
+        for scoring; (0, 1) averages all samples. Indices are rounded down,
+        retaining at least one sample. Quality samples are not trimmed.
+    :type _quantiles: Tuple[float, float]
+    :return: one measurement record per function, or None entries if CSV is missing
+        and _return_samples is False; benchmark_result converts None to inf
+    :rtype: List[Optional[NpuMeasurementReport]]
+    :raises ValueError: invalid counts or number of target names
+    :raises ProfilerResultMismatchError: filtered target-row count does not match
+    :raises ProfilerAcquisitionError: incomplete rows, unexpected target order,
+        invalid requested samples, or missing CSV when _return_samples is True
+    """
     import pandas as pd
 
     kernel_details_file = None
@@ -249,11 +288,8 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
     filter_df = df[filter_cond]
     names = ([target_kernel_name] * num_funcs
              if target_kernel_name is None or isinstance(target_kernel_name, str) else list(target_kernel_name))
-    if target_kernel_name is not None:
-        if isinstance(target_kernel_name, str):
-            filter_df = filter_df[filter_df["Name"] == target_kernel_name]
-        elif all(name is not None for name in names):
-            filter_df = filter_df[filter_df["Name"].isin(names)]
+    if all(name is not None for name in names):
+        filter_df = filter_df[filter_df["Name"].isin(names)]
 
     counts = [num_active] * num_funcs if _active_counts is None else list(_active_counts)
     if len(counts) != num_funcs or len(names) != num_funcs:
