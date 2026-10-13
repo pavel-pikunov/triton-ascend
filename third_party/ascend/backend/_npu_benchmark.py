@@ -11,6 +11,7 @@ import tempfile
 import time
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from statistics import fmean
 
@@ -42,6 +43,8 @@ class NpuBenchmarkOptions:
     cache_mode: str | None = None
     warmup: int | None = None
     active: int | None = None
+    lower_quantile: float = 0.0
+    upper_quantile: float = 1.0
     quality_check: bool = False
     max_retries: int = 0
     measure_budget_ms: float | None = None
@@ -75,7 +78,7 @@ class NpuBenchmarkOptions:
         if self.quality_check:
             from ._benchmark_quality import THRESHOLDS
             thresholds = tuple(sorted(THRESHOLDS.items()))
-        return ("npu-benchmark", 5, self.effective_policy(), thresholds)
+        return ("npu-benchmark", 6, self.effective_policy(), thresholds)
 
 
 def resolve_options():
@@ -94,7 +97,7 @@ def resolve_options():
                 value = int(value)
                 if value < COUNT_MINIMUMS[name]:
                     raise ValueError(f"expected >= {COUNT_MINIMUMS[name]}")
-            elif name in positive or name == "slow_config_recheck_delay_s":
+            elif name in positive or isinstance(default, float):
                 value = float(value)
                 minimum = 1 if name == "slow_config_factor" else 0
                 if not math.isfinite(value) or value < minimum or (name in positive and value == 0):
@@ -107,6 +110,8 @@ def resolve_options():
         except (ValueError, KeyError) as exc:
             raise ValueError(f"Invalid {environment}: {value!r}") from exc
         values[name] = value
+    if not 0 <= values["lower_quantile"] < values["upper_quantile"] <= 1:
+        raise ValueError("TRITON_NPU_BENCH quantiles must satisfy 0 <= LOWER_QUANTILE < UPPER_QUANTILE <= 1")
     if values["quality_check"] and values["active"] is not None and values["active"] < 2:
         raise ValueError("quality_check requires active >= 2")
     return NpuBenchmarkOptions(**values)
@@ -195,7 +200,7 @@ def print_best_config_report(function_name, configs, config, measurement):
         lines.append("NPU measurements unavailable for this selection; no extra benchmarking was run.")
     else:
         lines.extend([
-            f"Central 50% score: {measurement.score_ms * 1000:.12g} us ({measurement.score_ms:.12g} ms)",
+            f"Selection score: {measurement.score_ms * 1000:.12g} us ({measurement.score_ms:.12g} ms)",
             f"Mean duration: {measurement.mean_ms * 1000:.12g} us ({measurement.mean_ms:.12g} ms)",
             f"cache={measurement.cache_mode}, warmup={measurement.warmup}, active={measurement.active}, "
             f"selected attempt={measurement.attempt}"
@@ -223,10 +228,9 @@ def print_timing_report(function_name, started, durations):
 
 
 def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_name=None, clear_l2_cache=False,
-                         _return_samples=False, _active_counts=None, _capture_report=False):
+                         _return_samples=False, _active_counts=None, _capture_report=False, _quantiles=(0.0, 1.0)):
     """Read one batch into measurements, optionally including validated samples and aggregates."""
     import pandas as pd
-    from ._benchmark_quality import central_50_mean
 
     kernel_details_file = None
     for root, _, files in os.walk(base_dir):
@@ -270,7 +274,9 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
             raise ProfilerAcquisitionError(f"Incomplete profiler rows for config {index}")
         if names[index] is not None and not measured["Name"].eq(names[index]).all():
             raise ProfilerAcquisitionError(f"Unexpected profiler target order for config {index}")
-        cost = central_50_mean(durations) / 1000
+        ranked = np.sort(durations) if _quantiles != (0.0, 1.0) else durations
+        lower, upper = int(count * _quantiles[0]), int(count * _quantiles[1])
+        cost = float(np.mean(ranked[lower:max(lower + 1, upper)])) / 1000
         samples = None
         if _return_samples:
             times = measured["Start Time(us)"].to_numpy(dtype=float)
@@ -423,11 +429,13 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
     active = active if options.active is None else options.active
     clear_l2_cache = clear_l2_cache if options.cache_mode is None else options.cache_mode == "cold"
     options = replace(options, warmup=warmup, active=active, cache_mode="cold" if clear_l2_cache else "hot")
+    profile = partial(profile, _quantiles=(options.lower_quantile, options.upper_quantile))
     if options.quality_check and active < 2:
         raise ValueError("quality_check requires active >= 2")
     log_stage(
         options.log_level, "Benchmark settings", f"cache={'cold' if clear_l2_cache else 'hot'}, "
-        f"warmup={warmup}, active={active}, quality_check={options.quality_check}", detailed=True)
+        f"warmup={warmup}, active={active}, quality_check={options.quality_check}, "
+        f"quantiles=({options.lower_quantile}, {options.upper_quantile})", detailed=True)
     if not (options.quality_check or options.max_retries or options.measure_budget_ms is not None
             or options.filter_slow_configs):
         log_stage(options.log_level, "Profiler measurement", f"Attempt 1: {len(funcs)} candidates")

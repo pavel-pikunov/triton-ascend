@@ -27,6 +27,8 @@ export TRITON_PRINT_AUTOTUNING=0
 | `TRITON_NPU_BENCH_CACHE_MODE` | Inherit the caller's cache policy. `cold` evicts L2; `hot` does not explicitly evict it between profiler launches. |
 | `TRITON_NPU_BENCH_WARMUP` | Inherit the warmup launch count; integer >= 0. |
 | `TRITON_NPU_BENCH_ACTIVE` | Inherit the active launch count; integer >= 1, or >= 2 with quality checks. |
+| `TRITON_NPU_BENCH_LOWER_QUANTILE` | `0`; lower quantile boundary of the measured durations averaged for selection. |
+| `TRITON_NPU_BENCH_UPPER_QUANTILE` | `1`; upper quantile boundary of the measured durations averaged for selection. |
 | `TRITON_NPU_BENCH_QUALITY_CHECK` | `0`; evaluate the predefined sample-quality metrics. |
 | `TRITON_NPU_BENCH_MAX_RETRIES` | `0`; additional attempts for failing quality checks or unusable profiler data. |
 | `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | Unset; estimated accumulated device-time budget per candidate, finite and positive, in milliseconds. |
@@ -84,7 +86,13 @@ once, filters target kernels and cache operations, and splits candidates by
 cumulative counts. Each candidate's warmup rows are excluded. Identical target
 kernel names are supported.
 
-The selection score is the mean of the middle half of sorted measured durations.
+The selection score defaults to the arithmetic mean of all measured durations.
+Set `LOWER_QUANTILE=0.25` and `UPPER_QUANTILE=0.75` to average the middle durations.
+The finite boundaries must satisfy `0 <= LOWER_QUANTILE < UPPER_QUANTILE <= 1`.
+Sorted sample indices are rounded down, retaining at least one measurement.
+These settings select a range to average; `do_bench(quantiles=...)` instead returns
+quantile values. Trimming affects selection only, participates
+in the selection-cache key, and does not remove samples from quality checks.
 Quality checks cover tail contamination, gaps, multimodality, drift, and change
 points using the existing algorithms and thresholds in `_benchmark_quality.py`.
 Only failing candidates receive quality retries. Failed acquisition of the shared
@@ -122,7 +130,7 @@ autotune path. Neither logging level prints individual launches or raw CSV rows.
 Winner reports aggregate already-read measured rows. Numeric metrics are averaged;
 IDs and absolute timestamps are not. Constant text appears once, changing text as
 `varies`, and incomplete metrics show availability counts without substituting zeros.
-The report describes only the retained attempt and prints its central-half score
+The report describes only the retained attempt and prints its selection score
 and ordinary mean separately. Unavailable measurements are explicit. Reporting
 adds no measurements and does not read the CSV again.
 
