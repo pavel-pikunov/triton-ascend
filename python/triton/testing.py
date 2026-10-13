@@ -114,17 +114,26 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
 
     di = runtime.driver.active.get_device_interface()
 
+    clear_l2_cache = True
+    cache_mode = os.getenv("TRITON_NPU_BENCH_CACHE_MODE")
+    if cache_mode is not None and runtime.driver.active.get_current_target().backend == "npu":
+        cache_mode = cache_mode.strip().lower()
+        if cache_mode not in ("hot", "cold"):
+            raise ValueError("TRITON_NPU_BENCH_CACHE_MODE must be 'hot' or 'cold'")
+        clear_l2_cache = cache_mode == "cold"
+
     fn()
     di.synchronize()
 
-    cache = runtime.driver.active.get_empty_cache_for_benchmark()
+    cache = runtime.driver.active.get_empty_cache_for_benchmark() if clear_l2_cache else None
 
     # Estimate the runtime of the function
     start_event = di.Event(enable_timing=True)
     end_event = di.Event(enable_timing=True)
     start_event.record()
     for _ in range(5):
-        cache.zero_()
+        if clear_l2_cache:
+            cache.zero_()
         fn()
     end_event.record()
     di.synchronize()
@@ -147,7 +156,8 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
             for x in grad_to_none:
                 x.grad = None
         # we clear the L2 cache before each run
-        cache.zero_()
+        if clear_l2_cache:
+            cache.zero_()
         # record time of `fn`
         start_event[i].record()
         fn()

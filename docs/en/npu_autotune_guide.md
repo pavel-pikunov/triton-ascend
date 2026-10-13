@@ -2,7 +2,8 @@
 
 This guide describes the production NPU path. In the comparison test branch,
 winner/timing reports also support default and legacy routes. Measurement
-controls apply only to current NPU. See [Three benchmark paths](npu_benchmark_comparison.md).
+controls apply only to current NPU, except for shared cache mode.
+See [Three benchmark paths](npu_benchmark_comparison.md).
 
 Set `TRITON_BENCH_METHOD=npu` before running Python to configure the built-in
 NPU profiler used by `autotune` and `max_autotune`. All new controls use environment
