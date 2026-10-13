@@ -1,6 +1,7 @@
 """Opt-in synthetic instability cases; oracle failures are deliberately ordinary red tests."""
 
 import csv
+import json
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -43,9 +44,30 @@ def contaminated(values, scenario, variant, rng):
     return values
 
 
+def sample_values(scenario, variant, index, active, attempt=1):
+    """Use the same seeded distribution for each path's native sample count."""
+    rng = np.random.default_rng(100 * variant + index)
+    values = BASE_US[index] + rng.permutation(np.linspace(-.08, .08, active))
+    if attempt <= variant and index == 0:
+        values = contaminated(values, scenario, variant, rng)
+    if scenario == "stable_bias" and index == 0:
+        values += 10 * variant
+    if scenario == "between_batch_shift" and index == 0:
+        values *= 1.5 + .1 * variant
+    if scenario == "retained_bad_attempt" and attempt == 1 and index == 1:
+        values *= .5
+        values[-active // 10:] += 200 * variant
+    if scenario == "quantization":
+        quantum = (5, 6, 8, 10, 20)[variant - 1]
+        values = np.round(values / quantum) * quantum
+    if scenario == "invalid_profile" and attempt == 1 and index == 0 and variant in (2, 3, 4):
+        values[active // 2] = (np.nan, 0., -1.)[variant - 2]
+    return values
+
+
 @pytest.mark.parametrize("scenario", SCENARIOS)
 @pytest.mark.parametrize("variant", range(1, 6), ids=lambda value: f"v{value}")
-def test_stability_reference(backend, monkeypatch, tmp_path, scenario, variant):
+def test_stability_reference(backend, monkeypatch, tmp_path, record_property, scenario, variant):
     policy = backend.policy
     options = policy.resolve_options()
     assert (options.cache_mode, options.warmup, options.active, options.lower_quantile, options.upper_quantile,
@@ -102,22 +124,7 @@ def test_stability_reference(backend, monkeypatch, tmp_path, scenario, variant):
             writer.writerow(("Name", "Type", "Start Time(us)", "Duration(us)"))
             timestamp = 0
             for index in labels:
-                rng = np.random.default_rng(100 * variant + index)
-                values = BASE_US[index] + rng.permutation(np.linspace(-.08, .08, active))
-                if attempt <= variant and index == 0:
-                    values = contaminated(values, scenario, variant, rng)
-                if scenario == "stable_bias" and index == 0:
-                    values += 10 * variant
-                if scenario == "between_batch_shift":
-                    values *= (1.5 + .1 * variant) if index == 0 else 1
-                if scenario == "retained_bad_attempt" and attempt == 1 and index == 1:
-                    values *= .5
-                    values[-active // 10:] += 200 * variant
-                if scenario == "quantization":
-                    quantum = (5, 6, 8, 10, 20)[variant - 1]
-                    values = np.round(values / quantum) * quantum
-                if scenario == "invalid_profile" and attempt == 1 and index == 0 and variant in (2, 3, 4):
-                    values[active // 2] = (np.nan, 0., -1.)[variant - 2]
+                values = sample_values(scenario, variant, index, active, attempt)
                 first_means.setdefault(index, float(np.mean(values)))
                 attempt_means[attempt, index] = float(np.mean(values))
                 for launch, duration in enumerate(np.r_[np.full(warmup, 999.), values]):
@@ -150,6 +157,12 @@ def test_stability_reference(backend, monkeypatch, tmp_path, scenario, variant):
     scores = dict(zip(order, costs))
     winner = min(scores, key=scores.get)
     initial_mean_winner = min(first_means, key=first_means.get)
+    expected = 1 if scenario == "retained_bad_attempt" else 0
+    for name, value in {
+            "method": "npu", "scenario": scenario, "variant": variant, "winner": winner, "expected": expected,
+            "scores_ms": json.dumps(scores), "active": counts[0], "profiler_attempts": len(batches)
+    }.items():
+        record_property(name, value)
     assert counts and len(set(counts)) == 1 and counts[0] >= 250
     assert len(reads) == len(batches) - (variant if scenario == "missing_profile" else 0)
     assert len(reports) == 3 and all(report is None or report.samples is None for report in reports)
@@ -170,5 +183,10 @@ def test_stability_reference(backend, monkeypatch, tmp_path, scenario, variant):
         assert estimates[2] > 1, "new threshold did not revisit a previously retained candidate"
     elif scenario in SCENARIOS[:11]:
         assert len(batches) >= 2 and quality_failures[0], "contamination did not trigger a quality retry"
-    assert winner == 0, (f"{scenario}/v{variant}: independent winner=0 (40 us), selected={winner}, "
-                         f"scores_ms={scores}, first_mean_winner={initial_mean_winner}, batches={batches}")
+    elif scenario == "retained_bad_attempt":
+        retained = reports[order.index(1)]
+        assert retained.attempt == 1 and retained.quality_failures
+        assert len(batches) >= 2 and attempt_means[2, 1] == pytest.approx(BASE_US[1])
+        assert retained.score_ms * 1000 < attempt_means[2, 1]
+    assert winner == expected, (f"{scenario}/v{variant}: expected winner={expected}, selected={winner}, "
+                                f"scores_ms={scores}, first_mean_winner={initial_mean_winner}, batches={batches}")

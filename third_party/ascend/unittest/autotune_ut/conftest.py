@@ -12,6 +12,8 @@ import torch
 import torch_npu
 import triton
 import triton.language as tl
+from triton import testing as event_testing
+from triton.backends.ascend import _legacy_testing
 from triton.backends.ascend import _autotune_report, _npu_benchmark, testing
 from triton.backends.ascend import _npu_benchmark as _npu_profiler
 from triton.backends.ascend.runtime import autotuner
@@ -32,7 +34,7 @@ def backend(monkeypatch, tmp_path):
     monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
     monkeypatch.setattr(testing.runtime.cache, "get_home_dir", lambda: str(tmp_path))
     return SimpleNamespace(policy=_npu_benchmark, quality=_benchmark_quality, testing=testing, report=_autotune_report,
-                           profiler=_npu_profiler)
+                           profiler=_npu_profiler, legacy=_legacy_testing, events=event_testing)
 
 
 @pytest.fixture
