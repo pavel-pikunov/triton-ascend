@@ -280,12 +280,10 @@ def vector_kernel(...):
 
 ## NPU measurement policies and diagnostics
 
-`max_autotune` accepts the same `npu_bench_options`, `report_best_config` and `report_timing`
-arguments as `autotune`. See [Optional NPU benchmark policies](autotune_guide.md#optional-npu-benchmark-policies)
-for the option table, defaults, cache behavior, and limitations.
-
-Ignored NPU measurement settings warn once per reason per tuner, at the
-kernel's definition. Python warning filters apply.
+`max_autotune` uses the same environment controls as `autotune`, without added
+benchmark-policy arguments. See [NPU autotune policies](npu_autotune_guide.md).
+The test branch's three benchmark paths, repeated decisions and CSV reports
+are described in [Three benchmark paths](npu_benchmark_comparison.md).
 
 ## Summary
 

@@ -1,4 +1,4 @@
-"""Optional autotune diagnostics, independent of benchmark and cache policies."""
+"""Test-branch selection IDs, cross-method reports and repeated-autotune CSV statistics."""
 
 import csv
 import hashlib
@@ -8,36 +8,21 @@ import math
 import os
 import pprint
 import re
-import sys
 import time
-import warnings
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from numbers import Integral, Real
 from pathlib import Path
 from statistics import fmean
+
+from ._npu_benchmark import NpuMeasurementReport, resolve_options
 
 REPORT_ENV = "TRITON_NPU_BENCH_REPORT_BEST_CONFIG"
 TIMING_ENV = "TRITON_AUTOTUNE_REPORT_TIMING"
 RUNS_ENV = "TRITON_AUTOTUNE_RUNS"
 CSV_DIR_ENV = "TRITON_AUTOTUNE_CSV_DIR"
 TIMING_STAGES = ("generation_pruning", "compilation", "slow_filter", "calibration", "measurements")
-
-
-@dataclass(frozen=True)
-class NpuMeasurementReport:
-    metrics: dict
-    sample_count: int
-    warmup: int
-    active: int
-    cache_mode: str
-    mean_ms: float
-    attempt: int = 1
-    quality_failures: tuple = ()
-    quality_checked: bool = False
-    quality_metrics: dict = field(default_factory=dict)
-    score_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -229,7 +214,10 @@ def _decision_record(function_name, config, number, measurement, selection):
     if selection is not None and selection["scored_ids"] is None:
         method = "unmeasured"
     if isinstance(measurement, NpuMeasurementReport):
-        method, estimator, score = "npu", "central_50_mean", measurement.score_ms
+        options = resolve_options()
+        bounds = (options.lower_quantile, options.upper_quantile)
+        estimator = "mean" if bounds == (0.0, 1.0) else "trimmed_mean"
+        method, score = "npu", measurement.score_ms
     elif isinstance(measurement, ScoreReport):
         method = measurement.benchmark_method or ("custom" if measurement.custom else "default")
         if method == "npu_legacy":
@@ -251,6 +239,8 @@ def _decision_record(function_name, config, number, measurement, selection):
         "score_kind": estimator,
         "score_ms": score,
     }
+    if isinstance(measurement, NpuMeasurementReport):
+        record["score_quantiles"] = bounds
     if selection is not None:
         ids = selection["candidate_ids"]
         position = selection["positions"].get(id(config))
@@ -286,20 +276,11 @@ def resolve_report_timing(argument=None):
 
 
 def report_safely(action):
-    """Diagnostic failures must not affect measurement, retries or execution."""
+    """Optional diagnostics do not change scores or execution errors."""
     try:
         return action()
-    except Exception as exc:
-        try:
-            warnings.warn(f"Autotune report unavailable: {exc}", RuntimeWarning, stacklevel=3)
-        except Exception:
-            pass
-
-
-def log_stage(level, title, message, *, detailed=False):
-    if level == "off" or (detailed and level != "detailed"):
-        return
-    report_safely(lambda: print(f"NPU autotune: {title}\n  {message}"))
+    except Exception:
+        return None
 
 
 @contextmanager
@@ -311,53 +292,6 @@ def timing_stage(sink, name):
         if sink is not None:
             elapsed = time.perf_counter() - started
             report_safely(lambda: sink(name, elapsed))
-
-
-@contextmanager
-def yellow_warning():
-    """Color an emitted warning in a terminal while preserving warning filters."""
-    original = warnings.showwarning
-
-    def show(message, category, filename, lineno, file=None, line=None):
-        stream = file if file is not None else sys.stderr
-        if issubclass(category, RuntimeWarning) and getattr(stream, "isatty", lambda: False)():
-            message = f"\033[33m{message}\033[0m"
-        original(message, category, filename, lineno, file=file, line=line)
-
-    warnings.showwarning = show
-    try:
-        yield
-    finally:
-        warnings.showwarning = original
-
-
-def aggregate_profile_rows(columns, rows):
-    """Aggregate measured rows; identifiers and absolute times remain text."""
-    metrics = {}
-    for column in columns:
-        values = [
-            str(row[column]).strip() for row in rows if row.get(column) is not None
-            and str(row[column]).strip().lower() not in {"", "nan", "n/a", "null", "none"}
-        ]
-        if not values:
-            metrics[column] = ("unavailable", 0, False)
-            continue
-        absolute = re.search(r"(^|[^a-z])(id|timestamp)([^a-z]|$)|start\s*time|end\s*time", column.lower())
-        try:
-            numbers = [float(value) for value in values] if not absolute else []
-        except ValueError:
-            numbers = []
-        if numbers:
-            numbers = [value for value in numbers if math.isfinite(value)]
-            metrics[column] = (fmean(numbers), len(numbers), True) if numbers else ("unavailable", 0, False)
-        else:
-            metrics[column] = (values[0] if len(set(values)) == 1 else "varies", len(values), False)
-    return metrics
-
-
-def make_profile_report(columns, rows, warmup, active, clear_l2_cache, cost, *, score_ms=None):
-    return NpuMeasurementReport(aggregate_profile_rows(columns, rows), len(rows), warmup, active,
-                                "cold" if clear_l2_cache else "hot", cost, score_ms=score_ms)
 
 
 def print_best_config_report(function_name, configs, config, measurement=None, *, selection=None):
@@ -403,10 +337,10 @@ def print_best_config_report(function_name, configs, config, measurement=None, *
             stream.write(f"Returned score: {measurement.score!r}; median and quantiles unavailable.\n")
     else:
         if measurement.score_ms is not None:
-            stream.write(f"Central 50% score: {measurement.score_ms * 1000:.12g} us "
+            stream.write(f"Selection score: {measurement.score_ms * 1000:.12g} us "
                          f"({measurement.score_ms:.12g} ms)\n")
         else:
-            stream.write("Central 50% score unavailable.\n")
+            stream.write("Selection score unavailable.\n")
         stream.write(f"Mean duration: {measurement.mean_ms * 1000:.12g} us ({measurement.mean_ms:.12g} ms)\n")
         stream.write(f"cache={measurement.cache_mode}, warmup={measurement.warmup}, "
                      f"active={measurement.active}, selected attempt={measurement.attempt}\n")
@@ -426,23 +360,6 @@ def print_best_config_report(function_name, configs, config, measurement=None, *
         stream.write("AUTOTUNE_DECISION " +
                      json.dumps(decision, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n")
     print(stream.getvalue(), end="")
-
-
-def capture_profile_report(filter_df, time_cost, num_warmup, num_active, clear_l2_cache, report_sink):
-
-    def capture():
-        total = num_warmup + num_active
-        reports = [
-            make_profile_report(
-                tuple(filter_df.columns),
-                filter_df.iloc[index * total + num_warmup:(index + 1) * total].to_dict("records"), num_warmup,
-                num_active, clear_l2_cache,
-                float(filter_df["Duration(us)"].iloc[index * total + num_warmup:(index + 1) * total].mean()) / 1000,
-                score_ms=cost) for index, cost in enumerate(time_cost)
-        ]
-        report_sink(reports)
-
-    report_safely(capture)
 
 
 def print_timing_report(function_name, started, durations, *, total=None):

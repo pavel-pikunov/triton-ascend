@@ -44,7 +44,7 @@ import triton
 from triton.runtime.autotuner import Autotuner, Config
 from triton.tools.get_ascend_devices import is_compile_on_910_95
 
-from .. import _autotune_npu as npu_tuning
+from .. import _autotune_comparison as npu_tuning
 
 from .autoparser import (LowDimsAxesParser, PtrNumsParser, ReductionAxesParser,
                          SplitAxesParser, TilingAxesParser)

@@ -12,7 +12,8 @@ import torch
 import torch_npu
 import triton
 import triton.language as tl
-from triton.backends.ascend import _autotune_report, _npu_benchmark, _npu_profiler, testing
+from triton.backends.ascend import _autotune_report, _npu_benchmark, testing
+from triton.backends.ascend import _npu_benchmark as _npu_profiler
 from triton.backends.ascend.runtime import autotuner
 from triton.runtime.driver import driver
 
@@ -24,7 +25,7 @@ def backend(monkeypatch, tmp_path):
     for name in tuple(os.environ):
         if name.startswith(_npu_benchmark.ENV_PREFIX) or name in {
                 "TRITON_PRINT_AUTOTUNING", "TRITON_ENABLE_UBTUNER", "TRITON_AUTOTUNE_PARALLEL_COMPILE",
-                "TRITON_AUTOTUNE_REPORT_TIMING"
+                "TRITON_AUTOTUNE_REPORT_TIMING", "TRITON_AUTOTUNE_RUNS", "TRITON_AUTOTUNE_CSV_DIR"
         }:
             monkeypatch.delenv(name)
     monkeypatch.setenv("TRITON_BENCH_METHOD", "default")
@@ -55,8 +56,16 @@ def make_tuner(backend, monkeypatch, jit_kernel):
     monkeypatch.setattr(driver.active, "get_benchmarker", lambda: unexpected_benchmark)
 
     def create(options=None, configs=None, **kwargs):
-        tuner = autotuner.autotune(configs if configs is not None else [triton.Config({})], [],
-                                   npu_bench_options=options, **kwargs)(jit_kernel)
+        for name, value in (options or {}).items():
+            if value is not None:
+                monkeypatch.setenv(_npu_benchmark.ENV_PREFIX + name.upper(),
+                                   str(int(value)) if isinstance(value, bool) else str(value))
+        for name, environment in (("report_best_config", "TRITON_NPU_BENCH_REPORT_BEST_CONFIG"),
+                                  ("report_timing", "TRITON_AUTOTUNE_REPORT_TIMING")):
+            value = kwargs.pop(name, None)
+            if value is not None:
+                monkeypatch.setenv(environment, str(int(value)) if isinstance(value, bool) else str(value))
+        tuner = autotuner.autotune(configs if configs is not None else [triton.Config({})], [], **kwargs)(jit_kernel)
         monkeypatch.setattr(jit_kernel, "run",
                             lambda *a, **k: SimpleNamespace(packed_metadata={"kernel_name": "kernel"}))
         tuner.compile_parallel = False
