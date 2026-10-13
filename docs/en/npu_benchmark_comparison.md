@@ -1,6 +1,8 @@
 # Three benchmark paths (test branch only)
 
-Branch: `AutotunerBenchCompare-3.2.2`, based on `0f6ade525`.
+Branch: `AutotunerBenchCompare-3.2.2`. The current NPU measurement modules are
+copied from `AutotunerNpuPolicies-3.2.2-dev` at `bb4f3c54d`; the comparison branch
+keeps its existing release base, default event benchmarker and legacy measurement code.
 The legacy implementation is pinned to release commit
 `7aa09ec5f1ba564b5544007bca4f97ce0e493182`, rather than a moving release ref.
 
@@ -8,7 +10,7 @@ The legacy implementation is pinned to release commit
 | --- | --- | --- |
 | Unset or `default` | Current tuner, original device-event `triton.testing.do_bench` | Median (autotuning requests quantiles 50%, 20%, 80%) |
 | `npu_legacy` | Copied release tuner and copied release NPU profiler | Arithmetic mean of all measured durations |
-| `npu` | Current tuner and current NPU profiler | Mean of the central 50% of measured durations |
+| `npu` | Current tuner and current NPU profiler | Arithmetic mean by default; mean within configured quantile boundaries |
 
 Both `autotune` and `max_autotune` route to the complete copied tuner for
 `npu_legacy`, before processing the new options. Direct calls to the backend's
@@ -29,9 +31,10 @@ are unchanged from the pinned release.
 The original common profiler session, CV pruning/count calculation, warmup,
 kernel-name filtering, CSV aggregation, synchronization, exceptions and cleanup
 are preserved. L2 eviction in legacy mode still occurs before kernel hooks.
-The new quality checks, retries, budget, slow filter and stage logs are not
-applied to legacy. The `npu_bench_options` decorator argument is ignored there;
-`report_best_config` and `report_timing` are supported by all three paths.
+The new quality checks, retries, budget, slow filter, quantile boundaries and
+stage logs are not applied to legacy. Public decorators retain their original
+signatures: all new measurement and reporting controls are environment-only.
+Winner and timing reports remain supported by all three paths in this test branch.
 original `auto_prof_dir` remains supported and can perform an extra profile.
 
 Original fallbacks are also preserved: one remaining configuration uses the
@@ -61,8 +64,7 @@ Hot means no intentional eviction; hooks, working-set size and other operations
 can still change cache contents. Cold eviction also uses the original operations
 and hook order of each path, so their cache preparation is not identical.
 No other `TRITON_NPU_BENCH_*` measurement options are resolved by events or legacy.
-For events, the `npu_bench_options` mapping remains ignored; the two shared
-controls are environment-only.
+The two shared controls are environment-only.
 
 ## Run an existing case in separate processes
 
@@ -103,8 +105,8 @@ There is no additional benchmark runner in this branch.
 
 ## Record selection decisions for all three paths
 
-The same independent flags work for `autotune` and `max_autotune`, including
-legacy mode. Explicit decorator arguments override the environment:
+The same independent environment flags work for `autotune` and `max_autotune`,
+including legacy mode:
 
 ```bash
 export TRITON_NPU_BENCH_REPORT_BEST_CONFIG=1
@@ -119,7 +121,7 @@ TRITON_BENCH_METHOD=npu python your_existing_case.py > npu.log
 The winner report contains all config parameters and `ubtune_cfg`, its original
 1-based position before pruning, its selection score, and its stable SHA-256
 ID. The reported time is the already-measured median for events, arithmetic
-mean for legacy, or central-half score and ordinary mean of the selected attempt
+mean for legacy, or selection score and ordinary mean of the selected attempt
 for current NPU. Custom benchmarker scores keep their original meaning. An
 unmeasured selection is explicitly marked; no additional kernel launches or
 CSV reads are performed for reporting. Legacy fallback is marked as the
@@ -138,7 +140,7 @@ parameters, including `ubtune_cfg`; `candidate_id` identifies the original
 candidate before UBTuner changes. IDs exclude `pre_hook`, which is still printed
 in the full parameters. Dictionary insertion order, object addresses and
 `PYTHONHASHSEED` do not affect IDs for supported values. Unsupported values
-with process-dependent representations make the ID unavailable with a warning.
+with process-dependent representations make the optional ID unavailable.
 
 `candidate_set_id` identifies the original candidate list independently of
 order, preserving duplicates; `candidate_order_id` also includes order.
@@ -161,6 +163,11 @@ and enable only the desired options, for example:
 
 ```bash
 export TRITON_BENCH_METHOD=npu
+export TRITON_NPU_BENCH_LOWER_QUANTILE=0.25
+export TRITON_NPU_BENCH_UPPER_QUANTILE=0.75
+export TRITON_NPU_BENCH_MEASURE_BUDGET_MS=5
+export TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS=1
+export TRITON_NPU_BENCH_SLOW_CONFIG_ROUNDS=2
 export TRITON_NPU_BENCH_QUALITY_CHECK=1
 export TRITON_NPU_BENCH_MAX_RETRIES=4
 export TRITON_NPU_BENCH_LOG_LEVEL=brief
@@ -259,7 +266,7 @@ repeated selection cost from the first pass's cost. Neither is a fresh-process
 compilation measurement. A stage that is not executed contributes zero.
 
 The per-pass score is the event median for default, the original mean for
-legacy, and the central-half score of the fastest measured attempt for new
+legacy, and the mean within configured quantile boundaries of the fastest measured attempt for new
 NPU, irrespective of its quality status. Original event fallback scores are
 used when fallback occurs. This CSV aggregates selection scores, not raw
 kernel launches and not all retry attempts. The mean column does not replace
@@ -279,3 +286,18 @@ candidate must be a distinct `Config` object. When winner reporting is enabled,
 `AUTOTUNE_DECISION` also includes `run_index` and `total_runs`; stable set/order
 IDs still allow comparison across fresh processes. No completed CSV is emitted
 if tuning fails before all requested passes finish.
+
+## Real-device smoke
+
+The smoke file now covers both decorators and all three benchmark routes using
+environment controls. Each case makes three decisions, verifies kernel output,
+stable candidate order, CSV win counts and silent cached calls:
+
+```bash
+pytest third_party/ascend/unittest/autotune_ut/test_npu_autotune_smoke.py -q
+```
+
+CPU helper checks do not validate native event/profiler execution. Historical
+policy/report unit tests in this branch still include assertions about removed
+decorator arguments, warning policies and private APIs; those assertions need
+migration before treating the full old suite as the current contract.
