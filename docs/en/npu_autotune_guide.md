@@ -103,7 +103,7 @@ quantile values. Trimming affects selection only, participates
 in the selection-cache key, and does not remove samples from quality checks.
 Quality checks cover tail contamination, gaps, multimodality, drift, and change
 points using the existing algorithms in `_benchmark_quality.py`. Their thresholds
-are 0.030, 0.2, 0.027, 0.275 and 0.275, respectively.
+are 0.030, 0.2, 0.027, 0.3 and 0.275, respectively.
 Only failing candidates receive quality retries. Failed acquisition of the shared
 CSV retries the current batch. The shared count is retained across retries without recalibration.
 Kernel execution and synchronization failures propagate without retries.
