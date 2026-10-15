@@ -43,10 +43,10 @@ export TRITON_PRINT_AUTOTUNING=0
 | `TRITON_NPU_BENCH_QUALITY_CHECK_ALL` | `0`; stop after the first failed check. `1` computes all quality metrics for diagnostics, including rejected attempts. Does not change retry decisions or the selection-cache key. |
 | `TRITON_NPU_BENCH_MAX_RETRIES` | `5`; additional attempts for failing quality checks or unusable profiler data; at most six attempts in total. |
 | `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | `10`; estimated accumulated device-time budget per candidate, in milliseconds. `0` disables it; other values must be finite and positive. |
-| `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `50`; measured launches per short event estimate, used by filtering and budget calibration; integer >= 2. |
+| `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; measured launches per short event estimate, used by filtering and budget calibration; integer >= 2. |
 | `TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS` | `1`; enable preliminary filtering through NPU events under the selected cache policy. |
-| `TRITON_NPU_BENCH_SLOW_CONFIG_ROUNDS` | `5`; total filtering rounds per winner, including the first; integer >= 1. |
-| `TRITON_NPU_BENCH_SLOW_CONFIG_FACTOR` | `2`; recheck candidates above this multiple of the current winner's retained minimum; finite and >= 1. |
+| `TRITON_NPU_BENCH_SLOW_CONFIG_ROUNDS` | `7`; total filtering rounds per winner, including the first; integer >= 1. |
+| `TRITON_NPU_BENCH_SLOW_CONFIG_FACTOR` | `2.5`; recheck candidates above this multiple of the current winner's retained minimum; finite and >= 1. |
 | `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_DELAY_S` | `0.05`; finite, nonnegative pause before each needed subsequent round. `0` disables the pause. |
 
 Boolean values accept `0`, `1`, `false`, and `true`. Settings do not enable one
@@ -71,8 +71,8 @@ current winner. If another candidate obtains a strictly lower minimum, it become
 the winner: all original candidates are reclassified and the round counter restarts
 at 1. Ties preserve the current winner. Previously retained candidates can become
 suspects under the new threshold. Candidates still slow after the configured number
-of rounds are excluded. One round permits immediate filtering; the default five
-rounds provide four rechecks per winner.
+of rounds are excluded. One round permits immediate filtering; the default seven
+rounds provide six rechecks per winner.
 
 There is one pause before each needed recheck round. No pause or recheck occurs
 without suspects, with fewer than two candidates, or with one configured round.

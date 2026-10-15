@@ -52,10 +52,10 @@ class NpuBenchmarkOptions:
     quality_check_all: bool = False
     max_retries: int = 5
     measure_budget_ms: float | None = 10.0
-    calibration_runs: int = 50
+    calibration_runs: int = 10
     filter_slow_configs: bool = True
-    slow_config_rounds: int = 5
-    slow_config_factor: float = 2.0
+    slow_config_rounds: int = 7
+    slow_config_factor: float = 2.5
     slow_config_recheck_delay_s: float = 0.05
     log_level: str = "brief"
     report_best_config: bool = True
