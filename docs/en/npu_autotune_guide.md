@@ -35,7 +35,7 @@ export TRITON_PRINT_AUTOTUNING=0
 | Environment variable | Default / meaning |
 | --- | --- |
 | `TRITON_NPU_BENCH_CACHE_MODE` | `hot`; `cold` evicts L2; `hot` does not explicitly evict it between profiler launches. |
-| `TRITON_NPU_BENCH_WARMUP` | `50`; warmup launches per candidate; integer >= 0. |
+| `TRITON_NPU_BENCH_WARMUP` | Unset: `ceil(active / 10)` using the final budget-adjusted active. An explicit integer >= 0 overrides it; `0` disables profiler warmup. |
 | `TRITON_NPU_BENCH_ACTIVE` | `250`; minimum measured launches per candidate; integer >= 1, or >= 2 with quality checks. |
 | `TRITON_NPU_BENCH_LOWER_QUANTILE` | `0.25`; lower quantile boundary of the measured durations averaged for selection. |
 | `TRITON_NPU_BENCH_UPPER_QUANTILE` | `0.75`; upper quantile boundary of the measured durations averaged for selection. |
@@ -88,6 +88,9 @@ A measurement budget sets
 one shared `active = max(active, ceil(measure_budget_ms / minimum_event_duration_ms))`
 for all surviving candidates, using the fastest retained event launch.
 Calibration reuses slow-filter minima.
+Profiler warmup defaults to `(active + 9) // 10` after the shared active count is
+calibrated: active 50 gives 5 warmup launches, 51 gives 6, and 250 gives 25.
+An explicit `TRITON_NPU_BENCH_WARMUP` is preserved, including zero.
 When those results are unavailable, one preliminary call and `CALIBRATION_RUNS`
 event measurements estimate each candidate under the requested profiler cache
 policy. Calibration creates no profiler session or CSV. Event estimates determine
