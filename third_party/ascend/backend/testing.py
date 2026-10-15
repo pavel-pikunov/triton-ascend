@@ -48,11 +48,11 @@ def do_bench_npu(
 
 
 def _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name, *,
-                 _return_samples=False, _pre_hook_scope=None, _execution_state=None,
-                 _capture_report=False, _quantiles=(0.0, 1.0)):
+                 _return_samples=False, _pre_hook_scope=None, _execution_state=None, _capture_report=False,
+                 _quantiles=(0.0, 1.0), _timings=None, _profiler_mode="summary"):
     import torch
     import torch_npu
-    from ._npu_benchmark import _collect_prof_result, profile_scope, result_scope
+    from ._npu_benchmark import _collect_prof_result, export_npu_summary, profile_scope, result_scope, timing_stage
 
     if not isinstance(funcs, list):
         funcs = [funcs]
@@ -70,8 +70,10 @@ def _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, targ
     for fn in funcs:
         run(fn)
 
+    summary = _profiler_mode == "summary"
     experimental_config = torch_npu.profiler._ExperimentalConfig(
-        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        aic_metrics=(torch_npu.profiler.AiCMetrics.AiCoreNone
+                     if summary else torch_npu.profiler.AiCMetrics.PipeUtilization),
         profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
         l2_cache=False,
         data_simplification=False,
@@ -84,9 +86,7 @@ def _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, targ
         pid = process.pid
         process_name = process.name
         timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-        base_path = os.path.join(
-            runtime.cache.get_home_dir(), ".triton", "profile_results"
-        )
+        base_path = os.path.join(runtime.cache.get_home_dir(), ".triton", "profile_results")
         torch_path = os.path.join(base_path, f"prof_{timestamp}_{process_name}-{pid}")
 
     if clear_l2_cache:
@@ -95,41 +95,54 @@ def _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, targ
         buffer.sum()
         torch.npu.synchronize()  # shake out of any npu error
 
+    handler = torch_npu.profiler.tensorboard_trace_handler(torch_path, analyse_flag=not summary)
+
+    def on_trace_ready(prof):
+        with timing_stage(_timings, "export"):
+            handler(prof)
+
     try:
         scope = profile_scope(buffer if clear_l2_cache else None, torch.npu.synchronize, _pre_hook_scope,
                               lambda: _rm_dic(keep_res, torch_path))
         with scope, torch_npu.profiler.profile(
                 activities=[torch_npu.profiler.ProfilerActivity.NPU],
-                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
+                on_trace_ready=on_trace_ready,
+                schedule=lambda step: (torch_npu.profiler.ProfilerAction.RECORD_AND_SAVE
+                                       if step == 0 else torch_npu.profiler.ProfilerAction.NONE),
                 record_shapes=False,
                 profile_memory=False,
                 with_stack=False,
                 with_flops=False,
                 with_modules=False,
                 experimental_config=experimental_config,
-        ):
-            for fn in funcs:
-                for _ in builtins.range(warmup + active):
-                    if clear_l2_cache and _pre_hook_scope is None:
-                        buffer.sum()  # use buffer read to clear l2 cache
-                        torch.npu.synchronize()
-                    run(fn)
+        ) as prof:
+            with timing_stage(_timings, "profiler"):
+                for fn in funcs:
+                    for _ in builtins.range(warmup + active):
+                        if clear_l2_cache and _pre_hook_scope is None:
+                            buffer.sum()  # use buffer read to clear l2 cache
+                            torch.npu.synchronize()
+                        run(fn)
+            prof.step()  # Complete one recording step for the entire candidate batch.
     finally:
         if clear_l2_cache:
             del buffer
 
     with result_scope(lambda: _rm_dic(keep_res, torch_path)):
-        return _collect_prof_result(
-            torch_path,
-            funcs,
-            warmup,
-            active,
-            target_kernel_name=target_kernel_name,
-            clear_l2_cache=clear_l2_cache,
-            _return_samples=_return_samples,
-            _capture_report=_capture_report,
-            _quantiles=_quantiles,
-        )
+        if summary:
+            export_npu_summary(prof.prof_if.prof_path, _timings)
+        with timing_stage(_timings, "csv"):
+            return _collect_prof_result(
+                prof.prof_if.prof_path,
+                funcs,
+                warmup,
+                active,
+                target_kernel_name=target_kernel_name,
+                clear_l2_cache=clear_l2_cache,
+                _return_samples=_return_samples,
+                _capture_report=_capture_report,
+                _quantiles=_quantiles,
+            )
 
 
 def _rm_dic(keep_res, torch_path):

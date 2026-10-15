@@ -1,8 +1,8 @@
 # Three benchmark paths (test branch only)
 
-Branch: `AutotunerBenchCompare-3.2.2`. The current NPU measurement modules are
-kept identical to `AutotunerNpuPolicies-3.2.2-dev`; the comparison branch
-keeps its existing release base. The original default and legacy benchmark paths
+Branch: `AutotunerBenchCompare-3.2.2`. It additionally tests a reduced NPU
+profiler export; this experiment is not in `AutotunerNpuPolicies-3.2.2-dev`.
+The comparison branch keeps its existing release base. The original default and legacy benchmark paths
 are pinned to `release/3.2.2-dev` commit
 `3595ed00385d8f533091b9bd50caf7bd7a7ccd24`. NPU measurement-policy environment
 variables apply only to the current `npu` path, except for the shared cache-mode
@@ -20,6 +20,37 @@ public `do_bench_npu` also route to the copied profiler in this mode.
 Set the mode before imports and decorator creation, and keep it fixed for the
 process lifetime. Each comparison run must start a separate Python process;
 switching the environment on an already-created tuner is unsupported.
+
+## NPU profiler export experiment
+
+Only the current `npu` path reads `TRITON_NPU_BENCH_PROFILER_MODE`:
+
+- `summary` (default): Level1 with `AiCoreNone`, native CANN summary export and
+  direct pandas reading of `op_summary` CSVs. The TensorBoard analysis pipeline
+  and timeline export are skipped. Type information is retained for cold-cache
+  filtering. `msprof` must be on PATH with its installed `msprof.py` script.
+- `full`: Level1 with `PipeUtilization`, the usual TensorBoard analysis and
+  `kernel_details.csv`. Use this to compare against the previous NPU export.
+
+```bash
+export TRITON_BENCH_METHOD=npu
+export TRITON_NPU_BENCH_PROFILER_MODE=summary
+python your_existing_case.py
+TRITON_NPU_BENCH_PROFILER_MODE=full python your_existing_case.py
+```
+
+Both modes use the same candidate order, launch counts, cache policy, scores and
+five quality checks. The mode participates in the selection-cache key. Each
+attempt remains one profiler session, completed as one recording step for the
+entire batch. No step is added per kernel launch. Failures follow the existing
+acquisition-retry policy; a failed summary export does not silently switch modes.
+
+The final timing block splits `Measurements` into launch/synchronization time,
+export/analysis, CSV/aggregates, quality and remaining overhead. The latter
+includes profiler setup/finalization and cleanup. Nested times are not counted
+again in the autotune total. Native NPU export speed has not been measured locally;
+the CANN 9.2.beta2 command interface was checked in the WSL build installation.
+Raw-data parsing is still required, so this is not a promise of a fixed speedup.
 
 ## What is preserved in legacy mode
 

@@ -5,6 +5,11 @@ winner/timing reports also support default and legacy routes. Measurement
 controls apply only to current NPU, except for shared cache mode.
 See [Three benchmark paths](npu_benchmark_comparison.md).
 
+This test branch additionally defaults to reduced NPU profiler export.
+`TRITON_NPU_BENCH_PROFILER_MODE=summary|full` switches between summary-only
+export and the previous full analysis. This setting is not in the PR branch;
+see the [export experiment](npu_benchmark_comparison.md#npu-profiler-export-experiment).
+
 Set `TRITON_BENCH_METHOD=npu` before running Python to configure the built-in
 NPU profiler used by `autotune` and `max_autotune`. All new controls use environment
 variables; the decorator signatures are unchanged. Unset fields use the explicit
@@ -155,6 +160,10 @@ time includes profiler completion, CSV reading, and quality evaluation. Reused
 filter measurements belong to filtering time; calibration does not count them
 again. Timing ends before the optional extra winner profile, final kernel call,
 and final report output. Cache hits repeat neither stages nor reports.
+
+In this test branch, the final measurement line additionally contains exclusive
+times for profiled launches/synchronization, CANN export/analysis, CSV/aggregates,
+quality and remaining measurement overhead (including setup/finalization).
 
 The optional `auto_prof_dir` profile retains its existing invocation and reads the
 NPU measurement environment through `do_bench_npu`.
