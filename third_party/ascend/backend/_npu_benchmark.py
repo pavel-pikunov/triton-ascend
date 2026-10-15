@@ -436,6 +436,7 @@ def event_timer(clear_l2_cache, pre_hook_scope):
     torch.npu.synchronize()
     buffer = runtime.driver.active.get_empty_cache_for_benchmark().float() if clear_l2_cache else None
     scoped = buffer is not None and pre_hook_scope is not None
+    event_pairs = [(start, end)]
 
     def prepare():
         if buffer is not None:
@@ -444,17 +445,20 @@ def event_timer(clear_l2_cache, pre_hook_scope):
         start.record()
 
     def measure(fn, count):
+        nonlocal start
+
+        while len(event_pairs) < count:
+            event_pairs.append((torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)))
+        pairs = event_pairs[:count]
         fn()
         torch.npu.synchronize()
-        minimum_ms = float("inf")
-        for _ in range(count):
+        for start, end in pairs:
             if not scoped:
                 prepare()
             fn()
             end.record()
-            torch.npu.synchronize()
-            minimum_ms = min(minimum_ms, start.elapsed_time(end))
-        return minimum_ms
+        torch.npu.synchronize()
+        return min(begin.elapsed_time(end) for begin, end in pairs)
 
     try:
         with pre_hook_scope(prepare) if scoped else nullcontext():
