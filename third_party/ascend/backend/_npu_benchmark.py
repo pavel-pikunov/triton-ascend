@@ -56,7 +56,7 @@ class NpuBenchmarkOptions:
     filter_slow_configs: bool = True
     slow_config_rounds: int = 5
     slow_config_factor: float = 2.0
-    slow_config_recheck_delay_s: float = 0.2
+    slow_config_recheck_delay_s: float = 0.05
     log_level: str = "brief"
     report_best_config: bool = True
     report_timing: bool = True
