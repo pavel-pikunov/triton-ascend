@@ -1,6 +1,7 @@
 # Synthetic NPU stability stress cases
 
-This test-branch suite contains **20 scenarios x 5 variants = 100 cases**.
+This test-branch suite contains **20 scenarios x 5 variants = 100 models**,
+run in both short-circuit and full-check modes: **200 NPU cases**.
 It exercises the real NPU benchmark helpers, pandas collector and quality
 algorithms with generated event estimates and profiler rows. It does not emulate
 an NPU backend or validate native torch_npu timing, synchronization or L2 residency.
@@ -95,7 +96,7 @@ that the fast samples are wrong. Requiring A here contradicted the requested
 minimum-score policy and has been corrected in all five variants.
 Finite clean samples can themselves fail a heuristic quality threshold. Retry
 addressing is checked against the actual metrics rather than assuming that every
-clean candidate passes; all statistical algorithms remain unchanged.
+clean candidate passes; all five metrics retain their definitions and thresholds.
 
 All rows are generated in temporary directories and removed after each attempt;
 no recorded datasets are committed. Reports retain aggregates, not raw rows.
@@ -111,15 +112,20 @@ Run it explicitly on the usual installed Ascend test environment:
 pytest third_party/ascend/unittest/autotune_ut/npu_stability_stress.py third_party/ascend/unittest/autotune_ut/npu_stability_comparison.py -q --dist=loadfile
 ```
 
-`-vv` exposes all 260 scenario/variant/path IDs. No native profiler sessions are
+`-vv` exposes all 360 scenario/variant/path/mode IDs. No native profiler sessions are
 created by this synthetic suite; existing real-device smoke tests remain separate.
 
 Local verification: Python 3.11 CPU helpers, byte-identical test assertions,
-**80 passed / 20 failed**, five failures in each remaining applicability-limit scenario.
+**80 passed / 20 failed in each NPU mode**, five failures in each remaining
+applicability-limit scenario. Winners, scores, active counts and attempt counts
+match between both modes in all 100 models.
 Every failure was an independent-winner assertion; there were no acquisition
 errors, skips or xfails in the completed CPU run. The normal repository fixture
 could not be collected locally because torch_npu is absent. This result verifies
 synthetic helper behavior, not native NPU execution.
+
+The separate [CPU performance audit](npu_quality_performance.md) measures every
+metric on all distributions, including full 24 x 5000 batches and CSV aggregates.
 
 ## Comparison with the original paths
 
@@ -177,8 +183,8 @@ paths use one attempt, while NPU can retry. This deliberately favors retries
 and does not estimate real selection accuracy or establish an NPU speedup.
 Recovery is tied to attempt number, not elapsed wall/device time: the model
 does not allow a long default-path acquisition to recover within that attempt.
-All 260 outcomes were collected on CPU with unchanged sources and assertions;
-136 ordinary failures were selection-oracle/unusable-score assertions, with
+All 360 outcomes were collected on CPU with byte-identical helper sources and assertions;
+156 ordinary failures were selection-oracle/unusable-score assertions, with
 no collection errors or skips. Installed do_bench/statistics matched the
 repository source by AST. Python 3.10/3.11 syntax and repository style checks
 are separate from these synthetic results.

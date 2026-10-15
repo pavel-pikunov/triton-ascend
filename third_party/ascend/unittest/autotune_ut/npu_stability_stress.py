@@ -3,6 +3,7 @@
 import csv
 import json
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -67,9 +68,10 @@ def sample_values(scenario, variant, index, active, attempt=1):
 
 @pytest.mark.parametrize("scenario", SCENARIOS)
 @pytest.mark.parametrize("variant", range(1, 6), ids=lambda value: f"v{value}")
-def test_stability_reference(backend, monkeypatch, tmp_path, record_property, scenario, variant):
+@pytest.mark.parametrize("check_all", [False, True], ids=["short-circuit", "all-checks"])
+def test_stability_reference(backend, monkeypatch, tmp_path, record_property, scenario, variant, check_all):
     policy = backend.policy
-    options = policy.resolve_options()
+    options = replace(policy.resolve_options(), quality_check_all=check_all)
     assert (options.cache_mode, options.warmup, options.active, options.lower_quantile, options.upper_quantile,
             options.quality_check, options.max_retries, options.measure_budget_ms, options.calibration_runs,
             options.filter_slow_configs, options.slow_config_rounds, options.slow_config_factor,
@@ -143,8 +145,8 @@ def test_stability_reference(backend, monkeypatch, tmp_path, record_property, sc
 
     evaluate_quality = backend.quality.evaluate_quality
 
-    def evaluate(*samples):
-        metrics, failures = evaluate_quality(*samples)
+    def evaluate(*samples, **kwargs):
+        metrics, failures = evaluate_quality(*samples, **kwargs)
         quality_failures.append(bool(failures))
         return metrics, failures
 
