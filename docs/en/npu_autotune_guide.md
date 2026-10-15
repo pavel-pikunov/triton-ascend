@@ -78,6 +78,9 @@ There is one pause before each needed recheck round. No pause or recheck occurs
 without suspects, with fewer than two candidates, or with one configured round.
 `SLOW_CONFIG_RUNS` and `SLOW_CONFIG_RECHECK_RUNS` are not used; `CALIBRATION_RUNS`
 controls the short event estimates. The ordinary and custom benchmarkers are unchanged.
+Event pairs are reused between candidates, with storage bounded by the largest
+requested series. Hot estimates synchronize after warmup and after the complete
+series; cold estimates also retain the existing cache-preparation synchronization.
 The release CV time-limit pruning also retains its original implementation; explicit
 `ACTIVE` or `MEASURE_BUDGET_MS` bypasses that separate pruning and count calculation.
 
