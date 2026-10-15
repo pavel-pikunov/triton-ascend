@@ -2,6 +2,8 @@
 
 Measured on 2026-10-15, Windows, Intel Core Ultra 7 258V (8 cores),
 Python 3.11.9, NumPy 1.26.4, pandas 2.2.3 and SciPy 1.13.1.
+These results describe commit `a0c2dbc2c`; they predate the test-branch
+summary/full profiler export experiment.
 
 The audit covers 100 seeded stress variants and eight additional distributions,
 each with 24 candidates and either 250 or 5000 active rows: **216 cases**.

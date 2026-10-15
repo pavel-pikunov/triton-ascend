@@ -7,6 +7,8 @@ import os
 import pprint
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 from contextlib import contextmanager, nullcontext, suppress
@@ -40,6 +42,7 @@ class ProfilerAcquisitionError(RuntimeError):
 
 @dataclass(frozen=True)
 class NpuBenchmarkOptions:
+    profiler_mode: str = "summary"
     cache_mode: str | None = "hot"
     warmup: int | None = 50
     active: int | None = 250
@@ -74,8 +77,8 @@ class NpuBenchmarkOptions:
     @property
     def is_default(self):
         """Whether measurement policies leave the original benchmark behavior intact."""
-        return (self.cache_mode is None and self.warmup is None and self.active is None and self.lower_quantile == 0
-                and self.upper_quantile == 1
+        return (self.profiler_mode == "full" and self.cache_mode is None and self.warmup is None and self.active is None
+                and self.lower_quantile == 0 and self.upper_quantile == 1
                 and not (self.quality_check or self.max_retries or self.measure_budget_ms is not None
                          or self.filter_slow_configs))
 
@@ -84,7 +87,7 @@ class NpuBenchmarkOptions:
         if self.quality_check:
             from ._benchmark_quality import THRESHOLDS
             thresholds = tuple(sorted(THRESHOLDS.items()))
-        return ("npu-benchmark", 7, self.effective_policy(), thresholds)
+        return ("npu-benchmark", 8, self.effective_policy(), thresholds)
 
 
 def resolve_options():
@@ -113,7 +116,10 @@ def resolve_options():
                     raise ValueError("invalid finite range")
             else:
                 value = value.strip().lower()
-                allowed = {"hot", "cold"} if name == "cache_mode" else {"off", "brief", "detailed"}
+                allowed = {
+                    "cache_mode": {"hot", "cold"}, "log_level": {"off", "brief", "detailed"}, "profiler_mode":
+                    {"summary", "full"}
+                }[name]
                 if value not in allowed:
                     raise ValueError(f"expected one of {sorted(allowed)}")
         except (ValueError, KeyError) as exc:
@@ -245,19 +251,50 @@ def print_best_config_report(function_name, configs, config, measurement):
     print("\n".join(lines))
 
 
-def print_timing_report(function_name, started, durations):
-    total = time.perf_counter() - started
+def print_timing_report(function_name, started, durations, *, total=None):
+    total = time.perf_counter() - started if total is None else total
     labels = ("Generation/pruning", "Compilation", "Slow filter", "Calibration", "Measurements (including retries)")
     lines = [f"Triton autotuning timing for {function_name}", "-" * 60, f"  Total: {total:.6f} s"]
-    lines.extend(f"  {label}: {durations.get(stage, 0):.6f} s" for stage, label in zip(TIMING_STAGES, labels))
-    lines.append(f"  Other: {max(0, total - sum(durations.values())):.6f} s")
+    details = (("profiler", "Profiled launches/synchronization"), ("export", "CANN export/analysis"),
+               ("csv", "CSV and aggregates"), ("quality", "Quality checks"))
+    for stage, label in zip(TIMING_STAGES, labels):
+        elapsed = durations.get(stage, 0)
+        lines.append(f"  {label}: {elapsed:.6f} s")
+        if stage == "measurements" and any(name in durations for name, _ in details):
+            lines.extend(f"    {label}: {durations.get(name, 0):.6f} s" for name, label in details)
+            remaining = max(0, elapsed - sum(durations.get(name, 0) for name, _ in details))
+            lines.append(f"    Other measurement overhead: {remaining:.6f} s")
+    lines.append(f"  Other: {max(0, total - sum(durations.get(name, 0) for name in TIMING_STAGES)):.6f} s")
     print("\n".join(lines))
+
+
+def export_npu_summary(profiler_path, timings=None):
+    """Export CANN summary CSVs without the TensorBoard analysis pipeline."""
+    cann_path = next((path for path in Path(profiler_path).glob("PROF_*") if path.is_dir()), None)
+    msprof = shutil.which("msprof")
+    if cann_path is None or msprof is None:
+        raise ProfilerAcquisitionError("CANN profiling data or msprof executable was not found")
+    relative = "tools/profiler/profiler_tool/analysis/msprof/msprof.py"
+    script = next((parent / relative for parent in Path(msprof).resolve().parents if (parent / relative).is_file()),
+                  None)
+    if script is None:
+        raise ProfilerAcquisitionError("CANN msprof.py summary exporter was not found")
+    with timing_stage(timings, "export"):
+        result = subprocess.run(
+            [sys.executable,
+             str(script), "export", "summary", "-dir",
+             str(cann_path), "--format", "csv"], capture_output=True, text=True)
+    if result.returncode:
+        raise ProfilerAcquisitionError(f"CANN summary export failed: {result.stderr or result.stdout}")
 
 
 def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_name=None, clear_l2_cache=False,
                          _return_samples=False, _capture_report=False, _quantiles=(0.0, 1.0)):
     """
-    Collect per-function measurements from one kernel_details.csv read.
+    Collect per-function measurements, reading each profiler CSV once.
+
+    Accept kernel_details.csv or native CANN op_summary CSVs. Summary column
+    names are normalized to the same schema; split files are merged by start time.
 
     Split rows in profiler execution order into equal num_warmup + num_active
     blocks. Skip each function's warmup rows and collect its num_active rows.
@@ -296,19 +333,20 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
     """
     import pandas as pd
 
-    kernel_details_file = None
-    for root, _, files in os.walk(base_dir):
-        for file in files:
-            if file == "kernel_details.csv":
-                kernel_details_file = os.path.join(root, file)
-                break
+    files = list(Path(base_dir).rglob("kernel_details.csv"))[:1] or sorted(Path(base_dir).rglob("op_summary*.csv"))
     num_funcs = len(funcs)
-    if kernel_details_file is None:
+    if not files:
         if _return_samples:
-            raise ProfilerAcquisitionError("NPU profiler CSV kernel_details.csv was not found")
+            raise ProfilerAcquisitionError("NPU profiler CSV kernel_details.csv or op_summary was not found")
         return [None] * num_funcs
 
-    df = pd.read_csv(kernel_details_file)
+    columns = {
+        "Op Name": "Name", "OP Type": "Type", "Task Start Time(us)": "Start Time(us)", "Task Duration(us)":
+        "Duration(us)", "Task Type": "Accelerator Core"
+    }
+    frames = [pd.read_csv(path).rename(columns=columns, copy=False) for path in files]
+    df = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True).sort_values(
+        "Start Time(us)", kind="stable")
     filter_df = df[~df["Type"].str.contains(r"^ReduceSum$", case=False, na=False)] if clear_l2_cache else df
     names = ([target_kernel_name] * num_funcs
              if target_kernel_name is None or isinstance(target_kernel_name, str) else list(target_kernel_name))
@@ -496,12 +534,15 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
     active = active if options.active is None else options.active
     clear_l2_cache = clear_l2_cache if options.cache_mode is None else options.cache_mode == "cold"
     options = replace(options, warmup=warmup, active=active, cache_mode="cold" if clear_l2_cache else "hot")
-    profile = partial(profile, _quantiles=(options.lower_quantile, options.upper_quantile))
+    profile = partial(profile, _quantiles=(options.lower_quantile, options.upper_quantile),
+                      _profiler_mode=options.profiler_mode)
+    if timings is not None:
+        profile = partial(profile, _timings=timings)
     if options.quality_check and active < 2:
         raise ValueError("quality_check requires active >= 2")
     log_stage(
         options.log_level, "Benchmark settings", f"cache={'cold' if clear_l2_cache else 'hot'}, "
-        f"warmup={warmup}, active={active}, quality_check={options.quality_check}, "
+        f"profiler_mode={options.profiler_mode}, warmup={warmup}, active={active}, quality_check={options.quality_check}, "
         f"quality_check_all={options.quality_check_all}, "
         f"quantiles=({options.lower_quantile}, {options.upper_quantile})", detailed=True)
     if not (options.quality_check or options.max_retries or options.measure_budget_ms is not None
@@ -570,7 +611,8 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
                 continue
             pending = []
             for index, measurement in zip(selected, measurements):
-                metrics, failures = evaluate_quality(*measurement.samples) if options.quality_check else ({}, [])
+                with timing_stage(timings, "quality"):
+                    metrics, failures = evaluate_quality(*measurement.samples) if options.quality_check else ({}, [])
                 if measurement.score_ms < getattr(best_reports[index], "score_ms", float("inf")):
                     best_reports[index] = replace(measurement, samples=None, attempt=attempt + 1,
                                                   quality_failures=tuple(failures),

@@ -17,6 +17,7 @@ from pathlib import Path
 from statistics import fmean
 
 from ._npu_benchmark import NpuMeasurementReport, resolve_options
+from ._npu_benchmark import print_timing_report as print_timing_report
 
 REPORT_ENV = "TRITON_NPU_BENCH_REPORT_BEST_CONFIG"
 TIMING_ENV = "TRITON_AUTOTUNE_REPORT_TIMING"
@@ -170,7 +171,8 @@ class AutotuneComparison:
     def record_timing(self, total, durations):
         self.timings.append({
             "autotune": total, **{stage: durations.get(stage, 0)
-                                  for stage in TIMING_STAGES}, "other": max(0, total - sum(durations.values()))
+                                  for stage in TIMING_STAGES}, "other":
+            max(0, total - sum(durations.get(stage, 0) for stage in TIMING_STAGES))
         })
 
     def timing_summary(self):
@@ -360,12 +362,3 @@ def print_best_config_report(function_name, configs, config, measurement=None, *
         stream.write("AUTOTUNE_DECISION " +
                      json.dumps(decision, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n")
     print(stream.getvalue(), end="")
-
-
-def print_timing_report(function_name, started, durations, *, total=None):
-    total = time.perf_counter() - started if total is None else total
-    labels = ("Generation/pruning", "Compilation", "Slow filter", "Calibration", "Measurements (including retries)")
-    lines = [f"Triton autotuning timing for {function_name}", "-" * 60, f"  Total: {total:.6f} s"]
-    lines.extend(f"  {label}: {durations.get(stage, 0):.6f} s" for stage, label in zip(TIMING_STAGES, labels))
-    lines.append(f"  Other: {max(0, total - sum(durations.values())):.6f} s")
-    print("\n".join(lines))
