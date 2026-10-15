@@ -44,7 +44,7 @@ class ProfilerAcquisitionError(RuntimeError):
 class NpuBenchmarkOptions:
     profiler_mode: str = "summary"
     cache_mode: str | None = "hot"
-    warmup: int | None = 50
+    warmup: int | None = None
     active: int | None = 250
     lower_quantile: float = 0.25
     upper_quantile: float = 0.75
@@ -87,7 +87,7 @@ class NpuBenchmarkOptions:
         if self.quality_check:
             from ._benchmark_quality import THRESHOLDS
             thresholds = tuple(sorted(THRESHOLDS.items()))
-        return ("npu-benchmark", 8, self.effective_policy(), thresholds)
+        return ("npu-benchmark", 9, self.effective_policy(), thresholds)
 
 
 def resolve_options():
@@ -534,10 +534,10 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
     funcs = funcs if isinstance(funcs, list) else [funcs]
     if not funcs:
         return []
-    warmup = warmup if options.warmup is None else options.warmup
     active = active if options.active is None else options.active
+    warmup = (active + 9) // 10 if options.warmup is None else options.warmup
     clear_l2_cache = clear_l2_cache if options.cache_mode is None else options.cache_mode == "cold"
-    options = replace(options, warmup=warmup, active=active, cache_mode="cold" if clear_l2_cache else "hot")
+    options = replace(options, active=active, cache_mode="cold" if clear_l2_cache else "hot")
     profile = partial(profile, _quantiles=(options.lower_quantile, options.upper_quantile),
                       _profiler_mode=options.profiler_mode)
     if timings is not None:
@@ -566,9 +566,9 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
         if options.filter_slow_configs:
             indices, durations = filter_slow_configs(funcs, options, clear_l2_cache, pre_hook_scope)
     with timing_stage(timings, "calibration"):
-        options = replace(
-            options, active=calibrate_active(funcs, indices, durations, options, active, clear_l2_cache,
-                                             pre_hook_scope))
+        active = calibrate_active(funcs, indices, durations, options, active, clear_l2_cache, pre_hook_scope)
+        options = replace(options, active=active,
+                          warmup=(active + 9) // 10 if options.warmup is None else options.warmup)
     measurements = _profile_with_retries(profile, funcs, names, indices, options, prof_dir, keep_res, pre_hook_scope,
                                          capture_report=report_sink is not None, timings=timings)
     return benchmark_result(measurements, report_sink)

@@ -1,6 +1,7 @@
 """Summary/full export controls and the shared pandas collector."""
 
 import json
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -173,3 +174,40 @@ def test_comparison_timing_reuses_the_breakdown_and_preserves_csv_totals(backend
     assert comparison.timings[0]["other"] == 10.
     report.print_timing_report("legacy", 0., {"measurements": 50.}, total=60.)
     assert "CANN export/analysis" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("active,budget,warmup,expected", [
+    (1, None, None, (1, 1)),
+    (50, None, None, (5, 50)),
+    (51, None, None, (6, 51)),
+    (250, None, None, (25, 250)),
+    (50, 10., None, (100, 1000)),
+    (50, 10., 0, (0, 1000)),
+    (50, 10., 7, (7, 1000)),
+])
+def test_automatic_warmup_uses_the_final_budget_count(backend, monkeypatch, tmp_path, active, budget, warmup, expected):
+    policy = backend.policy
+
+    @contextmanager
+    def timer(*args):
+        yield lambda fn, count: .01
+
+    calls = []
+
+    def profile(funcs, warmup, active, *args, **kwargs):
+        calls.append((warmup, active))
+        return [policy.NpuMeasurementReport({}, active, warmup, active, "hot", .01, .01)]
+
+    monkeypatch.setattr(policy, "event_timer", timer)
+    options = replace(policy.resolve_options(), active=active, warmup=warmup, measure_budget_ms=budget,
+                      filter_slow_configs=False, quality_check=False, max_retries=0, log_level="off")
+    assert policy.bench_npu(profile, [lambda: None], 5, 30, False, tmp_path, False, "k", options=options) == .01
+    assert calls == [expected]
+
+
+def test_automatic_warmup_environment_and_cache_key(backend, monkeypatch):
+    automatic = backend.policy.resolve_options()
+    assert automatic.warmup is None
+    monkeypatch.setenv("TRITON_NPU_BENCH_WARMUP", "0")
+    explicit = backend.policy.resolve_options()
+    assert explicit.warmup == 0 and explicit.cache_key() != automatic.cache_key()
