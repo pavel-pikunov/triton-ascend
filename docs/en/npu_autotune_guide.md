@@ -30,6 +30,7 @@ export TRITON_PRINT_AUTOTUNING=0
 | `TRITON_NPU_BENCH_LOWER_QUANTILE` | `0.25`; lower quantile boundary of the measured durations averaged for selection. |
 | `TRITON_NPU_BENCH_UPPER_QUANTILE` | `0.75`; upper quantile boundary of the measured durations averaged for selection. |
 | `TRITON_NPU_BENCH_QUALITY_CHECK` | `1`; evaluate the predefined sample-quality metrics. |
+| `TRITON_NPU_BENCH_QUALITY_CHECK_ALL` | `0`; stop after the first failed check. `1` computes all quality metrics for diagnostics, including rejected attempts. Does not change retry decisions or the selection-cache key. |
 | `TRITON_NPU_BENCH_MAX_RETRIES` | `5`; additional attempts for failing quality checks or unusable profiler data; at most six attempts in total. |
 | `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | `10`; estimated accumulated device-time budget per candidate, in milliseconds. `0` disables it; other values must be finite and positive. |
 | `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `50`; measured launches per short event estimate, used by filtering and budget calibration; integer >= 2. |
@@ -99,6 +100,11 @@ in the selection-cache key, and does not remove samples from quality checks.
 Quality checks cover tail contamination, gaps, multimodality, drift, and change
 points using the existing algorithms in `_benchmark_quality.py`. Their thresholds
 are 0.030, 0.2, 0.027, 0.3 and 0.275, respectively.
+Checks normally stop at the first failure; detailed logs then contain only the
+metrics already evaluated. Set `TRITON_NPU_BENCH_QUALITY_CHECK_ALL=1` to evaluate
+all five checks even after a failure. Both modes use all untrimmed samples and
+the same statistics and thresholds. Pairwise statistics use linear auxiliary
+memory; sampled slopes suggest search pivots, never replace the full-sample median.
 Only failing candidates receive quality retries. Failed acquisition of the shared
 CSV retries the current batch. The shared count is retained across retries without recalibration.
 Kernel execution and synchronization failures propagate without retries.

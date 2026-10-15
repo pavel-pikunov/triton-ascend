@@ -46,6 +46,7 @@ class NpuBenchmarkOptions:
     lower_quantile: float = 0.25
     upper_quantile: float = 0.75
     quality_check: bool = True
+    quality_check_all: bool = False
     max_retries: int = 5
     measure_budget_ms: float | None = 10.0
     calibration_runs: int = 50
@@ -62,6 +63,7 @@ class NpuBenchmarkOptions:
             "log_level": False,
             "report_best_config": False,
             "report_timing": False,
+            "quality_check_all": False,
             "calibration_runs": self.measure_budget_ms is not None or self.filter_slow_configs,
             "slow_config_rounds": self.filter_slow_configs,
             "slow_config_factor": self.filter_slow_configs,
@@ -172,12 +174,30 @@ class NpuMeasurementReport:
 def aggregate_profile_rows(frame):
     metrics = {}
     for column in frame.columns:
+        data = frame[column].to_numpy()
+        absolute = re.search(r"(^|[^a-z])(id|timestamp)([^a-z]|$)|start\s*time|end\s*time", column.lower())
+        if data.dtype.kind in "iuf":
+            available = data[~np.isnan(data)] if absolute else data[np.isfinite(data)]
+            count = len(available)
+            value = (str(available[0]) if np.all(available == available[0]) else "varies") if count else "unavailable"
+            metrics[column] = ((float(np.mean(available)), count, True) if count and not absolute else
+                               (value, count, False))
+            continue
+        if len(data) and np.all(data == data[0]):
+            text = str(data[0]).strip()
+            if text.lower() not in {"", "nan", "n/a", "null", "none"}:
+                try:
+                    number = float(text) if not absolute else None
+                except ValueError:
+                    number = None
+                metrics[column] = ((number, len(data), True) if number is not None and math.isfinite(number) else
+                                   (text, len(data), False) if number is None else ("unavailable", 0, False))
+                continue
         values = [
             str(value).strip()
             for value in frame[column]
             if str(value).strip().lower() not in {"", "nan", "n/a", "null", "none"}
         ]
-        absolute = re.search(r"(^|[^a-z])(id|timestamp)([^a-z]|$)|start\s*time|end\s*time", column.lower())
         try:
             numbers = [float(value) for value in values] if not absolute else []
         except ValueError:
@@ -289,12 +309,13 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
         return [None] * num_funcs
 
     df = pd.read_csv(kernel_details_file)
-    filter_cond = (not clear_l2_cache) | ~df["Type"].str.contains(r"^ReduceSum$", case=False, na=False)
-    filter_df = df[filter_cond]
+    filter_df = df[~df["Type"].str.contains(r"^ReduceSum$", case=False, na=False)] if clear_l2_cache else df
     names = ([target_kernel_name] * num_funcs
              if target_kernel_name is None or isinstance(target_kernel_name, str) else list(target_kernel_name))
     if all(name is not None for name in names):
-        filter_df = filter_df[filter_df["Name"].isin(names)]
+        selected = filter_df["Name"].isin(names)
+        if not selected.all():
+            filter_df = filter_df[selected]
 
     if len(names) != num_funcs:
         raise ValueError("Provide one kernel name per function")
@@ -481,6 +502,7 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
     log_stage(
         options.log_level, "Benchmark settings", f"cache={'cold' if clear_l2_cache else 'hot'}, "
         f"warmup={warmup}, active={active}, quality_check={options.quality_check}, "
+        f"quality_check_all={options.quality_check_all}, "
         f"quantiles=({options.lower_quantile}, {options.upper_quantile})", detailed=True)
     if not (options.quality_check or options.max_retries or options.measure_budget_ms is not None
             or options.filter_slow_configs):
@@ -511,6 +533,8 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
                           timings):
     if options.quality_check:
         from ._benchmark_quality import evaluate_quality
+        if options.quality_check_all:
+            evaluate_quality = partial(evaluate_quality, check_all=True)
     best_reports = [None] * len(funcs)
     root = Path(prof_dir) if prof_dir is not None else Path(
         runtime.cache.get_home_dir()) / ".triton" / "profile_results"
