@@ -343,3 +343,27 @@ CPU helper checks do not validate native event/profiler execution. Historical
 policy/report unit tests in this branch still include assertions about removed
 decorator arguments, warning policies and private APIs; those assertions need
 migration before treating the full old suite as the current contract.
+
+## Benchmark kernels with or without autotune
+
+```python
+from triton.backends.ascend import benchmark_npu
+
+benchmark_npu(my_kernel, grid, x, y, n, BLOCK_SIZE=256)
+```
+
+For a fixed JIT kernel, this test-only wrapper measures initial compilation/launch,
+then runs the current NPU pipeline with slow filtering disabled. It reuses the same
+event calibration, shared active/warmup calculation, cache policy, quantile score,
+quality checks, retries, profiler mode and timing/winner reports. The profiler target
+name comes from the compiled kernel. Reports include actual compiled constants and
+compiler metadata. Existing environment flags control output; this wrapper always
+uses the current NPU benchmark for fixed kernels, regardless of BENCH_METHOD.
+
+If the decorator chain already contains an autotuner, the wrapper only launches it;
+that autotuner owns measurement, reporting and cache-hit behavior. No second benchmark
+or duplicate report is added. Autotuner single-config behavior is unchanged.
+
+The wrapper returns the original launch result, including LibEntry tuples. Fixed
+kernels are benchmarked on every wrapper call; kernel arguments must tolerate repeated
+execution. The repeated-autotune CSV experiment does not apply to fixed kernels.

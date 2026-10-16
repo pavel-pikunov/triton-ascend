@@ -211,3 +211,92 @@ def test_automatic_warmup_environment_and_cache_key(backend, monkeypatch):
     monkeypatch.setenv("TRITON_NPU_BENCH_WARMUP", "0")
     explicit = backend.policy.resolve_options()
     assert explicit.warmup == 0 and explicit.cache_key() != automatic.cache_key()
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("reports", [False, True])
+@pytest.mark.parametrize("cache", ["hot", "cold"])
+def test_fixed_kernel_benchmark_reuses_npu_policies(backend, jit_kernel, monkeypatch, capsys, wrapped, reports, cache):
+    policy, testing = backend.policy, backend.testing
+    monkeypatch.setenv("TRITON_BENCH_METHOD", "npu_legacy")
+    for name, value in dict(CACHE_MODE=cache, ACTIVE=8, MEASURE_BUDGET_MS=.4, MAX_RETRIES=2,
+                            REPORT_BEST_CONFIG=int(reports)).items():
+        monkeypatch.setenv(policy.ENV_PREFIX + name, str(value))
+    monkeypatch.setenv("TRITON_AUTOTUNE_REPORT_TIMING", str(int(reports)))
+    compiled = SimpleNamespace(src=SimpleNamespace(name="fixed_kernel", constants={"BLOCK": 32}),
+                               packed_metadata={"kernel_name": "compiled_target"},
+                               metadata=SimpleNamespace(_asdict=lambda: dict(num_warps=4, num_stages=2)))
+    result = (compiled, {"BLOCK": 32}) if wrapped else compiled
+    launches, measurements = [], []
+    data = object()
+
+    def launch(*args, **kwargs):
+        assert args == (data, ) and kwargs == dict(BLOCK=32, grid=(1, ), warmup=False)
+        launches.append(1)
+        return result
+
+    def measure(profile, fn, warmup, active, cold, directory, keep, target, **kwargs):
+        options = kwargs["options"]
+        assert profile is testing._profile_npu and target == "compiled_target"
+        assert not options.filter_slow_configs and options.quality_check
+        assert options.active == active == 8 and options.measure_budget_ms == .4 and options.max_retries == 2
+        assert warmup is None and cold == (cache == "cold")
+        assert (options.lower_quantile, options.upper_quantile) == (.25, .75)
+        assert kwargs["config_numbers"] == [1]
+        assert (kwargs["timings"] is not None) == reports
+        for _ in range(3):
+            fn()
+        measurements.append(1)
+        if reports:
+            record = policy.NpuMeasurementReport({}, 8, 1, 8, cache, .021, .02, quality_checked=True)
+            kwargs["report_sink"]([record])
+        else:
+            assert kwargs["report_sink"] is None
+        return .02
+
+    monkeypatch.setattr(jit_kernel, "run", launch)
+    monkeypatch.setattr(policy, "bench_npu", measure)
+    assert testing.benchmark_npu(jit_kernel, (1, ), data, BLOCK=32) is result
+    assert launches == [1] * 4 and measurements == [1]
+    text = capsys.readouterr().out
+    assert ("Triton autotuning timing for fixed_kernel" in text) == reports
+    assert ("Triton autotuning result for fixed_kernel" in text) == reports
+    if reports:
+        assert "Selection score: 20 us" in text and "Quality checks: passed" in text
+        assert "Selected config: 1/1" in text and "compiler_metadata" in text
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_kernel_benchmark_delegates_existing_autotuner(backend, make_tuner, monkeypatch, capsys, wrapped):
+    from triton.runtime import Heuristics
+
+    tuner = make_tuner()
+    calls, result = [], object()
+
+    def launch(*args, **kwargs):
+        calls.append((args, kwargs))
+        print("Existing autotuner report")
+        return result
+
+    monkeypatch.setattr(tuner, "run", launch)
+    monkeypatch.setattr(backend.policy, "resolve_options", lambda: pytest.fail("unexpected standalone benchmark"))
+    kernel = Heuristics(tuner, tuner.arg_names, {}) if wrapped else tuner
+    assert backend.testing.benchmark_npu(kernel, (1, ), "input", BLOCK=32) is result
+    assert calls == [(("input", ), dict(grid=(1, ), warmup=False, BLOCK=32))]
+    assert capsys.readouterr().out == "Existing autotuner report\n"
+
+
+@pytest.mark.parametrize("stage", ["compilation", "measurements"])
+def test_fixed_kernel_benchmark_propagates_errors(backend, jit_kernel, monkeypatch, capsys, stage):
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(stage)
+
+    compiled = SimpleNamespace(src=SimpleNamespace(name="fixed_kernel"),
+                               packed_metadata={"kernel_name": "compiled_target"})
+    monkeypatch.setattr(jit_kernel, "run", fail if stage == "compilation" else lambda *a, **k: compiled)
+    monkeypatch.setattr(backend.policy, "bench_npu",
+                        fail if stage == "measurements" else lambda *a, **k: pytest.fail("bench after compile failure"))
+    with pytest.raises(RuntimeError, match=stage):
+        backend.testing.benchmark_npu(jit_kernel, (1, ), "input", BLOCK=32)
+    assert capsys.readouterr().out == ""

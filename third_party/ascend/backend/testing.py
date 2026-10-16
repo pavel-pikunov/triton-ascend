@@ -47,6 +47,44 @@ def do_bench_npu(
     return bench_npu(_profile_npu, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name)
 
 
+def benchmark_npu(kernel, grid, *args, **kwargs):
+    """Launch a Triton kernel; benchmark/report fixed kernels, delegate autotuned ones.
+
+    Returns the original launch result. Fixed kernels are measured on every call
+    using NPU environment policies with slow filtering disabled.
+    """
+    fn = kernel
+    while hasattr(fn, "fn"):
+        if isinstance(fn, runtime.Autotuner):
+            return kernel[grid](*args, **kwargs)
+        fn = fn.fn
+
+    import time
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from . import _npu_benchmark as benchmark
+    from ._autotune_report import print_best_config_report
+
+    options = replace(benchmark.resolve_options(), filter_slow_configs=False)
+    timings = {} if options.report_timing else None
+    records = []
+    started = time.perf_counter()
+    with benchmark.timing_stage(timings, "compilation"):
+        result = kernel[grid](*args, **kwargs)
+    compiled = result[0] if isinstance(result, tuple) else result
+    name = compiled.src.name
+    benchmark.bench_npu(_profile_npu, lambda: kernel[grid](*args, **kwargs), options.warmup, options.active,
+                        options.cache_mode == "cold", None, False, compiled.packed_metadata["kernel_name"],
+                        options=options, report_sink=records.extend if options.report_best_config else None,
+                        timings=timings, config_numbers=[1])
+    if options.report_timing:
+        benchmark.report_safely(lambda: benchmark.print_timing_report(name, started, timings))
+    if options.report_best_config:
+        config = SimpleNamespace(kwargs=compiled.src.constants, compiler_metadata=compiled.metadata._asdict())
+        benchmark.report_safely(lambda: print_best_config_report(name, [config], config, records[0]))
+    return result
+
+
 def _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name, *,
                  _return_samples=False, _pre_hook_scope=None, _execution_state=None, _capture_report=False,
                  _quantiles=(0.0, 1.0), _timings=None, _profiler_mode="summary"):
