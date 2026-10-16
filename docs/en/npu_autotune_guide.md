@@ -45,9 +45,9 @@ export TRITON_PRINT_AUTOTUNING=0
 | `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | `10`; estimated accumulated device-time budget per candidate, in milliseconds. `0` disables it; other values must be finite and positive. |
 | `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; measured launches per short event estimate, used by filtering and budget calibration; integer >= 2. |
 | `TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS` | `1`; enable preliminary filtering through NPU events under the selected cache policy. |
-| `TRITON_NPU_BENCH_SLOW_CONFIG_ROUNDS` | `7`; total filtering rounds per winner, including the first; integer >= 1. |
+| `TRITON_NPU_BENCH_SLOW_CONFIG_ROUNDS` | `10`; total filtering rounds per winner, including the first; integer >= 1. |
 | `TRITON_NPU_BENCH_SLOW_CONFIG_FACTOR` | `2.5`; recheck candidates above this multiple of the current winner's retained minimum; finite and >= 1. |
-| `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_DELAY_S` | `0.05`; finite, nonnegative pause before each needed subsequent round. `0` disables the pause. |
+| `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_DELAY_S` | `0`; finite, nonnegative pause before each needed subsequent round. `0` disables the pause. |
 
 Boolean values accept `0`, `1`, `false`, and `true`. Settings do not enable one
 another: quality checks do not automatically enable retries, filtering, or a budget.
