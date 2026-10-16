@@ -43,9 +43,9 @@ class ProfilerAcquisitionError(RuntimeError):
 @dataclass(frozen=True)
 class NpuBenchmarkOptions:
     profiler_mode: str = "summary"
-    cache_mode: str | None = "hot"
+    cache_mode: str = "hot"
     warmup: int | None = None
-    active: int | None = 250
+    active: int = 250
     lower_quantile: float = 0.25
     upper_quantile: float = 0.75
     quality_check: bool = True
@@ -73,14 +73,6 @@ class NpuBenchmarkOptions:
             "slow_config_recheck_delay_s": self.filter_slow_configs and self.slow_config_rounds > 1,
         }
         return tuple(sorted((name, value) for name, value in asdict(self).items() if enabled.get(name, True)))
-
-    @property
-    def is_default(self):
-        """Whether measurement policies leave the original benchmark behavior intact."""
-        return (self.profiler_mode == "full" and self.cache_mode is None and self.warmup is None and self.active is None
-                and self.lower_quantile == 0 and self.upper_quantile == 1
-                and not (self.quality_check or self.max_retries or self.measure_budget_ms is not None
-                         or self.filter_slow_configs))
 
     def cache_key(self):
         thresholds = ()
@@ -127,7 +119,7 @@ def resolve_options():
         values[name] = value
     if not 0 <= values["lower_quantile"] < values["upper_quantile"] <= 1:
         raise ValueError("TRITON_NPU_BENCH quantiles must satisfy 0 <= LOWER_QUANTILE < UPPER_QUANTILE <= 1")
-    if values["quality_check"] and values["active"] is not None and values["active"] < 2:
+    if values["quality_check"] and values["active"] < 2:
         raise ValueError("quality_check requires active >= 2")
     return NpuBenchmarkOptions(**values)
 
@@ -534,10 +526,9 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
     funcs = funcs if isinstance(funcs, list) else [funcs]
     if not funcs:
         return []
-    active = active if options.active is None else options.active
+    active = options.active
     warmup = (active + 9) // 10 if options.warmup is None else options.warmup
-    clear_l2_cache = clear_l2_cache if options.cache_mode is None else options.cache_mode == "cold"
-    options = replace(options, active=active, cache_mode="cold" if clear_l2_cache else "hot")
+    clear_l2_cache = options.cache_mode == "cold"
     profile = partial(profile, _quantiles=(options.lower_quantile, options.upper_quantile),
                       _profiler_mode=options.profiler_mode)
     if timings is not None:

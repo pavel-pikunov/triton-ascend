@@ -81,14 +81,14 @@ def cache_pre_hook(tuner, evict_cache):
         tuner.pre_hook = original
 
 
-def profile_candidates(tuner, kernels_call, run_fns, warmup, active, report_sink):
+def profile_candidates(tuner, kernels_call, run_fns, report_sink):
     from .testing import _profile_npu
 
     options = tuner._npu_options
-    names = (tuner._resolve_target_kernel_name(kernels_call, run_fns.keys()) if options.is_default else
-             [getattr(kernels_call[config], "target_kernel_name", None) for config in run_fns])
+    names = [getattr(kernels_call[config], "target_kernel_name", None) for config in run_fns]
     costs = benchmark.bench_npu(
-        _profile_npu, list(run_fns.values()), warmup, active, True, None, False, names, options=options,
+        _profile_npu, list(run_fns.values()), options.warmup, options.active, options.cache_mode == "cold", None, False,
+        names, options=options,
         pre_hook_scope=functools.partial(cache_pre_hook, tuner) if options.cache_mode == "cold" else None,
         report_sink=(lambda records: report_sink(dict(zip(run_fns, records)))) if report_sink is not None else None,
         timings=durations(tuner))

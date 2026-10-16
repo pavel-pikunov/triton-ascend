@@ -2117,7 +2117,7 @@ class AutoTilingTuner(Autotuner):
             )
             return float("inf")
 
-    def _prune_by_time_limit(self, run_fns: Dict[Config, Any], *, warmup=None) -> Dict[Config, Any]:
+    def _prune_by_time_limit(self, run_fns: Dict[Config, Any]) -> Dict[Config, Any]:
         time_limit = 200
 
         if len(run_fns) <= 1:
@@ -2130,7 +2130,7 @@ class AutoTilingTuner(Autotuner):
         sorted_configs = sorted(rough_timings.keys(), key=lambda c: rough_timings[c])
 
         fastest_time = rough_timings[sorted_configs[0]]
-        n_warmup = max(1, int(25 / fastest_time)) if warmup is None else warmup
+        n_warmup = max(1, int(25 / fastest_time))
         n_repeat = max(1, int(100 / fastest_time))
         self.cv_warmup = n_warmup
         self.cv_repeat = n_repeat
@@ -2198,7 +2198,7 @@ class AutoTilingTuner(Autotuner):
         if dtype is None:
             raise NotImplementedError("Not support for non-Tensor inputs")
 
-        if self._npu_options is not None and not self._npu_options.is_default:
+        if self._npu_options is not None:
             key.append(self._npu_options.cache_key())
         key = tuple(key)
         if key not in self.cache:
@@ -2380,47 +2380,16 @@ class AutoTilingTuner(Autotuner):
         if len(run_fns) == 0:
             raise RuntimeError(f"No valid triton configs. {type(exc).__name__}: {exc} \nStack trace: {exc_stack}")
 
-        if len(run_fns) == 1 and (self._npu_options is None or self._npu_options.is_default):
+        if len(run_fns) == 1 and self._npu_options is None:
             # we ignore expensive profiling method when only single config is left
             return {config: self.do_bench(fn, quantiles=(0.5, 0.2, 0.8)) for config, fn in run_fns.items()}
 
-        use_cv_counts = (self.parser_mode in ("cube", "mix") and self.cv_parse_result is not None
-                         and (self._npu_options is None or
-                              (self._npu_options.active is None and self._npu_options.measure_budget_ms is None)))
-        if use_cv_counts:
-            overrides = ({"warmup": self._npu_options.warmup}
-                         if self._npu_options is not None and self._npu_options.warmup is not None else {})
-            candidate_count = len(run_fns)
-            with npu_tuning.stage(self, "slow_filter"):
-                run_fns = self._prune_by_time_limit(run_fns, **overrides)
-            npu_tuning.log_candidates(self, "Time-limit pruning result", len(run_fns), candidate_count)
+        if self._npu_options is None and self.parser_mode in ("cube", "mix") and self.cv_parse_result is not None:
+            run_fns = self._prune_by_time_limit(run_fns)
 
-        use_profiling = os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu"
-        # Respect user-provided benchmarkers even when NPU profiling mode is enabled.
-        use_npu_profiling = use_profiling and not self.user_defined_do_bench
-        if use_npu_profiling:
-            from ..testing import ProfilerResultMismatchError
-
-            warmup = self.cv_warmup if use_cv_counts else 5
-            active = self.cv_repeat if use_cv_counts else 30
-            try:
-                return npu_tuning.profile_candidates(self, kernels_call, run_fns, warmup, active, _report_sink)
-            except ProfilerResultMismatchError:
-                if not self._npu_options.is_default:
-                    raise
-                return {config: self.do_bench(fn, quantiles=(0.5, 0.2, 0.8)) for config, fn in run_fns.items()}
-        else:
-            return {config: self.do_bench(fn, quantiles=(0.5, 0.2, 0.8)) for config, fn in run_fns.items()}
-
-    def _resolve_target_kernel_name(self, kernels_call, configs) -> Optional[str]:
-        for config in configs:
-            kernel_call = kernels_call.get(config)
-            if kernel_call is None:
-                continue
-            kernel_name = getattr(kernel_call, "target_kernel_name", None)
-            if kernel_name:
-                return kernel_name
-        return None
+        if self._npu_options is not None:
+            return npu_tuning.profile_candidates(self, kernels_call, run_fns, _report_sink)
+        return {config: self.do_bench(fn, quantiles=(0.5, 0.2, 0.8)) for config, fn in run_fns.items()}
 
     def _make_kernel_call(self, *args, config, **meta):
         # check for conflicts, i.e. meta-parameters both provided

@@ -72,8 +72,8 @@ controls the short event estimates. The ordinary and custom benchmarkers are unc
 Event pairs are reused between candidates, with storage bounded by the largest
 requested series. Hot estimates synchronize after warmup and after the complete
 series; cold estimates also retain the existing cache-preparation synchronization.
-The release CV time-limit pruning also retains its original implementation; explicit
-`ACTIVE` or `MEASURE_BUDGET_MS` bypasses that separate pruning and count calculation.
+The ordinary and custom benchmarkers retain release CV time-limit pruning and
+count calculation. The NPU path uses configured counts and event calibration.
 
 A measurement budget sets
 one shared `active = max(active, ceil(measure_budget_ms / minimum_event_duration_ms))`
@@ -86,7 +86,7 @@ When those results are unavailable, one preliminary call and `CALIBRATION_RUNS`
 event measurements estimate each candidate under the requested profiler cache
 policy. Calibration creates no profiler session or CSV. Event estimates determine
 the shared count only; final ranking uses profiler kernel durations. Without a
-budget, the original active count is retained. The budget is an estimate,
+budget, the configured active count is retained. The budget is an estimate,
 not a guarantee of accumulated kernel time or a wall-clock timeout.
 
 ## Profiler attempts and selection
