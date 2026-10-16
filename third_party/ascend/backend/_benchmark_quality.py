@@ -8,11 +8,11 @@ from scipy.stats import rankdata
 from scipy.stats._stats import _kendall_dis
 
 THRESHOLDS = {
-    "mean_trimmed_relative_deviation": 0.05,
-    "central_gap_ratio": 0.30,
-    "dip_statistic": 0.05,
-    "normalized_drift": 0.45,
-    "normalized_change_point": 0.42,
+    "mean_trimmed_relative_deviation": 0.04,
+    "central_gap_ratio": 0.26,
+    "dip_statistic": 0.04,
+    "normalized_drift": 0.39,
+    "normalized_change_point": 0.36,
 }
 
 
