@@ -289,7 +289,7 @@ def export_npu_summary(profiler_path, timings=None):
 
 
 def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_name=None, clear_l2_cache=False,
-                         _return_samples=False, _capture_report=False, _quantiles=(0.0, 1.0)):
+                         _return_samples=False, _capture_report=False, _quantiles=(0.0, 1.0), _aggregate_calls=False):
     """
     Collect per-function measurements, reading each profiler CSV once.
 
@@ -323,6 +323,7 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
         for scoring; (0, 1) averages all samples. Indices are rounded down,
         retaining at least one sample. Quality samples are not trimmed.
     :type _quantiles: Tuple[float, float]
+    :param _aggregate_calls: sum a fixed kernel sequence into one sample per operation call
     :return: one measurement record per function, or None entries if CSV is missing
         and _return_samples is False; benchmark_result converts None to inf
     :rtype: List[Optional[NpuMeasurementReport]]
@@ -360,6 +361,25 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
     if num_warmup < 0 or num_active < 1:
         raise ValueError("Warmup must be nonnegative and active positive")
     expected_rows = num_funcs * (num_warmup + num_active)
+
+    if _aggregate_calls:
+        # A fixed operation must launch the same ordered kernel sequence on every call.
+        if len(filter_df) == 0 or len(filter_df) % expected_rows:
+            raise ProfilerAcquisitionError("Operation kernel count changed between calls")
+        width = len(filter_df) // expected_rows
+        sequence = filter_df["Name"].to_numpy().reshape(expected_rows, width)
+        if not np.all(sequence == sequence[0]):
+            raise ProfilerAcquisitionError("Operation kernel sequence changed between calls")
+        filter_df = pd.DataFrame({
+            "Name": [" + ".join(map(str, sequence[0]))] * expected_rows,
+            "Type":
+            "Operation",
+            "Start Time(us)":
+            filter_df["Start Time(us)"].to_numpy().reshape(expected_rows, width)[:, 0],
+            "Duration(us)":
+            filter_df["Duration(us)"].to_numpy(dtype=float).reshape(expected_rows, width).sum(axis=1),
+        })
+
     if target_kernel_name is not None and len(filter_df) != expected_rows:
         raise ProfilerResultMismatchError(target_kernel_name, expected_rows, len(filter_df))
 

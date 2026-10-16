@@ -47,21 +47,25 @@ def do_bench_npu(
     return bench_npu(_profile_npu, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name)
 
 
-def benchmark_npu(kernel, grid, *args, **kwargs):
+def benchmark_npu(kernel, grid=None, *args, **kwargs):
     """Launch a Triton kernel; benchmark/report fixed kernels, delegate autotuned ones.
 
+    With grid=None, accepts a zero-argument operation (also exported as perf_npu).
     Returns the original launch result. Fixed kernels are measured on every call
     using NPU environment policies with slow filtering disabled.
     """
+    launch = kernel if grid is None else lambda: kernel[grid](*args, **kwargs)
     fn = kernel
-    while hasattr(fn, "fn"):
+    while grid is not None and hasattr(fn, "fn"):
         if isinstance(fn, runtime.Autotuner):
-            return kernel[grid](*args, **kwargs)
+            return launch()
         fn = fn.fn
 
     import time
     from dataclasses import replace
     from types import SimpleNamespace
+    from functools import partial
+    from ._autotune_comparison import _perf_measured
     from . import _npu_benchmark as benchmark
     from ._autotune_report import print_best_config_report
 
@@ -69,25 +73,36 @@ def benchmark_npu(kernel, grid, *args, **kwargs):
     timings = {} if options.report_timing else None
     records = []
     started = time.perf_counter()
-    with benchmark.timing_stage(timings, "compilation"):
-        result = kernel[grid](*args, **kwargs)
-    compiled = result[0] if isinstance(result, tuple) else result
-    name = compiled.src.name
-    benchmark.bench_npu(_profile_npu, lambda: kernel[grid](*args, **kwargs), options.warmup, options.active,
-                        options.cache_mode == "cold", None, False, compiled.packed_metadata["kernel_name"],
-                        options=options, report_sink=records.extend if options.report_best_config else None,
+    token = _perf_measured.set(False)
+    try:
+        with benchmark.timing_stage(timings, "compilation"):
+            result = launch()
+        measured = _perf_measured.get()
+    finally:
+        _perf_measured.reset(token)
+    if measured:
+        _perf_measured.set(True)
+        return result
+    compiled = (result[0] if isinstance(result, tuple) else result) if grid is not None else None
+    name = compiled.src.name if compiled is not None else getattr(kernel, "__name__", "operation")
+    target = compiled.packed_metadata["kernel_name"] if compiled is not None else None
+    profile = _profile_npu if compiled is not None else partial(_profile_npu, _aggregate_calls=True)
+    benchmark.bench_npu(profile, launch, options.warmup, options.active, options.cache_mode == "cold", None, False,
+                        target, options=options, report_sink=records.extend if options.report_best_config else None,
                         timings=timings, config_numbers=[1])
     if options.report_timing:
         benchmark.report_safely(lambda: benchmark.print_timing_report(name, started, timings))
     if options.report_best_config:
-        config = SimpleNamespace(kwargs=compiled.src.constants, compiler_metadata=compiled.metadata._asdict())
+        config = (SimpleNamespace(kwargs=compiled.src.constants, compiler_metadata=compiled.metadata._asdict())
+                  if compiled is not None else SimpleNamespace(operation=name,
+                                                               measurement="sum of device kernel durations per call"))
         benchmark.report_safely(lambda: print_best_config_report(name, [config], config, records[0]))
     return result
 
 
 def _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name, *,
                  _return_samples=False, _pre_hook_scope=None, _execution_state=None, _capture_report=False,
-                 _quantiles=(0.0, 1.0), _timings=None, _profiler_mode="summary"):
+                 _quantiles=(0.0, 1.0), _timings=None, _profiler_mode="summary", _aggregate_calls=False):
     import torch
     import torch_npu
     from ._npu_benchmark import _collect_prof_result, export_npu_summary, profile_scope, result_scope, timing_stage
@@ -180,6 +195,7 @@ def _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, targ
                 _return_samples=_return_samples,
                 _capture_report=_capture_report,
                 _quantiles=_quantiles,
+                _aggregate_calls=_aggregate_calls,
             )
 
 

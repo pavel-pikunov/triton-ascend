@@ -3,9 +3,12 @@
 import functools
 import os
 import time
+from contextvars import ContextVar
 
 from . import _autotune_report as report_module
 from . import _autotune_npu as npu_tuning
+
+_perf_measured = ContextVar("npu_perf_measured", default=False)
 
 
 def initialize(tuner, options=None, report=None, report_timing=None):
@@ -75,6 +78,8 @@ def record_comparison(tuner, config, timings, cache_miss):
 
 
 def record_scored_candidates(tuner, configs):
+    if configs:
+        _perf_measured.set(True)
     if tuner._autotune_selection is not None:
         report_module.report_safely(lambda: report_module.record_scored_candidates(tuner._autotune_selection, configs))
 
