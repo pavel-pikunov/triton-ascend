@@ -93,10 +93,11 @@ def benchmark_npu(kernel, grid=None, *args, **kwargs):
     if options.report_timing:
         benchmark.report_safely(lambda: benchmark.print_timing_report(name, started, timings))
     if options.report_best_config:
-        config = (SimpleNamespace(kwargs=compiled.src.constants, compiler_metadata=compiled.metadata._asdict())
-                  if compiled is not None else SimpleNamespace(operation=name,
-                                                               measurement="sum of device kernel durations per call"))
-        benchmark.report_safely(lambda: print_best_config_report(name, [config], config, records[0]))
+        if compiled is None:
+            benchmark.report_safely(lambda: benchmark.print_operation_report(name, records[0]))
+        else:
+            config = SimpleNamespace(kwargs=compiled.src.constants, compiler_metadata=compiled.metadata._asdict())
+            benchmark.report_safely(lambda: print_best_config_report(name, [config], config, records[0]))
     return result
 
 
