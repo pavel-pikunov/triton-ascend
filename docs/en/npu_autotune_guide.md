@@ -24,8 +24,9 @@ export TRITON_PRINT_AUTOTUNING=0
 
 | Environment variable | Default / meaning |
 | --- | --- |
+| `TRITON_NPU_BENCH_PROFILER_MODE` | `summary`; export native CANN summary CSVs. `full` uses the previous torch_npu analysis and kernel_details.csv. |
 | `TRITON_NPU_BENCH_CACHE_MODE` | `hot`; `cold` evicts L2; `hot` does not explicitly evict it between profiler launches. |
-| `TRITON_NPU_BENCH_WARMUP` | `50`; warmup launches per candidate; integer >= 0. |
+| `TRITON_NPU_BENCH_WARMUP` | Unset: `ceil(active / 10)` using the final budget-adjusted active. An explicit integer >= 0 overrides it; `0` disables profiler warmup. |
 | `TRITON_NPU_BENCH_ACTIVE` | `250`; minimum measured launches per candidate; integer >= 1, or >= 2 with quality checks. |
 | `TRITON_NPU_BENCH_LOWER_QUANTILE` | `0.25`; lower quantile boundary of the measured durations averaged for selection. |
 | `TRITON_NPU_BENCH_UPPER_QUANTILE` | `0.75`; upper quantile boundary of the measured durations averaged for selection. |
@@ -33,11 +34,11 @@ export TRITON_PRINT_AUTOTUNING=0
 | `TRITON_NPU_BENCH_QUALITY_CHECK_ALL` | `0`; stop after the first failed check. `1` computes all quality metrics for diagnostics, including rejected attempts. Does not change retry decisions or the selection-cache key. |
 | `TRITON_NPU_BENCH_MAX_RETRIES` | `5`; additional attempts for failing quality checks or unusable profiler data; at most six attempts in total. |
 | `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | `10`; estimated accumulated device-time budget per candidate, in milliseconds. `0` disables it; other values must be finite and positive. |
-| `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `50`; measured launches per short event estimate, used by filtering and budget calibration; integer >= 2. |
+| `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; measured launches per short event estimate, used by filtering and budget calibration; integer >= 2. |
 | `TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS` | `1`; enable preliminary filtering through NPU events under the selected cache policy. |
-| `TRITON_NPU_BENCH_SLOW_CONFIG_ROUNDS` | `5`; total filtering rounds per winner, including the first; integer >= 1. |
-| `TRITON_NPU_BENCH_SLOW_CONFIG_FACTOR` | `2`; recheck candidates above this multiple of the current winner's retained minimum; finite and >= 1. |
-| `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_DELAY_S` | `0.2`; finite, nonnegative pause before each needed subsequent round. `0` disables the pause. |
+| `TRITON_NPU_BENCH_SLOW_CONFIG_ROUNDS` | `10`; total filtering rounds per winner, including the first; integer >= 1. |
+| `TRITON_NPU_BENCH_SLOW_CONFIG_FACTOR` | `2.5`; recheck candidates above this multiple of the current winner's retained minimum; finite and >= 1. |
+| `TRITON_NPU_BENCH_SLOW_CONFIG_RECHECK_DELAY_S` | `0`; finite, nonnegative pause before each needed subsequent round. `0` disables the pause. |
 
 Boolean values accept `0`, `1`, `false`, and `true`. Settings do not enable one
 another: quality checks do not automatically enable retries, filtering, or a budget.
@@ -61,13 +62,16 @@ current winner. If another candidate obtains a strictly lower minimum, it become
 the winner: all original candidates are reclassified and the round counter restarts
 at 1. Ties preserve the current winner. Previously retained candidates can become
 suspects under the new threshold. Candidates still slow after the configured number
-of rounds are excluded. One round permits immediate filtering; the default five
-rounds provide four rechecks per winner.
+of rounds are excluded. One round permits immediate filtering; the default ten
+rounds provide nine rechecks per winner.
 
 There is one pause before each needed recheck round. No pause or recheck occurs
 without suspects, with fewer than two candidates, or with one configured round.
 `SLOW_CONFIG_RUNS` and `SLOW_CONFIG_RECHECK_RUNS` are not used; `CALIBRATION_RUNS`
 controls the short event estimates. The ordinary and custom benchmarkers are unchanged.
+Event pairs are reused between candidates, with storage bounded by the largest
+requested series. Hot estimates synchronize after warmup and after the complete
+series; cold estimates also retain the existing cache-preparation synchronization.
 The release CV time-limit pruning also retains its original implementation; explicit
 `ACTIVE` or `MEASURE_BUDGET_MS` bypasses that separate pruning and count calculation.
 
@@ -75,6 +79,9 @@ A measurement budget sets
 one shared `active = max(active, ceil(measure_budget_ms / minimum_event_duration_ms))`
 for all surviving candidates, using the fastest retained event launch.
 Calibration reuses slow-filter minima.
+Profiler warmup defaults to `(active + 9) // 10` after the shared active count is
+calibrated: active 50 gives 5 warmup launches, 51 gives 6, and 250 gives 25.
+An explicit `TRITON_NPU_BENCH_WARMUP` is preserved, including zero.
 When those results are unavailable, one preliminary call and `CALIBRATION_RUNS`
 event measurements estimate each candidate under the requested profiler cache
 policy. Calibration creates no profiler session or CSV. Event estimates determine
@@ -99,7 +106,7 @@ quantile values. Trimming affects selection only, participates
 in the selection-cache key, and does not remove samples from quality checks.
 Quality checks cover tail contamination, gaps, multimodality, drift, and change
 points using the existing algorithms in `_benchmark_quality.py`. Their thresholds
-are 0.030, 0.2, 0.027, 0.3 and 0.275, respectively.
+are 0.04, 0.26, 0.04, 0.39 and 0.36, respectively.
 Checks normally stop at the first failure; detailed logs then contain only the
 metrics already evaluated. Set `TRITON_NPU_BENCH_QUALITY_CHECK_ALL=1` to evaluate
 all five checks even after a failure. Both modes use all untrimmed samples and
@@ -151,5 +158,15 @@ filter measurements belong to filtering time; calibration does not count them
 again. Timing ends before the optional extra winner profile, final kernel call,
 and final report output. Cache hits repeat neither stages nor reports.
 
+The final measurement line additionally contains exclusive
+times for profiled launches/synchronization, CANN export/analysis, CSV/aggregates,
+quality and remaining measurement overhead (including setup/finalization).
+
 The optional `auto_prof_dir` profile retains its existing invocation and reads the
 NPU measurement environment through `do_bench_npu`.
+
+Summary mode collects Level1 data without AiCore counters and exports CSVs with
+the installed CANN `msprof.py export summary` tool. Full mode retains Level1
+and PipeUtilization counters with the ordinary torch_npu analysis. Both modes
+use the same launch counts, score and quality checks; profiler overhead can differ.
+Summary export requires the installed CANN tool and does not silently fall back.
