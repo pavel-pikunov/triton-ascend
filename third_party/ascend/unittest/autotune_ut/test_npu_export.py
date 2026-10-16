@@ -300,3 +300,109 @@ def test_fixed_kernel_benchmark_propagates_errors(backend, jit_kernel, monkeypat
     with pytest.raises(RuntimeError, match=stage):
         backend.testing.benchmark_npu(jit_kernel, (1, ), "input", BLOCK=32)
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("reports", [False, True])
+def test_callable_benchmark_uses_quality_retries(backend, monkeypatch, capsys, tmp_path, reports):
+    policy, testing = backend.policy, backend.testing
+    for name, value in dict(ACTIVE=8, WARMUP=2, MEASURE_BUDGET_MS=0, MAX_RETRIES=1,
+                            REPORT_BEST_CONFIG=int(reports)).items():
+        monkeypatch.setenv(policy.ENV_PREFIX + name, str(value))
+    monkeypatch.setenv("TRITON_AUTOTUNE_REPORT_TIMING", str(int(reports)))
+    monkeypatch.setattr(policy.runtime.cache, "get_home_dir", lambda: str(tmp_path))
+    calls, attempts = [], []
+    result = object()
+
+    def operation():
+        calls.append(1)
+        return result
+
+    def profile(funcs, warmup, active, cold, directory, keep, names, **kwargs):
+        assert kwargs["_aggregate_calls"] and names == [None]
+        assert warmup == 2 and active == 8
+        for _ in range(warmup + active):
+            funcs[0]()
+        attempts.append(1)
+        duration = .02 if len(attempts) == 1 else .021
+        count = warmup + active
+        pd.DataFrame({
+            "Name": ["first", "second"] * count, "Type": "Kernel", "Start Time(us)": np.arange(2 * count) * 100 + 1,
+            "Duration(us)": duration * 500
+        }).to_csv(Path(directory) / "kernel_details.csv", index=False)
+        return policy._collect_prof_result(directory, funcs, warmup, active, names,
+                                           _return_samples=kwargs["_return_samples"],
+                                           _capture_report=kwargs["_capture_report"], _quantiles=kwargs["_quantiles"],
+                                           _aggregate_calls=kwargs["_aggregate_calls"])
+
+    monkeypatch.setattr(testing, "_profile_npu", profile)
+    monkeypatch.setattr(backend.quality, "evaluate_quality", lambda *a: ({}, ["unstable"]
+                                                                         if len(attempts) == 1 else []))
+    assert testing.benchmark_npu(operation) is result
+    assert len(attempts) == 2 and len(calls) == 21
+    text = capsys.readouterr().out
+    assert ("Triton autotuning timing for operation" in text) == reports
+    assert ("Selection score: 20 us" in text) == reports
+
+
+@pytest.mark.parametrize("reports", [False, True])
+def test_callable_does_not_repeat_autotuner_measurements(backend, make_tuner, monkeypatch, capsys, reports):
+    from importlib import import_module
+    comparison = import_module(backend.testing.__package__ + "._autotune_comparison")
+    tuner = make_tuner()
+    tuner._autotune_selection = None
+    monkeypatch.setenv("TRITON_NPU_BENCH_REPORT_BEST_CONFIG", str(int(reports)))
+    monkeypatch.setenv("TRITON_AUTOTUNE_REPORT_TIMING", str(int(reports)))
+    monkeypatch.setattr(backend.policy, "bench_npu", lambda *a, **k: pytest.fail("duplicate benchmark"))
+    calls, result = [], object()
+
+    def operation():
+        calls.append(1)
+        comparison.record_scored_candidates(tuner, {object(): .02})
+        if reports:
+            print("Existing autotuner report")
+        return result
+
+    assert backend.testing.benchmark_npu(operation) is result
+    assert calls == [1]
+    assert capsys.readouterr().out == ("Existing autotuner report\n" if reports else "")
+
+
+def test_callable_exception_restores_measurement_scope(backend):
+    from importlib import import_module
+    comparison = import_module(backend.testing.__package__ + "._autotune_comparison")
+    previous = comparison._perf_measured.get()
+
+    def fail():
+        comparison._perf_measured.set(not previous)
+        raise RuntimeError("operation failed")
+
+    with pytest.raises(RuntimeError, match="operation failed"):
+        backend.testing.benchmark_npu(fail)
+    assert comparison._perf_measured.get() == previous
+
+
+@pytest.mark.parametrize("width", [1, 2, 3])
+@pytest.mark.parametrize("names", [None, [None]])
+def test_operation_collector_sums_kernels_per_call(backend, tmp_path, width, names):
+    count = 6
+    durations = np.arange(count * width, dtype=float).reshape(count, width) + 1
+    pd.DataFrame({
+        "Name": [f"k{i}" for i in range(width)] * count, "Type": "Kernel", "Start Time(us)":
+        np.arange(count * width) + 1, "Duration(us)": durations.ravel()
+    }).to_csv(tmp_path / "kernel_details.csv", index=False)
+    record, = backend.policy._collect_prof_result(tmp_path, [lambda: None], 2, 4, names, _return_samples=True,
+                                                  _capture_report=True, _quantiles=(.25, .75), _aggregate_calls=True)
+    totals = durations.sum(axis=1)[2:]
+    assert record.score_ms == np.mean(np.sort(totals)[1:3]) / 1000
+    assert record.mean_ms == np.mean(totals) / 1000
+    np.testing.assert_array_equal(record.samples[1], totals)
+    np.testing.assert_array_equal(record.samples[0], (np.arange(count * width) + 1).reshape(count, width)[2:, 0])
+    assert record.sample_count == 4 and record.metrics["Duration(us)"][0] == np.mean(totals)
+
+
+@pytest.mark.parametrize("names", [["a", "b", "a"], ["a", "b", "b", "a"]])
+def test_operation_collector_rejects_changing_sequence(backend, tmp_path, names):
+    pd.DataFrame({"Name": names, "Type": "Kernel", "Start Time(us)": np.arange(len(names)) + 1, "Duration(us)":
+                  10}).to_csv(tmp_path / "kernel_details.csv", index=False)
+    with pytest.raises(backend.policy.ProfilerAcquisitionError, match="Operation kernel"):
+        backend.policy._collect_prof_result(tmp_path, [lambda: None], 0, 2, _aggregate_calls=True)

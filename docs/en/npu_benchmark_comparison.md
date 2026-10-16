@@ -367,3 +367,49 @@ or duplicate report is added. Autotuner single-config behavior is unchanged.
 The wrapper returns the original launch result, including LibEntry tuples. Fixed
 kernels are benchmarked on every wrapper call; kernel arguments must tolerate repeated
 execution. The repeated-autotune CSV experiment does not apply to fixed kernels.
+
+
+## Plug into operation-level performance tests
+
+Replace only the NPU performance function chosen by `auto_switch_platform`:
+
+```python
+from triton.backends.ascend import perf_npu
+
+# Inside the existing platform selector:
+if platform == "npu":
+    perf_fn = perf_npu
+```
+
+Existing tests keep their interface:
+
+```python
+perf(lambda: apply_penalties(logits, token_freqs, pres_pens, freq_pens,
+                             rep_pens, temps, blocksize))
+```
+
+`perf_npu(fn)` is the callable form of `benchmark_npu`, not a second measurement
+implementation. It runs `fn()` once and observes completed tuning decisions in the
+current Python context. If an autotuner measured candidates, it returns that call's
+result without another benchmark or report. This works through Python wrappers
+and with NPU, legacy and default test-branch tuners, independently of report flags.
+It reports only the kernels measured by those tuners, not total operation latency.
+
+If no tuner measured candidates (including cache hits and single-config bypasses),
+it measures the callable with the current NPU policies and slow filtering disabled.
+All repeated calls reuse compiled kernels and tuner caches. The return value is the
+original operation result, not the benchmark score. Arguments must tolerate repeated
+execution; the adapter does not clone or restore mutable operation inputs.
+
+For operations that launch multiple kernels, each sample is the **sum of device
+kernel durations for one call**, excluding host work and gaps between kernels.
+The callable must launch a fixed ordered sequence on one stream; row counts and
+kernel-name patterns are checked before aggregation. It is not a wall-clock or
+critical-path benchmark for concurrent streams. Only the per-call duration and
+first kernel timestamp are aggregated, so quality runs on operation samples rather
+than mixing individual kernels. Unknown compiled parameters are not inferred from
+the callable. The timing report's compilation stage includes the initial operation
+call, which can also perform allocations and host work.
+
+This adapter targets the Triton Ascend **test branch**; no Mojo source or A5-specific
+kernel code needs to be changed. Native A5 execution still requires device validation.
