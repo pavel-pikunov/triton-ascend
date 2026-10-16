@@ -528,7 +528,7 @@ def benchmark_result(measurements, report_sink):
 
 
 def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name, *, options=None,
-              pre_hook_scope=None, report_sink=None, timings=None):
+              pre_hook_scope=None, report_sink=None, timings=None, config_numbers=None):
     """Run one profiler batch per attempt and retain each candidate's fastest score."""
     options = resolve_options() if options is None else options
     funcs = funcs if isinstance(funcs, list) else [funcs]
@@ -570,12 +570,13 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
         options = replace(options, active=active,
                           warmup=(active + 9) // 10 if options.warmup is None else options.warmup)
     measurements = _profile_with_retries(profile, funcs, names, indices, options, prof_dir, keep_res, pre_hook_scope,
-                                         capture_report=report_sink is not None, timings=timings)
+                                         capture_report=report_sink is not None, timings=timings,
+                                         config_numbers=config_numbers)
     return benchmark_result(measurements, report_sink)
 
 
 def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, keep_res, pre_hook_scope, capture_report,
-                          timings):
+                          timings, config_numbers=None):
     if options.quality_check:
         from ._benchmark_quality import evaluate_quality
         if options.quality_check_all:
@@ -636,8 +637,12 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
     if not measured:
         raise RuntimeError("NPU benchmark: no usable profiler measurements") from last_acquisition_error
     best = min(measured, key=lambda record: record.score_ms)
-    if best.quality_failures:
-        report_safely(lambda: print("NPU autotune: the fastest retained measurement failed quality checks; "
-                                    "the autotuner is not confident that this is the fastest configuration. "
-                                    "The selected score is unchanged. " + "; ".join(best.quality_failures)))
+    if pending and options.quality_check:
+        index = next(index for index, record in enumerate(best_reports) if record is best)
+        winner = (f"config #{config_numbers[index]}" if config_numbers is not None and config_numbers[index] is not None
+                  else f"benchmark candidate #{index + 1}")
+        report_safely(
+            lambda: print("\033[33mNot all configurations passed quality checks. "
+                          f"Selected {winner}: lowest score {best.score_ms * 1000:.6g} us; "
+                          f"selected attempt quality: {'failed' if best.quality_failures else 'pass'}.\033[0m"))
     return best_reports

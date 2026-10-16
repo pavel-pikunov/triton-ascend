@@ -130,9 +130,11 @@ Kernel execution and synchronization failures propagate without retries.
 
 Each candidate retains its minimum measured score regardless of quality. A faster
 failed-quality attempt remains eligible after a slower successful attempt. If the
-selected measurement failed quality checks, one plain-text message states the
-autotuner's uncertainty independently of the logging level. It does not change the
-winner or raise a warning exception. No ANSI coloring or global warning handler is used.
+retry limit is exhausted with pending quality checks, one yellow message reports
+the selected configuration number, lowest retained score and selected-attempt
+pass/failed status independently of the logging
+level. ANSI coloring is unconditional, including redirected output. The message
+does not change the winner or raise a warning exception.
 
 Existing unavailable-data behavior is retained: a simple missing-CSV result is
 `inf`; the retry path raises when no usable measurements were acquired. The
