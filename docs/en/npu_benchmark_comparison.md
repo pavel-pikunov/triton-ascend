@@ -401,8 +401,16 @@ All repeated calls reuse compiled kernels and tuner caches. The return value is 
 original operation result, not the benchmark score. Arguments must tolerate repeated
 execution; the adapter does not clone or restore mutable operation inputs.
 
-For operations that launch multiple kernels, each sample is the **sum of device
-kernel durations for one call**, excluding host work and gaps between kernels.
+The final operation report lists each kernel position and name with its own
+quantile score, ordinary mean, minimum and maximum duration in microseconds.
+Repeated names remain separate positions. Warmup rows are excluded, and every
+entry comes from the same retained profiler attempt; no extra measurements or
+CSV reads are added. Aggregate operation latency is not printed as a kernel score.
+
+Internally, each sample remains the **sum of device kernel durations for one
+call** for quality checks and retaining the fastest attempt, excluding host work
+and gaps between kernels. The printed quality status applies to those operation
+samples, not separately to each kernel.
 The callable must launch a fixed ordered sequence on one stream; row counts and
 kernel-name patterns are checked before aggregation. It is not a wall-clock or
 critical-path benchmark for concurrent streams. Only the per-call duration and

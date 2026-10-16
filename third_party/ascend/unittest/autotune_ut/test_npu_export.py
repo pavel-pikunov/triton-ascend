@@ -341,7 +341,12 @@ def test_callable_benchmark_uses_quality_retries(backend, monkeypatch, capsys, t
     assert len(attempts) == 2 and len(calls) == 21
     text = capsys.readouterr().out
     assert ("Triton autotuning timing for operation" in text) == reports
-    assert ("Selection score: 20 us" in text) == reports
+    assert ("NPU operation kernel breakdown for operation" in text) == reports
+    assert "Selection score:" not in text
+    if reports:
+        assert "1. first" in text and "2. second" in text
+        assert text.count("score=10 us; mean=10 us; min=10 us; max=10 us") == 2
+        assert "selected attempt=1; operation quality: failed" in text
 
 
 @pytest.mark.parametrize("reports", [False, True])
@@ -398,6 +403,12 @@ def test_operation_collector_sums_kernels_per_call(backend, tmp_path, width, nam
     np.testing.assert_array_equal(record.samples[1], totals)
     np.testing.assert_array_equal(record.samples[0], (np.arange(count * width) + 1).reshape(count, width)[2:, 0])
     assert record.sample_count == 4 and record.metrics["Duration(us)"][0] == np.mean(totals)
+    assert len(record.kernel_timings) == width
+    for index, (name, score, mean, low, high) in enumerate(record.kernel_timings):
+        values = durations[2:, index]
+        assert name == f"k{index}"
+        assert score == np.mean(np.sort(values)[1:3])
+        assert (mean, low, high) == (np.mean(values), min(values), max(values))
 
 
 @pytest.mark.parametrize("names", [["a", "b", "a"], ["a", "b", "b", "a"]])
@@ -406,3 +417,20 @@ def test_operation_collector_rejects_changing_sequence(backend, tmp_path, names)
                   10}).to_csv(tmp_path / "kernel_details.csv", index=False)
     with pytest.raises(backend.policy.ProfilerAcquisitionError, match="Operation kernel"):
         backend.policy._collect_prof_result(tmp_path, [lambda: None], 0, 2, _aggregate_calls=True)
+
+
+def test_operation_breakdown_keeps_repeated_kernel_positions(backend, tmp_path):
+    pd.DataFrame({
+        "Name": ["same"] * 6, "Type": "Kernel", "Start Time(us)": np.arange(6) + 1, "Duration(us)":
+        [1000, 2000, 10, 40, 20, 60]
+    }).to_csv(tmp_path / "kernel_details.csv", index=False)
+    record, = backend.policy._collect_prof_result(tmp_path, [lambda: None], 1, 2, _aggregate_calls=True,
+                                                  _capture_report=True)
+    assert record.kernel_timings == (("same", 15., 15., 10., 20.), ("same", 50., 50., 40., 60.))
+
+
+def test_operation_breakdown_is_optional(backend, tmp_path):
+    pd.DataFrame({"Name": ["k"] * 2, "Type": "Kernel", "Start Time(us)": [1, 2], "Duration(us)":
+                  [10, 20]}).to_csv(tmp_path / "kernel_details.csv", index=False)
+    record, = backend.policy._collect_prof_result(tmp_path, [lambda: None], 0, 2, _aggregate_calls=True)
+    assert record.kernel_timings == ()

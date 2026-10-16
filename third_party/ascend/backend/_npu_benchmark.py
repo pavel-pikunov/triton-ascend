@@ -175,6 +175,7 @@ class NpuMeasurementReport:
     quality_checked: bool = False
     quality_metrics: dict = field(default_factory=dict)
     samples: tuple | None = field(default=None, repr=False)
+    kernel_timings: tuple = ()
 
 
 def aggregate_profile_rows(frame):
@@ -249,6 +250,20 @@ def print_best_config_report(function_name, configs, config, measurement):
             available = f" ({count}/{measurement.sample_count} available)" if count != measurement.sample_count else ""
             lines.append(f"  {column}: {'mean' if numeric else 'value'}={formatted}{available}")
     print("\n".join(lines))
+
+
+def print_operation_report(name, measurement):
+    print(f"NPU operation kernel breakdown for {name}\n" + "-" * 60)
+    if measurement is None:
+        print("Measurements unavailable.")
+        return
+    quality = (
+        "failed" if measurement.quality_failures else "passed") if measurement.quality_checked else "not requested"
+    print(f"cache={measurement.cache_mode}, warmup={measurement.warmup}, active={measurement.active}, "
+          f"selected attempt={measurement.attempt}; operation quality: {quality}")
+    for index, (kernel, score, mean, low, high) in enumerate(measurement.kernel_timings, 1):
+        print(f"  {index}. {kernel}\n"
+              f"     score={score:.6g} us; mean={mean:.6g} us; min={low:.6g} us; max={high:.6g} us")
 
 
 def print_timing_report(function_name, started, durations, *, total=None):
@@ -362,6 +377,7 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
         raise ValueError("Warmup must be nonnegative and active positive")
     expected_rows = num_funcs * (num_warmup + num_active)
 
+    kernel_timings = [()] * num_funcs
     if _aggregate_calls:
         # A fixed operation must launch the same ordered kernel sequence on every call.
         if len(filter_df) == 0 or len(filter_df) % expected_rows:
@@ -370,6 +386,17 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
         sequence = filter_df["Name"].to_numpy().reshape(expected_rows, width)
         if not np.all(sequence == sequence[0]):
             raise ProfilerAcquisitionError("Operation kernel sequence changed between calls")
+        all_durations = filter_df["Duration(us)"].to_numpy(dtype=float).reshape(expected_rows, width)
+        if _capture_report:
+            lower, upper = int(num_active * _quantiles[0]), int(num_active * _quantiles[1])
+            for index in range(num_funcs):
+                offset = index * (num_warmup + num_active) + num_warmup
+                measured = all_durations[offset:offset + num_active]
+                scores = np.sort(measured, axis=0)[lower:max(lower + 1, upper)].mean(axis=0)
+                kernel_timings[index] = tuple(
+                    (str(name), float(score), float(mean), float(low), float(high))
+                    for name, score, mean, low, high in zip(sequence[0], scores, measured.mean(
+                        axis=0), measured.min(axis=0), measured.max(axis=0)))
         filter_df = pd.DataFrame({
             "Name": [" + ".join(map(str, sequence[0]))] * expected_rows,
             "Type":
@@ -377,7 +404,7 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
             "Start Time(us)":
             filter_df["Start Time(us)"].to_numpy().reshape(expected_rows, width)[:, 0],
             "Duration(us)":
-            filter_df["Duration(us)"].to_numpy(dtype=float).reshape(expected_rows, width).sum(axis=1),
+            all_durations.sum(axis=1),
         })
 
     if target_kernel_name is not None and len(filter_df) != expected_rows:
@@ -405,7 +432,8 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
         metrics = report_safely(lambda: aggregate_profile_rows(measured)) if _capture_report else {}
         results.append(
             NpuMeasurementReport(metrics, num_active, num_warmup, num_active, "cold" if clear_l2_cache else "hot",
-                                 float(np.mean(durations)) / 1000, cost, samples=samples))
+                                 float(np.mean(durations)) / 1000, cost, samples=samples,
+                                 kernel_timings=kernel_timings[index]))
     return results
 
 
