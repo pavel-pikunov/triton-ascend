@@ -87,9 +87,13 @@ def benchmark_npu(kernel, grid=None, *args, **kwargs):
     name = compiled.src.name if compiled is not None else getattr(kernel, "__name__", "operation")
     target = compiled.packed_metadata["kernel_name"] if compiled is not None else None
     profile = _profile_npu if compiled is not None else partial(_profile_npu, _aggregate_calls=True)
+    sink = benchmark._perf_report_sink.get()
     benchmark.bench_npu(profile, launch, options.warmup, options.active, options.cache_mode == "cold", None, False,
-                        target, options=options, report_sink=records.extend if options.report_best_config else None,
+                        target, options=options,
+                        report_sink=records.extend if options.report_best_config or sink is not None else None,
                         timings=timings, config_numbers=[1])
+    if sink is not None:
+        sink(name, records[0])
     if options.report_timing:
         benchmark.report_safely(lambda: benchmark.print_timing_report(name, started, timings))
     if options.report_best_config:

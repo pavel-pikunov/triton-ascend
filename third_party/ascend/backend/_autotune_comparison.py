@@ -155,9 +155,19 @@ def bench_events(tuner, run_fns, report_sink):
 def print_winner(tuner, config, reports):
     if reports is not None:
         try:
+            sink = npu_tuning.benchmark._perf_report_sink.get()
+            if sink is not None and reports.get(config) is not None:
+                sink(tuner.base_fn.__name__, reports[config])
+            if not tuner.report_best_config:
+                return
             report_module.report_safely(lambda: report_module.print_best_config_report(
                 tuner.base_fn.__name__, tuner.configs, config, reports.get(config), selection=tuner._autotune_selection)
                                         )
         finally:
             reports.clear()
             tuner._autotune_selection = None
+
+
+def capture_reports(tuner, cache_miss):
+    return {} if cache_miss and (tuner.report_best_config
+                                 or npu_tuning.benchmark._perf_report_sink.get() is not None) else None

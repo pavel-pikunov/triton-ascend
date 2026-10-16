@@ -22,6 +22,7 @@ __version__ = '3.2.2'
 import logging
 from triton._C.libtriton.ascend import ir as ascend_ir
 
+from ._npu_benchmark import capture_npu_reports
 from .testing import benchmark_npu, do_bench_npu
 from .testing import benchmark_npu as perf_npu
 
@@ -54,4 +55,4 @@ def _apply_ascend_patch():
         ASTSource._ascend_patch_applied = True
 
 
-__all__ = ["benchmark_npu", "do_bench_npu", "perf_npu"]
+__all__ = ["benchmark_npu", "do_bench_npu", "perf_npu", "capture_npu_reports"]

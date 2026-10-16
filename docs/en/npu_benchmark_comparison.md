@@ -421,3 +421,32 @@ call, which can also perform allocations and host work.
 
 This adapter targets the Triton Ascend **test branch**; no Mojo source or A5-specific
 kernel code needs to be changed. Native A5 execution still requires device validation.
+
+
+## Export retained measurements to an external CSV writer
+
+```python
+from triton.backends.ascend import capture_npu_reports, perf_npu
+
+with capture_npu_reports(lambda name, measurement: export_csv(name, measurement)):
+    perf_npu(lambda: operation(...))
+```
+
+This test-only context sends retained NPU measurements to the callback independently
+of console-report flags. `measurement.kernel_rows` contains `(kernel_name, rows)`
+pairs in launch order, with warmup removed. Rows retain available original profiler
+columns; they are captured during the existing CSV read, only while this context is
+active. Tuners export the selected candidate's retained attempt, not other candidates.
+Plain operations export each fixed kernel position from their retained attempt.
+Callbacks run without another acquisition. Capture/allocation and callback errors
+propagate; CSV export errors are not silently suppressed as optional console output.
+Outside the context, raw rows are not retained. Context restoration also runs on errors.
+The context applies to the current thread/context, not launches dispatched to workers.
+
+External writers must represent missing counters/shapes as unavailable. Summary mode
+does not provide pipe-utilization metrics; use `TRITON_NPU_BENCH_PROFILER_MODE=full`
+when those counters are required. Full mode still does not enable shape recording.
+No host-latency measurement is added. For multi-kernel operation exports, a writer can
+evaluate the existing quality checks per kernel on the retained samples; this reporting
+check does not change the operation-level retry decision. Exporting a failed retained
+attempt preserves its quality status and follows the existing fastest-score policy.
