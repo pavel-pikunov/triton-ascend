@@ -191,6 +191,7 @@ class NpuMeasurementReport:
     samples: tuple | None = field(default=None, repr=False)
     kernel_timings: tuple = ()
     kernel_rows: tuple = field(default=(), repr=False)
+    all_configs_passed: bool = True
 
 
 def aggregate_profile_rows(frame):
@@ -718,4 +719,8 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
             lambda: print("\033[33mNot all configurations passed quality checks. "
                           f"Selected {winner}: lowest score {best.score_ms * 1000:.6g} us; "
                           f"selected attempt quality: {'failed' if best.quality_failures else 'pass'}.\033[0m"))
+    if options.quality_check:
+        best_reports = [
+            replace(record, all_configs_passed=not pending) if record is not None else None for record in best_reports
+        ]
     return best_reports

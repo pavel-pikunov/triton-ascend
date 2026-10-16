@@ -496,3 +496,32 @@ def test_csv_capture_winner_works_without_console_reports(backend, make_tuner, m
         comparison.print_winner(tuner, selected, reports)
     assert reports == {} and captured == ([record] if measured else [])
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_batch_quality_status_survives_a_passing_winner(backend, monkeypatch, tmp_path, exhausted):
+    policy = backend.policy
+    calls, retained = [], []
+    fast, slow = lambda: None, lambda: None
+
+    def profile(funcs, warmup, active, *args, **kwargs):
+        calls.append(list(funcs))
+        return [
+            policy.NpuMeasurementReport({}, active, warmup, active, "hot", .01 if fn is fast else .02,
+                                        .01 if fn is fast else .02,
+                                        samples=(np.arange(active), np.full(active, 10 if fn is fast else 20)))
+            for fn in funcs
+        ]
+
+    monkeypatch.setattr(
+        backend.quality, "evaluate_quality", lambda times, durations:
+        ({}, ["unstable"] if durations[0] == 20 and (exhausted or len(calls) == 1) else []))
+    options = replace(policy.resolve_options(), active=4, warmup=0, measure_budget_ms=None, filter_slow_configs=False,
+                      max_retries=1, log_level="off")
+    costs = policy.bench_npu(profile, [fast, slow], 0, 4, False, tmp_path, False, None, options=options,
+                             report_sink=retained.extend)
+    assert costs == [.01, .02] and calls == [[fast, slow], [slow]]
+    assert not retained[0].quality_failures
+    assert all(record.all_configs_passed == (not exhausted) for record in retained)
+    # A later pass does not replace the earlier equally fast rejected attempt.
+    assert retained[1].quality_failures == ("unstable", )

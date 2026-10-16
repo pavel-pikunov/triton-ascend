@@ -450,3 +450,12 @@ No host-latency measurement is added. For multi-kernel operation exports, a writ
 evaluate the existing quality checks per kernel on the retained samples; this reporting
 check does not change the operation-level retry decision. Exporting a failed retained
 attempt preserves its quality status and follows the existing fastest-score policy.
+
+
+For CSV trust status, `measurement.all_configs_passed` records whether any candidates
+remained pending after the final retry. A passing winner is still untrusted when
+another candidate never passed quality. CSV writers must set WrongData when this
+flag is false **or** the retained selected attempt failed quality; a later successful
+attempt does not erase failure of an earlier faster retained attempt. Per-kernel
+export checks may additionally reject individual kernel samples. This status does
+not alter scores, ranking, retained attempts, or the retry algorithm.
