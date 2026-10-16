@@ -115,7 +115,7 @@ quantile values. Trimming affects selection only, participates
 in the selection-cache key, and does not remove samples from quality checks.
 Quality checks cover tail contamination, gaps, multimodality, drift, and change
 points using the existing algorithms in `_benchmark_quality.py`. Their thresholds
-are 0.030, 0.2, 0.027, 0.3 and 0.275, respectively.
+are 0.04, 0.26, 0.04, 0.39 and 0.36, respectively.
 Checks normally stop at the first failure; detailed logs then contain only the
 metrics already evaluated. Set `TRITON_NPU_BENCH_QUALITY_CHECK_ALL=1` to evaluate
 all five checks even after a failure. Both modes use all untrimmed samples and
