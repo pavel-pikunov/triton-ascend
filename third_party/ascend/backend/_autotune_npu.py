@@ -91,7 +91,10 @@ def profile_candidates(tuner, kernels_call, run_fns, warmup, active, report_sink
         _profile_npu, list(run_fns.values()), warmup, active, True, None, False, names, options=options,
         pre_hook_scope=functools.partial(cache_pre_hook, tuner) if options.cache_mode == "cold" else None,
         report_sink=(lambda records: report_sink(dict(zip(run_fns, records)))) if report_sink is not None else None,
-        timings=durations(tuner))
+        timings=durations(tuner), config_numbers=[
+            next((index for index, candidate in enumerate(tuner.configs, 1) if candidate is config),
+                 None) for config in run_fns
+        ])
     costs = [costs] if len(run_fns) == 1 else costs
     assert len(costs) == len(run_fns)
     return dict(zip(run_fns, costs))
