@@ -1,7 +1,7 @@
 """Summary/full export controls and the shared pandas collector."""
 
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -303,7 +303,8 @@ def test_fixed_kernel_benchmark_propagates_errors(backend, jit_kernel, monkeypat
 
 
 @pytest.mark.parametrize("reports", [False, True])
-def test_callable_benchmark_uses_quality_retries(backend, monkeypatch, capsys, tmp_path, reports):
+@pytest.mark.parametrize("export", [False, True])
+def test_callable_benchmark_uses_quality_retries(backend, monkeypatch, capsys, tmp_path, reports, export):
     policy, testing = backend.policy, backend.testing
     for name, value in dict(ACTIVE=8, WARMUP=2, MEASURE_BUDGET_MS=0, MAX_RETRIES=1,
                             REPORT_BEST_CONFIG=int(reports)).items():
@@ -337,7 +338,17 @@ def test_callable_benchmark_uses_quality_retries(backend, monkeypatch, capsys, t
     monkeypatch.setattr(testing, "_profile_npu", profile)
     monkeypatch.setattr(backend.quality, "evaluate_quality", lambda *a: ({}, ["unstable"]
                                                                          if len(attempts) == 1 else []))
-    assert testing.benchmark_npu(operation) is result
+    captured = []
+    with policy.capture_npu_reports(lambda name, record: captured.append((name, record))) if export else nullcontext():
+        assert testing.benchmark_npu(operation) is result
+    assert len(captured) == int(export)
+    if export:
+        name, record = captured[0]
+        assert name == "operation" and record.attempt == 1
+        assert [name for name, _ in record.kernel_rows] == ["first", "second"]
+        assert all(len(rows) == 8 for _, rows in record.kernel_rows)
+        assert all(row["Duration(us)"] == 10 for _, rows in record.kernel_rows for row in rows)
+    assert policy._perf_report_sink.get() is None
     assert len(attempts) == 2 and len(calls) == 21
     text = capsys.readouterr().out
     assert ("Triton autotuning timing for operation" in text) == reports
@@ -434,3 +445,54 @@ def test_operation_breakdown_is_optional(backend, tmp_path):
                   [10, 20]}).to_csv(tmp_path / "kernel_details.csv", index=False)
     record, = backend.policy._collect_prof_result(tmp_path, [lambda: None], 0, 2, _aggregate_calls=True)
     assert record.kernel_timings == ()
+
+
+@pytest.mark.parametrize("aggregate", [False, True])
+def test_csv_capture_keeps_only_measured_rows(backend, tmp_path, aggregate):
+    pd.DataFrame({
+        "Name": ["k"] * 6, "Type": "Kernel", "Start Time(us)": np.arange(6) + 1, "Duration(us)":
+        [1000, 2000, 10, 40, 20, 60]
+    }).to_csv(tmp_path / "kernel_details.csv", index=False)
+    with backend.policy.capture_npu_reports(lambda *a: None):
+        record, = backend.policy._collect_prof_result(tmp_path, [lambda: None], 1 if aggregate else 2,
+                                                      2 if aggregate else 4, _aggregate_calls=aggregate,
+                                                      _capture_report=True)
+    groups = record.kernel_rows
+    assert len(groups) == (2 if aggregate else 1)
+    assert [row["Duration(us)"]
+            for _, rows in groups
+            for row in rows] == ([10, 20, 40, 60] if aggregate else [10, 40, 20, 60])
+    assert backend.policy._perf_report_sink.get() is None
+
+
+def test_csv_capture_restores_nested_scopes(backend):
+    outer, inner = lambda *a: None, lambda *a: None
+    with backend.policy.capture_npu_reports(outer):
+        with pytest.raises(RuntimeError):
+            with backend.policy.capture_npu_reports(inner):
+                assert backend.policy._perf_report_sink.get() is inner
+                raise RuntimeError("export failed")
+        assert backend.policy._perf_report_sink.get() is outer
+    assert backend.policy._perf_report_sink.get() is None
+
+
+@pytest.mark.parametrize("measured", [False, True])
+def test_csv_capture_winner_works_without_console_reports(backend, make_tuner, measured, capsys):
+    from importlib import import_module
+    comparison = import_module(backend.testing.__package__ + "._autotune_comparison")
+    tuner = make_tuner()
+    tuner.report_best_config = False
+    tuner.base_fn = tuner.fn
+    tuner._autotune_selection = None
+    selected = tuner.configs[0]
+    record = backend.policy.NpuMeasurementReport({}, 2, 0, 2, "hot", .01, .01)
+    captured = []
+    with backend.policy.capture_npu_reports(lambda name, result: captured.append(result)):
+        reports = comparison.capture_reports(tuner, True)
+        assert reports == {}
+        assert comparison.capture_reports(tuner, False) is None
+        if measured:
+            reports[selected] = record
+        comparison.print_winner(tuner, selected, reports)
+    assert reports == {} and captured == ([record] if measured else [])
+    assert capsys.readouterr().out == ""

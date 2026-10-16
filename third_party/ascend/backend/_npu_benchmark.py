@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager, nullcontext, suppress
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -19,6 +20,19 @@ from statistics import fmean
 
 import numpy as np
 import triton.runtime as runtime
+
+_perf_report_sink = ContextVar("npu_perf_report_sink", default=None)
+
+
+@contextmanager
+def capture_npu_reports(sink):
+    """Capture retained measurement rows in this context, without extra profiling."""
+    token = _perf_report_sink.set(sink)
+    try:
+        yield
+    finally:
+        _perf_report_sink.reset(token)
+
 
 ENV_PREFIX = "TRITON_NPU_BENCH_"
 TIMING_STAGES = ("generation_pruning", "compilation", "slow_filter", "calibration", "measurements")
@@ -176,6 +190,7 @@ class NpuMeasurementReport:
     quality_metrics: dict = field(default_factory=dict)
     samples: tuple | None = field(default=None, repr=False)
     kernel_timings: tuple = ()
+    kernel_rows: tuple = field(default=(), repr=False)
 
 
 def aggregate_profile_rows(frame):
@@ -377,6 +392,7 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
         raise ValueError("Warmup must be nonnegative and active positive")
     expected_rows = num_funcs * (num_warmup + num_active)
 
+    source_df = filter_df
     kernel_timings = [()] * num_funcs
     if _aggregate_calls:
         # A fixed operation must launch the same ordered kernel sequence on every call.
@@ -430,10 +446,19 @@ def _collect_prof_result(base_dir, funcs, num_warmup, num_active, target_kernel_
                 raise ProfilerAcquisitionError(f"Invalid profiler samples for config {index}")
             samples = (times, durations)
         metrics = report_safely(lambda: aggregate_profile_rows(measured)) if _capture_report else {}
+        kernel_rows = ()
+        if _perf_report_sink.get() is not None:
+            if _aggregate_calls:
+                start = index * (num_warmup + num_active) * width + num_warmup * width
+                rows = source_df.iloc[start:start + num_active * width]
+                kernel_rows = tuple((str(sequence[0, column]), tuple(rows.iloc[column::width].to_dict("records")))
+                                    for column in range(width))
+            else:
+                kernel_rows = ((str(measured["Name"].iloc[0]), tuple(measured.to_dict("records"))), )
         results.append(
             NpuMeasurementReport(metrics, num_active, num_warmup, num_active, "cold" if clear_l2_cache else "hot",
                                  float(np.mean(durations)) / 1000, cost, samples=samples,
-                                 kernel_timings=kernel_timings[index]))
+                                 kernel_timings=kernel_timings[index], kernel_rows=kernel_rows))
     return results
 
 

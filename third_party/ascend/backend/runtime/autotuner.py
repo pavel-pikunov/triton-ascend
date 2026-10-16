@@ -2246,7 +2246,7 @@ class AutoTilingTuner(Autotuner):
         comparison.start_timing(self)
         key = comparison.call_stage(self, "generation_pruning", self.generate_key_and_configs, *args, **kwargs)
         cache_miss = key not in self.cache
-        reports = {} if cache_miss and self.report_best_config else None
+        reports = comparison.capture_reports(self, cache_miss)
         comparison.capture_selection(self, key, cache_miss)
         if self.is_simt_mode and kwargs.get('simt_stack_limit', None) is None:
             kwargs['simt_stack_limit'] = self.simt_stack_limit
