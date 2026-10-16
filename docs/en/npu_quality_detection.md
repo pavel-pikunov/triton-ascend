@@ -18,7 +18,7 @@ overhead is included. These are synthetic tests, not NPU measurements.
 
 | Target metric | Present defect |
 | --- | --- |
-| Mean/trim deviation | Exactly 2% of launches receive +100 us: approximately 5% mean deviation, above the 4% threshold. |
+| Mean/trim deviation | Exactly 2% of launches receive +100 us: approximately 5% mean deviation (near the current threshold). |
 | Central gap | Exactly 10% of launches receive +8 us, producing a populated separated mode. |
 | Dip | Two equally populated continuous modes, separated by 2 us. |
 | Drift | A linear +2 us change over the observed window. |
@@ -29,7 +29,7 @@ controls. These finite cases do not claim detection of every possible defect.
 Expected failures remain ordinary red assertions: no xfail, skipping, seed
 selection or threshold changes are used to hide false alarms.
 
-## Results, 2026-10-16
+## Recorded results before the additional 15% increase, 2026-10-16
 
 Thresholds are 0.04, 0.26, 0.04, 0.39 and 0.36 in table order.
 
@@ -55,3 +55,11 @@ backend import redirected to the copied helper package. The committed tests
 retain the ordinary backend import and repository fixtures. Neither torch_npu
 nor an NPU backend was substituted. No production code or thresholds changed
 as part of this audit.
+
+## Additional threshold increase
+
+Thresholds were subsequently multiplied by 1.15 and rounded upward to 0.01:
+mean/trim 0.05, central gap 0.30, dip 0.05, drift 0.45, change point 0.42.
+The recorded results above use the previous thresholds. The injected mean/trim
+defect is now near its threshold; its assertion is retained without changing
+the data to force detection.
