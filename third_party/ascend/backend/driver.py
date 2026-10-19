@@ -652,7 +652,6 @@ extern "C" {
   extern int MsprofRegisterCallback(unsigned int moduleId, callback handle);
   static unsigned int __MsprofFlagL0  = 0;
   static unsigned int __MsprofFlagL1  = 0;
-  static const char* kernelName = nullptr ;
   static std::vector<int> tensorKinds;
 
   int ProfCtrlHandle(unsigned int CtrlType, void* CtrlData, unsigned int DataLen) {
@@ -875,7 +874,7 @@ void triton_launch_kernel(
   // only 1D parallelization is supported for NPU
   // Pointer type becomes flattend 1-D Memref tuple: base_ptr, data_ptr, offset, shape, stride
   // base_ptr offset shape and stride are not used, arbitrarily set for now
-  static std::string name(kernelName);
+  std::string name(kernelName);
   void *workspace_addr_ptr = NULL;
   {coalesce_grid_div}
   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
@@ -982,7 +981,7 @@ void triton_launch_kernel(
 
 static void _launch(const char* kernelName, const void* func, rtStream_t stream, int gridX, int gridY, int gridZ, std::vector<std::vector<int64_t>> &tensorShapes, std::vector<int> &tensorKinds{', ' + arg_decls if len(signature) > 0 else ''}) {{
   // Keep Python launcher on the stable local packing path.
-  static std::string name(kernelName);
+  std::string name(kernelName);
   void *workspace_addr_ptr = NULL;
   {coalesce_grid_div}
   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
@@ -1132,10 +1131,8 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 
 
   // get kernel_name
-  if (!kernelName) {{
-      PyObject *kernelNameObj = PyDict_GetItemString(packedMetadata, "kernel_name");
-      kernelName = PyUnicode_AsUTF8(kernelNameObj);
-  }}
+  PyObject *kernelNameObj = PyDict_GetItemString(packedMetadata, "kernel_name");
+  const char *kernelName = PyUnicode_AsUTF8(kernelNameObj);
   // get tensor_kinds
   if( tensorKinds.empty() ) {{
      PyObject *tensorKindList = PyDict_GetItemString(packedMetadata, "tensor_kinds");

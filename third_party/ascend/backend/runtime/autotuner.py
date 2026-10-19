@@ -2294,6 +2294,8 @@ class AutoTilingTuner(Autotuner):
                 *args,
                 **final_kwargs,
             )
+            if cache_miss and used_cached_result:
+                self.cache[key] = config
             return ret
         finally:
             self.nargs = None
