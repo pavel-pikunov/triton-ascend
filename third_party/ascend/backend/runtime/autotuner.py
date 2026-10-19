@@ -45,15 +45,13 @@ from triton.tools.get_ascend_devices import is_compile_on_910_95
 
 from .. import _autotune_npu as npu_tuning
 
-from .autoparser import (LowDimsAxesParser, PtrNumsParser, ReductionAxesParser,
-                         SplitAxesParser, TilingAxesParser)
+from .autoparser import (LowDimsAxesParser, PtrNumsParser, ReductionAxesParser, SplitAxesParser, TilingAxesParser)
 from .dsl_analysis.cv_param_parser import parse_cv_params
 from .dsl_analysis.entry import analyze_dot_site_mnk, analyze_signature_and_missing_tunable
 from .dsl_analysis.kernel_classifier import resolve_kernel_type
 from .dsl_analysis.vv_config_adapter import adapt_vv_v2_to_vector_inputs
 from .dsl_analysis.vv_param_parser_v2 import parse_vv_axis_info_v2
-from .dsl_analysis.vv_parser_options import (resolve_vv_parser_v2_enabled,
-                                             resolve_vv_parser_v2_mode)
+from .dsl_analysis.vv_parser_options import (resolve_vv_parser_v2_enabled, resolve_vv_parser_v2_mode)
 from .utils import get_byte_per_numel, is_valid_axis_name, valid_axis_names
 from .ubtuner import UBTuner, get_origin_fn
 from .vector_axes import VectorAxes
@@ -61,7 +59,6 @@ from .vector_axes import VectorAxes
 # Import CV autotune components
 from .cv_autotune.generators.cv_tile_generator import CVTileGenerator
 from .cv_autotune.hardware_consts import get_default_hardware_constraints
-
 
 _RESERVED_HINT_KEYS = {
     "split_params",
@@ -92,12 +89,8 @@ def _get_constexpr_candidates_from_fn(fn) -> List[str]:
             if not isinstance(arg, ast.arg):
                 continue
             ann = arg.annotation
-            if (
-                isinstance(ann, ast.Attribute)
-                and isinstance(ann.value, ast.Name)
-                and ann.value.id == "tl"
-                and ann.attr == "constexpr"
-            ):
+            if (isinstance(ann, ast.Attribute) and isinstance(ann.value, ast.Name) and ann.value.id == "tl"
+                    and ann.attr == "constexpr"):
                 constexpr_names.append(arg.arg)
         break
     return constexpr_names
@@ -137,19 +130,15 @@ def _validate_user_hints(fn, hints: Optional[Dict[str, object]]) -> None:
     legal_keys = set(_RESERVED_HINT_KEYS) | set(_ALL_PARAMS) | constexpr_names
     invalid_keys = sorted(key for key in hints.keys() if key not in legal_keys)
     if invalid_keys:
-        raise ValueError(
-            "Unsupported hints keys: {}. "
-            "Legal keys must be reserved hints, tl.constexpr kernel parameters, "
-            "or supported compile options.".format(invalid_keys)
-        )
+        raise ValueError("Unsupported hints keys: {}. "
+                         "Legal keys must be reserved hints, tl.constexpr kernel parameters, "
+                         "or supported compile options.".format(invalid_keys))
 
 
 def _multibuffer_to_num_stages(multibuffer: bool) -> int:
     if not isinstance(multibuffer, bool):
-        raise ValueError(
-            "multibuffer must be a boolean when mapped to num_stages. "
-            f"Got: {type(multibuffer)}"
-        )
+        raise ValueError("multibuffer must be a boolean when mapped to num_stages. "
+                         f"Got: {type(multibuffer)}")
     return 2 if multibuffer else 1
 
 
@@ -163,17 +152,11 @@ def _normalize_config_hints(
     multibuffer_values = normalized_hints.pop("multibuffer", None)
     if multibuffer_values is not None:
         if not isinstance(multibuffer_values, (list, tuple)) or len(multibuffer_values) == 0:
-            raise ValueError(
-                "hints['multibuffer'] must be a non-empty list/tuple when used for config expansion."
-            )
+            raise ValueError("hints['multibuffer'] must be a non-empty list/tuple when used for config expansion.")
         if not all(isinstance(value, bool) for value in multibuffer_values):
-            raise ValueError(
-                "hints['multibuffer'] must contain only boolean values."
-            )
+            raise ValueError("hints['multibuffer'] must contain only boolean values.")
         if not has_explicit_num_stages:
-            normalized_hints["num_stages"] = [
-                _multibuffer_to_num_stages(value) for value in multibuffer_values
-            ]
+            normalized_hints["num_stages"] = [_multibuffer_to_num_stages(value) for value in multibuffer_values]
 
     if inject_default_num_stages and "num_stages" not in normalized_hints:
         normalized_hints["num_stages"] = list(_DEFAULT_HINT_NUM_STAGES)
@@ -182,23 +165,15 @@ def _normalize_config_hints(
 
 
 def _validate_config_hint_values(config_hints: Dict[str, object], constexpr_names: List[str]):
-    invalid_keys = sorted(
-        key for key in config_hints
-        if key not in constexpr_names and key not in _ALL_PARAMS
-    )
+    invalid_keys = sorted(key for key in config_hints if key not in constexpr_names and key not in _ALL_PARAMS)
     if invalid_keys:
         raise ValueError(
             "Invalid hints keys for config expansion: {}. "
-            "Keys must be tl.constexpr kernel parameters or supported compile options.".format(
-                invalid_keys
-            )
-        )
+            "Keys must be tl.constexpr kernel parameters or supported compile options.".format(invalid_keys))
 
     for key, value in config_hints.items():
         if not isinstance(value, (list, tuple)) or len(value) == 0:
-            raise ValueError(
-                f"hints['{key}'] must be a non-empty list/tuple when used for config expansion."
-            )
+            raise ValueError(f"hints['{key}'] must be a non-empty list/tuple when used for config expansion.")
         if key in _VALIDATION_RULES:
             rule = _VALIDATION_RULES[key]
             if not rule["check"](value, key):
@@ -286,9 +261,7 @@ class AutoTilingTuner(Autotuner):
         self.config_hints = config_hints
         self.vv_parser_v2_mode = resolve_vv_parser_v2_mode(self.hints)
         self.enable_vv_parser_v2 = resolve_vv_parser_v2_enabled(self.hints)
-        self.explicit_tunable_params = self._parse_explicit_tunable_params(
-            self.hints.get("tunable_parameter", None)
-        )
+        self.explicit_tunable_params = self._parse_explicit_tunable_params(self.hints.get("tunable_parameter", None))
 
         split_params = self.hints.get("split_params", None)
         tiling_params = self.hints.get("tiling_params", None)
@@ -323,16 +296,15 @@ class AutoTilingTuner(Autotuner):
         ori_fn = get_origin_fn(fn)
         setattr(ori_fn, '_triton_autotuned', True)
 
-        self.enable_ubtuner = os.getenv("TRITON_ENABLE_UBTUNER", "").lower() in ('compile', 'run') or getattr(ori_fn, '_ubtuned', False)
+        self.enable_ubtuner = os.getenv("TRITON_ENABLE_UBTUNER", "").lower() in ('compile', 'run') or getattr(
+            ori_fn, '_ubtuned', False)
         if self.enable_ubtuner:
             self.ubtuner = UBTuner(fn, key)
 
         # Compile kernels in parallel by default for triton.runtime.JITFunction or UBTuner,
         # but not for others, e.g., LibEntry, since it's not compatible with AsyncCompileMode
-        self.compile_parallel = (
-            isinstance(self.fn, (triton.runtime.JITFunction, UBTuner))
-            and os.getenv("TRITON_AUTOTUNE_PARALLEL_COMPILE", "1") == "1"
-        )
+        self.compile_parallel = (isinstance(self.fn, (triton.runtime.JITFunction, UBTuner))
+                                 and os.getenv("TRITON_AUTOTUNE_PARALLEL_COMPILE", "1") == "1")
         self._source_module_ast_cache: Optional[ast.Module] = None
         self._source_module_ast_resolved = False
 
@@ -341,11 +313,7 @@ class AutoTilingTuner(Autotuner):
         if raw_value is None:
             return []
         if not isinstance(raw_value, list):
-            raise ValueError(
-                "hints.tunable_parameter must be a list, got: {}".format(
-                    type(raw_value)
-                )
-            )
+            raise ValueError("hints.tunable_parameter must be a list, got: {}".format(type(raw_value)))
         values = list(raw_value)
         parsed = []
         seen = set()
@@ -358,11 +326,7 @@ class AutoTilingTuner(Autotuner):
 
     def _expand_simt_num_warps_configs(self, base_configs: List[Config]) -> List[Config]:
         _default_cand_num_warps = [8, 16, 32, 64]
-        cand_num_warps = (
-            _default_cand_num_warps
-            if self.user_specified_warps is None
-            else [self.user_specified_warps]
-        )
+        cand_num_warps = (_default_cand_num_warps if self.user_specified_warps is None else [self.user_specified_warps])
 
         simt_configs = []
         for base_cfg in base_configs:
@@ -395,66 +359,48 @@ class AutoTilingTuner(Autotuner):
                         base_cfg,
                         base_cfg.kwargs.copy(),
                         num_stages=num_stages,
-                    )
-                )
+                    ))
 
         if self.print_autotuning:
-            print(
-                "Triton autotuning: Expanded to "
-                f"{len(expanded_configs)} configs (with num_stages: {num_stages_candidates})"
-            )
+            print("Triton autotuning: Expanded to "
+                  f"{len(expanded_configs)} configs (with num_stages: {num_stages_candidates})")
         return expanded_configs
 
     def _expand_simd_multibuffer_configs(self, base_configs: List[Config]) -> List[Config]:
-        if (
-            self.user_specified_multibuffer is not None
-            or self.user_specified_num_stages is not None
-        ):
+        if (self.user_specified_multibuffer is not None or self.user_specified_num_stages is not None):
             normalized_configs = []
             for base_cfg in base_configs:
                 if self.user_specified_num_stages is not None:
                     base_cfg.num_stages = self.user_specified_num_stages
                     # Keep compiler-visible multibuffer consistent when only num_stages is specified.
                     if self.user_specified_multibuffer is None:
-                        base_cfg.kwargs["multibuffer"] = (
-                            self.user_specified_num_stages != 1
-                        )
+                        base_cfg.kwargs["multibuffer"] = (self.user_specified_num_stages != 1)
                 else:
-                    base_cfg.num_stages = _multibuffer_to_num_stages(
-                        self.user_specified_multibuffer
-                    )
+                    base_cfg.num_stages = _multibuffer_to_num_stages(self.user_specified_multibuffer)
 
                 normalized_configs.append(base_cfg)
             if self.print_autotuning:
-                print(
-                    "Triton autotuning: Skip SIMD multibuffer expansion because user "
-                    f"specified multibuffer={self.user_specified_multibuffer}, "
-                    f"num_stages={self.user_specified_num_stages}"
-                )
+                print("Triton autotuning: Skip SIMD multibuffer expansion because user "
+                      f"specified multibuffer={self.user_specified_multibuffer}, "
+                      f"num_stages={self.user_specified_num_stages}")
             return normalized_configs
 
         opposite_default_multibuffer = not self.default_multibuffer
         simd_configs = []
         for base_cfg in base_configs:
-            base_multibuffer = base_cfg.kwargs.get(
-                "multibuffer", self.default_multibuffer
-            )
+            base_multibuffer = base_cfg.kwargs.get("multibuffer", self.default_multibuffer)
             base_cfg.kwargs["multibuffer"] = base_multibuffer
             base_cfg.num_stages = _multibuffer_to_num_stages(base_multibuffer)
             simd_configs.append(base_cfg)
 
             new_cfg = _clone_config_with_kwargs(base_cfg, base_cfg.kwargs.copy())
             new_cfg.kwargs["multibuffer"] = opposite_default_multibuffer
-            new_cfg.num_stages = _multibuffer_to_num_stages(
-                opposite_default_multibuffer
-            )
+            new_cfg.num_stages = _multibuffer_to_num_stages(opposite_default_multibuffer)
             simd_configs.append(new_cfg)
 
         if self.print_autotuning:
-            print(
-                "Triton autotuning: Expanded to "
-                f"{len(simd_configs)} SIMD configs (toggle multibuffer={opposite_default_multibuffer})"
-            )
+            print("Triton autotuning: Expanded to "
+                  f"{len(simd_configs)} SIMD configs (toggle multibuffer={opposite_default_multibuffer})")
         return simd_configs
 
     def _parse_hints_axes(self, hints_axes):
@@ -466,37 +412,26 @@ class AutoTilingTuner(Autotuner):
             raise ValueError("All keys in 'hints.axes' must be valid axis names. Got unexpected keys.")
         for axis, arg_name in hints_axes.items():
             if not isinstance(arg_name, str):
-                raise ValueError(
-                    "All values in 'hints.axes' must be non-empty argument names. "
-                    "Got {} for axis '{}'.".format(type(arg_name), axis)
-                )
+                raise ValueError("All values in 'hints.axes' must be non-empty argument names. "
+                                 "Got {} for axis '{}'.".format(type(arg_name), axis))
             if not arg_name:
                 raise ValueError("All values in 'hints.axes' must be non-empty argument names.")
             if arg_name.isidentifier() and arg_name not in self._get_runtime_arg_names_for_hints_axes():
-                raise ValueError(
-                    "All values in 'hints.axes' must reference runtime non-constexpr argument names. "
-                    "Got '{}' for axis '{}'.".format(arg_name, axis)
-                )
+                raise ValueError("All values in 'hints.axes' must reference runtime non-constexpr argument names. "
+                                 "Got '{}' for axis '{}'.".format(arg_name, axis))
         return dict(hints_axes)
 
     def _normalize_autotuning_debug_value(self, value):
         if is_dataclass(value) and not isinstance(value, type):
             return self._normalize_autotuning_debug_value(asdict(value))
         if isinstance(value, dict):
-            return {
-                str(key): self._normalize_autotuning_debug_value(val)
-                for key, val in value.items()
-            }
+            return {str(key): self._normalize_autotuning_debug_value(val) for key, val in value.items()}
         if isinstance(value, (list, tuple)):
             return [self._normalize_autotuning_debug_value(item) for item in value]
         if isinstance(value, set):
             return [self._normalize_autotuning_debug_value(item) for item in sorted(value, key=repr)]
         if hasattr(value, "__dict__") and not isinstance(value, type):
-            public_attrs = {
-                key: val
-                for key, val in vars(value).items()
-                if not key.startswith("_")
-            }
+            public_attrs = {key: val for key, val in vars(value).items() if not key.startswith("_")}
             if public_attrs:
                 return self._normalize_autotuning_debug_value(public_attrs)
         if isinstance(value, (str, int, float, bool)) or value is None:
@@ -507,12 +442,10 @@ class AutoTilingTuner(Autotuner):
         if not self.print_autotuning:
             return
         normalized_result = self._normalize_autotuning_debug_value(result)
-        print(
-            "{}: {}".format(
-                label,
-                pprint.pformat(normalized_result, sort_dicts=True),
-            )
-        )
+        print("{}: {}".format(
+            label,
+            pprint.pformat(normalized_result, sort_dicts=True),
+        ))
 
     def _collect_vector_parse_debug_result(
         self,
@@ -547,10 +480,7 @@ class AutoTilingTuner(Autotuner):
                 constexpr_names = set(self._get_constexpr_candidates())
             except Exception:
                 constexpr_names = set()
-        return [
-            arg_name for arg_name in getattr(self, "arg_names", [])
-            if arg_name not in constexpr_names
-        ]
+        return [arg_name for arg_name in getattr(self, "arg_names", []) if arg_name not in constexpr_names]
 
     def _rebuild_vector_axes(self) -> VectorAxes:
         vector_axes = VectorAxes.from_hints_axes(self.hints_axes)
@@ -559,14 +489,11 @@ class AutoTilingTuner(Autotuner):
         if existing_vector_axes is not None:
             vector_axes.apply_semantic_fields(
                 axis_length_exprs=self._normalize_axis_name_mapping(
-                    getattr(existing_vector_axes, "axis_length_exprs", {}),
-                ),
+                    getattr(existing_vector_axes, "axis_length_exprs", {}), ),
                 fixed_tiling_exprs=self._normalize_axis_name_mapping(
-                    getattr(existing_vector_axes, "fixed_tiling_exprs", {}),
-                ),
+                    getattr(existing_vector_axes, "fixed_tiling_exprs", {}), ),
                 axis_dynamic_sources=self._normalize_axis_name_mapping(
-                    getattr(existing_vector_axes, "axis_dynamic_sources", {}),
-                ),
+                    getattr(existing_vector_axes, "axis_dynamic_sources", {}), ),
             )
 
         vector_axes.apply_semantic_fields(
@@ -594,13 +521,11 @@ class AutoTilingTuner(Autotuner):
     def _get_parser_axis_arg_names(self) -> Dict[str, str]:
         axis_arg_names = {}
         if self.vector_axes is not None:
-            axis_arg_names.update(
-                {
-                    axis: arg_name
-                    for axis, arg_name in self.vector_axes.axis_length_exprs.items()
-                    if self._is_direct_runtime_length_arg_name(arg_name)
-                }
-            )
+            axis_arg_names.update({
+                axis: arg_name
+                for axis, arg_name in self.vector_axes.axis_length_exprs.items()
+                if self._is_direct_runtime_length_arg_name(arg_name)
+            })
 
         return axis_arg_names
 
@@ -626,10 +551,8 @@ class AutoTilingTuner(Autotuner):
         axis_related_params = [split_params, tiling_params, low_dim_axes, reduction_axes]
         if any(item is not None for item in axis_related_params):
             if not self.hints_axes:
-                raise ValueError(
-                    "hints.axes must be provided when axis metadata "
-                    "(split_params, tiling_params, low_dim_axes, reduction_axes) is supplied."
-                )
+                raise ValueError("hints.axes must be provided when axis metadata "
+                                 "(split_params, tiling_params, low_dim_axes, reduction_axes) is supplied.")
             if not isinstance(split_params, dict):
                 raise ValueError("split_params must be a dict, got: {}".format(type(split_params)))
             if not isinstance(tiling_params, dict):
@@ -646,14 +569,10 @@ class AutoTilingTuner(Autotuner):
             if not used_axes.issubset(self.hints_axes.keys()):
                 raise ValueError(
                     "The following axes are used in axis metadata but missing from 'hints.axes': {}".format(
-                        used_axes - set(self.hints_axes.keys())
-                    )
-                )
+                        used_axes - set(self.hints_axes.keys())))
         elif not self.hints_axes:
-            defer_legacy_fallback = (
-                getattr(self, "enable_vv_parser_v2", False)
-                and getattr(self, "vv_parser_v2_mode", "off") in ("assist", "authoritative")
-            )
+            defer_legacy_fallback = (getattr(self, "enable_vv_parser_v2", False)
+                                     and getattr(self, "vv_parser_v2_mode", "off") in ("assist", "authoritative"))
             if not defer_legacy_fallback:
                 # Compatibility fallback for the legacy vector path: infer x/y/z...
                 # from the ordered key list when no explicit axis metadata is supplied.
@@ -927,9 +846,7 @@ class AutoTilingTuner(Autotuner):
             diagnostics = "; ".join(cv_parse_result.diagnostics).strip()
             if not diagnostics:
                 diagnostics = "no diagnostics"
-            raise RuntimeError(
-                "cv parser status {}: {}".format(cv_parse_result.status, diagnostics)
-            )
+            raise RuntimeError("cv parser status {}: {}".format(cv_parse_result.status, diagnostics))
         return cv_parse_result
 
     def _autoparse_axis_params_vector(self, all_args):
@@ -948,9 +865,7 @@ class AutoTilingTuner(Autotuner):
             self.reduction_axes = []
         self._refresh_vector_axes()
 
-        required_missing_params = [
-            arg for arg in self.arg_names if arg not in all_args.keys()
-        ]
+        required_missing_params = [arg for arg in self.arg_names if arg not in all_args.keys()]
         vv_injected_split_axes = set()
         vv_injected_tiling_axes = set()
         existing_split_axes = set(self.split_params.keys())
@@ -959,9 +874,7 @@ class AutoTilingTuner(Autotuner):
         self._apply_assist_legacy_hints_axes_fallback(all_args, vv_result)
         use_vv_semantics = False
         fallback_to_vector_all = self._should_fallback_to_vector_from_v2(vv_result)
-        if not fallback_to_vector_all and self._is_vv_semantic_usable(
-            vv_result, required_missing_params
-        ):
+        if not fallback_to_vector_all and self._is_vv_semantic_usable(vv_result, required_missing_params):
             use_vv_semantics = self._apply_vv_axis_semantic_result()
             if use_vv_semantics:
                 vv_injected_split_axes = set(self.split_params.keys()) - existing_split_axes
@@ -1017,9 +930,7 @@ class AutoTilingTuner(Autotuner):
                 self.all_split_params = {}
             else:
                 vector_gap_fill_applied.append("split_params")
-                all_split_params = self._parse_split_params_with_fallback(
-                    self._get_constexpr_candidates()
-                )
+                all_split_params = self._parse_split_params_with_fallback(self._get_constexpr_candidates())
                 self.all_split_params = dict(all_split_params)
                 self.split_params = {
                     axis: param
@@ -1033,42 +944,21 @@ class AutoTilingTuner(Autotuner):
                 vector_gap_fill_applied.append("axis_pid_dims")
                 self._parse_axis_pid_dims_with_fallback()
         self._apply_fixed_grid_semantics(all_args)
-        missing_tunable_params = [
-            arg for arg in missing_tunable_params
-            if arg not in self.split_params.values()
-        ]
+        missing_tunable_params = [arg for arg in missing_tunable_params if arg not in self.split_params.values()]
         if not self.tiling_params:
             if self._should_skip_vv_vector_gap_fill():
                 self.tiling_params = {}
             else:
                 vector_gap_fill_applied.append("tiling_params")
-                self.tiling_params = self._parse_tiling_params_with_fallback(
-                    missing_tunable_params
-                )
-        auto_fallback_report = self._fallback_unresolved_tunable_params_to_split_tiling(
-            missing_tunable_params
-        )
+                self.tiling_params = self._parse_tiling_params_with_fallback(missing_tunable_params)
+        auto_fallback_report = self._fallback_unresolved_tunable_params_to_split_tiling(missing_tunable_params)
         if self.vv_gap_fill_report_v2 is not None:
             self.vv_gap_fill_report_v2["auto_fallback_split_tiling"] = auto_fallback_report
-        missing_tunable_params = [
-            arg for arg in missing_tunable_params
-            if arg not in self.split_params.values()
-        ]
-        missing_tunable_params = [
-            arg for arg in missing_tunable_params
-            if arg not in self.tiling_params.values()
-        ]
-        required_missing_params = [
-            arg for arg in required_missing_params
-            if arg not in self.split_params.values()
-        ]
-        required_missing_params = [
-            arg for arg in required_missing_params
-            if arg not in self.tiling_params.values()
-        ]
-        required_missing_params = self._filter_hard_missing_required_params(
-            required_missing_params
-        )
+        missing_tunable_params = [arg for arg in missing_tunable_params if arg not in self.split_params.values()]
+        missing_tunable_params = [arg for arg in missing_tunable_params if arg not in self.tiling_params.values()]
+        required_missing_params = [arg for arg in required_missing_params if arg not in self.split_params.values()]
+        required_missing_params = [arg for arg in required_missing_params if arg not in self.tiling_params.values()]
+        required_missing_params = self._filter_hard_missing_required_params(required_missing_params)
         self._finalize_vv_gap_fill_report(
             vector_gap_fill_applied=vector_gap_fill_applied,
             required_missing_params=required_missing_params,
@@ -1083,21 +973,17 @@ class AutoTilingTuner(Autotuner):
             ),
         )
         if required_missing_params:
-            raise ValueError(
-                f"Missing required arguments: {required_missing_params}. "
-                f"These arguments must be explicitly provided and cannot be automatically tuned. "
-                f"Please ensure that these arguments are passed when calling the function."
-            )
+            raise ValueError(f"Missing required arguments: {required_missing_params}. "
+                             f"These arguments must be explicitly provided and cannot be automatically tuned. "
+                             f"Please ensure that these arguments are passed when calling the function.")
 
     @staticmethod
     def _require_base_axis_name(axis: Optional[str]) -> Optional[str]:
         if not isinstance(axis, str) or not axis:
             return None
         if axis.startswith("r"):
-            raise ValueError(
-                "r-prefixed axis names are not supported; "
-                f"use the base axis name instead of '{axis}'."
-            )
+            raise ValueError("r-prefixed axis names are not supported; "
+                             f"use the base axis name instead of '{axis}'.")
         if axis not in valid_axis_names:
             raise ValueError(f"Unsupported axis name '{axis}'.")
         return axis
@@ -1107,10 +993,8 @@ class AutoTilingTuner(Autotuner):
         if not isinstance(axis, str) or not axis:
             return None
         if axis.startswith("r"):
-            raise ValueError(
-                "r-prefixed axis names are not supported; "
-                f"use the base axis name instead of '{axis}'."
-            )
+            raise ValueError("r-prefixed axis names are not supported; "
+                             f"use the base axis name instead of '{axis}'.")
         if axis not in valid_axis_names:
             raise ValueError(f"Unsupported axis name '{axis}'.")
         return axis
@@ -1156,15 +1040,14 @@ class AutoTilingTuner(Autotuner):
         if not isinstance(axis, str) or not axis:
             return None
         if axis.startswith("r"):
-            raise ValueError(
-                "r-prefixed axis names are not supported; "
-                f"use the base axis name instead of '{axis}'."
-            )
+            raise ValueError("r-prefixed axis names are not supported; "
+                             f"use the base axis name instead of '{axis}'.")
         if axis not in valid_axis_names:
             raise ValueError(f"Unsupported axis name '{axis}'.")
         return axis
 
     def _apply_vv_axis_semantic_result(self) -> bool:
+
         def resolve_base_axis(axis_name):
             resolver = getattr(self, "_get_axis_base_name", None)
             if callable(resolver):
@@ -1172,10 +1055,8 @@ class AutoTilingTuner(Autotuner):
             if not isinstance(axis_name, str) or not axis_name:
                 return None
             if axis_name.startswith("r"):
-                raise ValueError(
-                    "r-prefixed axis names are not supported; "
-                    f"use the base axis name instead of '{axis_name}'."
-                )
+                raise ValueError("r-prefixed axis names are not supported; "
+                                 f"use the base axis name instead of '{axis_name}'.")
             return axis_name
 
         def normalize_axis_name_mapping(axis_mapping):
@@ -1210,15 +1091,9 @@ class AutoTilingTuner(Autotuner):
             return False
 
         applied = False
-        raw_adapter_reduction_axes = list(
-            getattr(self.vv_adapter_result_v2, "reduction_axes", []) or []
-        )
-        adapter_reduction_axes = self._normalize_vv_reduction_axes(
-            raw_adapter_reduction_axes
-        )
-        raw_adapter_low_dim_axes = list(
-            getattr(self.vv_adapter_result_v2, "low_dim_axes", []) or []
-        )
+        raw_adapter_reduction_axes = list(getattr(self.vv_adapter_result_v2, "reduction_axes", []) or [])
+        adapter_reduction_axes = self._normalize_vv_reduction_axes(raw_adapter_reduction_axes)
+        raw_adapter_low_dim_axes = list(getattr(self.vv_adapter_result_v2, "low_dim_axes", []) or [])
         if adapter_reduction_axes or self.reduction_axes:
             self.reduction_axes = []
             for reduction_axis in adapter_reduction_axes:
@@ -1232,23 +1107,19 @@ class AutoTilingTuner(Autotuner):
             self.low_dim_axes = list(adapter_low_dim_axes)
             applied = True
 
-        adapter_split_params = normalize_axis_name_mapping(
-            getattr(self.vv_adapter_result_v2, "split_params", {}) or {}
-        )
+        adapter_split_params = normalize_axis_name_mapping(getattr(self.vv_adapter_result_v2, "split_params", {}) or {})
         if adapter_split_params or self.split_params:
             self.split_params = dict(adapter_split_params)
             applied = True
 
         adapter_tiling_params = normalize_axis_name_mapping(
-            getattr(self.vv_adapter_result_v2, "tiling_params", {}) or {}
-        )
+            getattr(self.vv_adapter_result_v2, "tiling_params", {}) or {})
         if adapter_tiling_params or self.tiling_params:
             self.tiling_params = dict(adapter_tiling_params)
             applied = True
 
         adapter_axis_pid_dims = normalize_axis_name_mapping(
-            getattr(self.vv_adapter_result_v2, "axis_pid_dims", {}) or {}
-        )
+            getattr(self.vv_adapter_result_v2, "axis_pid_dims", {}) or {})
         if adapter_axis_pid_dims or self.axis_pid_dims:
             self.axis_pid_dims = dict(adapter_axis_pid_dims)
             applied = True
@@ -1355,15 +1226,9 @@ class AutoTilingTuner(Autotuner):
         if adapter_status == "failed":
             return False
 
-        adapter_split_params = dict(
-            getattr(self.vv_adapter_result_v2, "split_params", {}) or {}
-        )
-        adapter_tiling_params = dict(
-            getattr(self.vv_adapter_result_v2, "tiling_params", {}) or {}
-        )
-        mapped_params = set(adapter_split_params.values()) | set(
-            adapter_tiling_params.values()
-        )
+        adapter_split_params = dict(getattr(self.vv_adapter_result_v2, "split_params", {}) or {})
+        adapter_tiling_params = dict(getattr(self.vv_adapter_result_v2, "tiling_params", {}) or {})
+        mapped_params = set(adapter_split_params.values()) | set(adapter_tiling_params.values())
         if not mapped_params:
             return False
 
@@ -1379,11 +1244,8 @@ class AutoTilingTuner(Autotuner):
         return False
 
     def _should_skip_vv_vector_gap_fill(self) -> bool:
-        return (
-            self.enable_vv_parser_v2
-            and (self.parser_mode or "vector") == "vector"
-            and getattr(self, "vv_parser_v2_mode", "off") == "authoritative"
-        )
+        return (self.enable_vv_parser_v2 and (self.parser_mode or "vector") == "vector"
+                and getattr(self, "vv_parser_v2_mode", "off") == "authoritative")
 
     @staticmethod
     def _is_direct_runtime_length_arg_name(expr: Optional[str]) -> bool:
@@ -1392,13 +1254,9 @@ class AutoTilingTuner(Autotuner):
     def _resolve_axis_length_arg_name(self, axis: str) -> Optional[str]:
         axis_length_exprs = {}
         if self.vector_axes is not None:
-            axis_length_exprs = dict(
-                getattr(self.vector_axes, "axis_length_exprs", {}) or {}
-            )
+            axis_length_exprs = dict(getattr(self.vector_axes, "axis_length_exprs", {}) or {})
         elif self.vv_adapter_result_v2 is not None:
-            axis_length_exprs = dict(
-                getattr(self.vv_adapter_result_v2, "axis_length_exprs", {}) or {}
-            )
+            axis_length_exprs = dict(getattr(self.vv_adapter_result_v2, "axis_length_exprs", {}) or {})
         axis_expr = axis_length_exprs.get(axis, None)
         if self._is_direct_runtime_length_arg_name(axis_expr):
             return axis_expr
@@ -1452,9 +1310,7 @@ class AutoTilingTuner(Autotuner):
             if not is_valid_axis_name(axis):
                 continue
             if not isinstance(value, int):
-                raise ValueError(
-                    f"Not supported dim type: {type(value)}, `int` is the only supported type"
-                )
+                raise ValueError(f"Not supported dim type: {type(value)}, `int` is the only supported type")
             vector_axes.ensure_axis(axis)
             runtime_view[axis] = value
 
@@ -1483,10 +1339,7 @@ class AutoTilingTuner(Autotuner):
         if not self.fixed_grid_dims or not self.axis_pid_dims:
             return
 
-        fixed_grid_axes = {
-            axis for axis, pid_dim in self.axis_pid_dims.items()
-            if pid_dim in self.fixed_grid_dims
-        }
+        fixed_grid_axes = {axis for axis, pid_dim in self.axis_pid_dims.items() if pid_dim in self.fixed_grid_dims}
         if not fixed_grid_axes:
             return
 
@@ -1526,31 +1379,23 @@ class AutoTilingTuner(Autotuner):
         if getattr(self, "vv_parser_v2_mode", "off") not in ("observe", "authoritative"):
             return
         self.vv_gap_fill_report_v2 = {
-            "mode": getattr(self, "vv_parser_v2_mode", "off"),
-            "vv_status": (
-                None
-                if self.vv_parse_result_v2 is None
-                else getattr(self.vv_parse_result_v2, "status", None)
-            ),
-            "adapter_status": (
-                None
-                if self.vv_adapter_result_v2 is None
-                else getattr(self.vv_adapter_result_v2, "status", None)
-            ),
-            "required_missing_params_before_vector": list(required_missing_params),
-            "missing_tunable_params_before_vector": list(missing_tunable_params),
-            "vector_gap_fill_needed": self._collect_vv_vector_gap_fill_needed(),
+            "mode":
+            getattr(self, "vv_parser_v2_mode", "off"),
+            "vv_status":
+            (None if self.vv_parse_result_v2 is None else getattr(self.vv_parse_result_v2, "status", None)),
+            "adapter_status":
+            (None if self.vv_adapter_result_v2 is None else getattr(self.vv_adapter_result_v2, "status", None)),
+            "required_missing_params_before_vector":
+            list(required_missing_params),
+            "missing_tunable_params_before_vector":
+            list(missing_tunable_params),
+            "vector_gap_fill_needed":
+            self._collect_vv_vector_gap_fill_needed(),
             "vector_gap_fill_applied": [],
-            "vv_diagnostics": (
-                []
-                if self.vv_parse_result_v2 is None
-                else list(getattr(self.vv_parse_result_v2, "diagnostics", []) or [])
-            ),
-            "adapter_diagnostics": (
-                []
-                if self.vv_adapter_result_v2 is None
-                else list(getattr(self.vv_adapter_result_v2, "diagnostics", []) or [])
-            ),
+            "vv_diagnostics": ([] if self.vv_parse_result_v2 is None else list(
+                getattr(self.vv_parse_result_v2, "diagnostics", []) or [])),
+            "adapter_diagnostics": ([] if self.vv_adapter_result_v2 is None else list(
+                getattr(self.vv_adapter_result_v2, "diagnostics", []) or [])),
         }
 
     def _finalize_vv_gap_fill_report(
@@ -1561,18 +1406,16 @@ class AutoTilingTuner(Autotuner):
     ) -> None:
         if self.vv_gap_fill_report_v2 is None:
             return
-        self.vv_gap_fill_report_v2.update(
-            {
-                "vector_gap_fill_applied": list(vector_gap_fill_applied),
-                "required_missing_params_final": list(required_missing_params),
-                "missing_tunable_params_final": list(missing_tunable_params),
-                "final_split_params": dict(self.split_params or {}),
-                "final_tiling_params": dict(self.tiling_params or {}),
-                "final_low_dim_axes": list(self.low_dim_axes or []),
-                "final_reduction_axes": list(self.reduction_axes or []),
-                "final_axis_pid_dims": dict(self.axis_pid_dims or {}),
-            }
-        )
+        self.vv_gap_fill_report_v2.update({
+            "vector_gap_fill_applied": list(vector_gap_fill_applied),
+            "required_missing_params_final": list(required_missing_params),
+            "missing_tunable_params_final": list(missing_tunable_params),
+            "final_split_params": dict(self.split_params or {}),
+            "final_tiling_params": dict(self.tiling_params or {}),
+            "final_low_dim_axes": list(self.low_dim_axes or []),
+            "final_reduction_axes": list(self.reduction_axes or []),
+            "final_axis_pid_dims": dict(self.axis_pid_dims or {}),
+        })
 
     def _run_vector_parser_with_fallback(
         self,
@@ -1584,11 +1427,7 @@ class AutoTilingTuner(Autotuner):
             return parser_fn()
         except Exception:
             if self.print_autotuning:
-                print(
-                    "[WARNING] Failed to parse {}, fallback to {}.".format(
-                        parser_name, fallback_value
-                    )
-                )
+                print("[WARNING] Failed to parse {}, fallback to {}.".format(parser_name, fallback_value))
             return fallback_value
 
     def _parse_reduction_axes_with_fallback(self) -> List[str]:
@@ -1660,8 +1499,8 @@ class AutoTilingTuner(Autotuner):
                     defaulted.add(arg.arg)
 
         for kw_arg, kw_default in zip(
-            func_node.args.kwonlyargs,
-            func_node.args.kw_defaults,
+                func_node.args.kwonlyargs,
+                func_node.args.kw_defaults,
         ):
             if kw_default is None:
                 continue
@@ -1676,11 +1515,7 @@ class AutoTilingTuner(Autotuner):
         if not required_missing_params:
             return []
         defaulted_args = set(self._get_defaulted_argument_names())
-        return [
-            arg_name
-            for arg_name in required_missing_params
-            if arg_name not in defaulted_args
-        ]
+        return [arg_name for arg_name in required_missing_params if arg_name not in defaulted_args]
 
     def _resolve_vv_tunable_candidates_by_cv_policy(
         self,
@@ -1771,10 +1606,7 @@ class AutoTilingTuner(Autotuner):
             return 100
         if param_upper.startswith(anchor_upper) or anchor_upper.startswith(param_upper):
             return 90
-        if (
-            param_upper.replace("_SUB", "") == anchor_upper
-            or anchor_upper.replace("_SUB", "") == param_upper
-        ):
+        if (param_upper.replace("_SUB", "") == anchor_upper or anchor_upper.replace("_SUB", "") == param_upper):
             return 88
         common_prefix = 0
         for lhs, rhs in zip(param_upper, anchor_upper):
@@ -1798,11 +1630,8 @@ class AutoTilingTuner(Autotuner):
             "decisions": [],
             "applied": False,
         }
-        if not (
-            self.enable_vv_parser_v2
-            and (self.parser_mode or "vector") == "vector"
-            and getattr(self, "vv_parser_v2_mode", "off") in ("assist", "authoritative")
-        ):
+        if not (self.enable_vv_parser_v2 and (self.parser_mode or "vector") == "vector"
+                and getattr(self, "vv_parser_v2_mode", "off") in ("assist", "authoritative")):
             return report
 
         consumed_params = set(self.split_params.values()) | set(self.tiling_params.values())
@@ -1818,26 +1647,19 @@ class AutoTilingTuner(Autotuner):
         report["initial_unresolved_params"] = list(unresolved)
 
         ordered_axes = [
-            axis
-            for axis in self.axis_arg_names.keys()
-            if isinstance(axis, str) and is_valid_axis_name(axis)
+            axis for axis in self.axis_arg_names.keys() if isinstance(axis, str) and is_valid_axis_name(axis)
         ]
         if not ordered_axes:
             report["remaining_unresolved_params"] = list(unresolved)
             return report
         axis_order = {axis: idx for idx, axis in enumerate(ordered_axes)}
 
-        empty_axes = [
-            axis for axis in ordered_axes
-            if axis not in self.split_params and axis not in self.tiling_params
-        ]
+        empty_axes = [axis for axis in ordered_axes if axis not in self.split_params and axis not in self.tiling_params]
         split_only_axes = [
-            axis for axis in ordered_axes
-            if axis in self.split_params and axis not in self.tiling_params
+            axis for axis in ordered_axes if axis in self.split_params and axis not in self.tiling_params
         ]
         tiling_only_axes = [
-            axis for axis in ordered_axes
-            if axis in self.tiling_params and axis not in self.split_params
+            axis for axis in ordered_axes if axis in self.tiling_params and axis not in self.split_params
         ]
 
         def _pick_best_axis(param_name: str, candidate_axes: List[str], anchor_map: Dict[str, str]):
@@ -1914,20 +1736,16 @@ class AutoTilingTuner(Autotuner):
                     self.split_params[axis] = param_name
                     report["assigned_split_params"][axis] = param_name
                 candidate_axes.remove(axis)
-                report["decisions"].append(
-                    {
-                        "phase": phase_spec["phase"],
-                        "axis": axis,
-                        "param": param_name,
-                        "score": list(score) if score is not None else [],
-                    }
-                )
+                report["decisions"].append({
+                    "phase": phase_spec["phase"],
+                    "axis": axis,
+                    "param": param_name,
+                    "score": list(score) if score is not None else [],
+                })
             pending = next_pending
 
         report["remaining_unresolved_params"] = list(pending)
-        report["applied"] = bool(
-            report["assigned_tiling_params"] or report["assigned_split_params"]
-        )
+        report["applied"] = bool(report["assigned_tiling_params"] or report["assigned_split_params"])
         return report
 
     def _detect_missing_tunable_params(self, all_args, required_missing_params: List[str]) -> List[str]:
@@ -1947,10 +1765,7 @@ class AutoTilingTuner(Autotuner):
             raise
         except Exception:
             constexpr_names = set(self._get_constexpr_candidates())
-            fallback = [
-                arg_name for arg_name in required_missing_params
-                if arg_name in constexpr_names
-            ]
+            fallback = [arg_name for arg_name in required_missing_params if arg_name in constexpr_names]
             return fallback
 
     def _autoparse_axis_info_v2_for_vector(self, all_args=None):
@@ -2003,19 +1818,16 @@ class AutoTilingTuner(Autotuner):
             return result
         except Exception as exc:
             if self.print_autotuning:
-                print(
-                    "Ascend autotuning vector v2 parse failed: {}: {}".format(
-                        type(exc).__name__,
-                        exc,
-                    )
-                )
+                print("Ascend autotuning vector v2 parse failed: {}: {}".format(
+                    type(exc).__name__,
+                    exc,
+                ))
             self.vv_parse_result_v2 = None
             self.vv_adapter_result_v2 = None
             return None
 
-    def _gen_tile_configs(
-        self, kv_dict: Dict[str, int], dtype: torch.dtype, all_args: Dict[str, Any] = None
-    ) -> List[Config]:
+    def _gen_tile_configs(self, kv_dict: Dict[str, int], dtype: torch.dtype,
+                          all_args: Dict[str, Any] = None) -> List[Config]:
         # Use CVTileGenerator for cube/mix parser modes.
         if self.parser_mode in ("cube", "mix") and self.cv_parse_result is not None:
             return self._gen_tile_configs_cv(kv_dict, dtype, all_args)
@@ -2025,18 +1837,16 @@ class AutoTilingTuner(Autotuner):
 
         vector_tile_inputs = self._materialize_vector_tile_inputs(kv_dict, all_args)
         if self.print_autotuning:
-            print(
-                "Ascend autotuning vector tile inputs: "
-                f"axis_sizes={vector_tile_inputs['axis_sizes']}, "
-                f"split_params={vector_tile_inputs['split_params']}, "
-                f"fixed_split_params={self.fixed_split_params}, "
-                f"tiling_params={vector_tile_inputs['tiling_params']}, "
-                f"low_dim_axes={vector_tile_inputs['low_dim_axes']}, "
-                f"reduction_axes={vector_tile_inputs['reduction_axes']}, "
-                f"persistent_reduction={self.persistent_reduction}, "
-                f"dual_reduction={self.dual_reduction}, "
-                f"num_buffers={self.num_buffers}"
-            )
+            print("Ascend autotuning vector tile inputs: "
+                  f"axis_sizes={vector_tile_inputs['axis_sizes']}, "
+                  f"split_params={vector_tile_inputs['split_params']}, "
+                  f"fixed_split_params={self.fixed_split_params}, "
+                  f"tiling_params={vector_tile_inputs['tiling_params']}, "
+                  f"low_dim_axes={vector_tile_inputs['low_dim_axes']}, "
+                  f"reduction_axes={vector_tile_inputs['reduction_axes']}, "
+                  f"persistent_reduction={self.persistent_reduction}, "
+                  f"dual_reduction={self.dual_reduction}, "
+                  f"num_buffers={self.num_buffers}")
 
         kernel_meta = KernelMeta(
             vector_tile_inputs["axis_sizes"],
@@ -2063,16 +1873,13 @@ class AutoTilingTuner(Autotuner):
             self.gen_configs = self._expand_simd_multibuffer_configs(self.gen_configs)
 
         if len(self.gen_configs) == 0:
-            print(
-                "[WARNING] The generated candidate tiling configs are empty based on provided parameters!"
-            )
+            print("[WARNING] The generated candidate tiling configs are empty based on provided parameters!")
 
         if self.print_autotuning:
             print("Generated configs number: {}".format(len(self.gen_configs)))
 
-    def _gen_tile_configs_cv(
-        self, kv_dict: Dict[str, int], dtype: torch.dtype, all_args: Dict[str, Any] = None
-    ) -> List[Config]:
+    def _gen_tile_configs_cv(self, kv_dict: Dict[str, int], dtype: torch.dtype,
+                             all_args: Dict[str, Any] = None) -> List[Config]:
         """
         Generate candidate configs with CVTileGenerator for cube/mix mode.
 
@@ -2101,7 +1908,7 @@ class AutoTilingTuner(Autotuner):
 
     def _rough_bench_once(self, fn) -> float:
         di = triton.runtime.driver.active.get_device_interface()
-        di.synchronize()  
+        di.synchronize()
         try:
             start_event = di.Event(enable_timing=True)
             end_event = di.Event(enable_timing=True)
@@ -2111,10 +1918,8 @@ class AutoTilingTuner(Autotuner):
             di.synchronize()
             return start_event.elapsed_time(end_event)
         except Exception as exc:
-            print(
-                "Triton autotuning compile debug: "
-                f"one-shot rough benchmark failed, reason={type(exc).__name__}: {exc}"
-            )
+            print("Triton autotuning compile debug: "
+                  f"one-shot rough benchmark failed, reason={type(exc).__name__}: {exc}")
             return float("inf")
 
     def _prune_by_time_limit(self, run_fns: Dict[Config, Any]) -> Dict[Config, Any]:
@@ -2148,13 +1953,13 @@ class AutoTilingTuner(Autotuner):
 
         if self.print_autotuning:
             print(f"Triton autotuning: estimate n_warmup={n_warmup}, n_repeat={n_repeat}, "
-                    f"cumulative={cumulative_time:.4f}s/{time_limit}s, "
-                    f"valid={len(valid_configs)}/{len(run_fns)}")
+                  f"cumulative={cumulative_time:.4f}s/{time_limit}s, "
+                  f"valid={len(valid_configs)}/{len(run_fns)}")
             for config in sorted_configs:
                 is_valid = config in valid_configs
                 status = "valid" if is_valid else "pruned"
                 print(f"Triton autotuning compile debug: "
-                        f"[{status}] config={config}, rough_time={rough_timings[config]:.4f}ms")
+                      f"[{status}] config={config}, rough_time={rough_timings[config]:.4f}ms")
 
         return {cfg: run_fns[cfg] for cfg in valid_configs}
 
@@ -2163,10 +1968,7 @@ class AutoTilingTuner(Autotuner):
         npu_tuning.start_timing(self)
         generation_start = npu_tuning.begin_stage(self)
         self.nargs = dict(zip(self.arg_names, args))
-        self.is_simt_mode = (
-            kwargs.get("force_simt_only", False)
-            or kwargs.get("compile_mode") == "simt_only"
-        )
+        self.is_simt_mode = (kwargs.get("force_simt_only", False) or kwargs.get("compile_mode") == "simt_only")
         if 'num_warps' in kwargs and kwargs['num_warps'] is not None:
             self.user_specified_warps = kwargs['num_warps']
         else:
@@ -2190,11 +1992,7 @@ class AutoTilingTuner(Autotuner):
         for _, arg in _args.items():
             if hasattr(arg, "dtype"):
                 key.append(str(arg.dtype))
-                dtype = (
-                    arg.dtype
-                    if get_byte_per_numel(arg.dtype) >= get_byte_per_numel(dtype)
-                    else dtype
-                )
+                dtype = (arg.dtype if get_byte_per_numel(arg.dtype) >= get_byte_per_numel(dtype) else dtype)
         if dtype is None:
             raise NotImplementedError("Not support for non-Tensor inputs")
 
@@ -2272,10 +2070,8 @@ class AutoTilingTuner(Autotuner):
         self.best_config = config
 
         if self.print_autotuning and not used_cached_result:
-            print(
-                f"Triton autotuning for function {self.base_fn.__name__} finished after "
-                f"{self.bench_time:.2f}s; best config selected: {self.best_config};"
-            )
+            print(f"Triton autotuning for function {self.base_fn.__name__} finished after "
+                  f"{self.bench_time:.2f}s; best config selected: {self.best_config};")
 
         if self._npu_options is not None:
             npu_tuning.finish_reports(self, config, reports, cache_miss)
@@ -2341,8 +2137,8 @@ class AutoTilingTuner(Autotuner):
             future_kernels = []
             try:
                 with (
-                    ThreadPoolExecutor(max_workers=max_workers) as executor,
-                    triton.AsyncCompileMode(executor),
+                        ThreadPoolExecutor(max_workers=max_workers) as executor,
+                        triton.AsyncCompileMode(executor),
                 ):
                     for config, fn in kernels_call.items():
                         future_kernels.append((config, fn(warmup=True)))
@@ -2430,6 +2226,7 @@ class AutoTilingTuner(Autotuner):
             if not warmup:
                 self.post_hook(full_nargs, exception=None)
             return res
+
         kernel_call.target_kernel_name = None
         return kernel_call
 
@@ -2442,22 +2239,14 @@ class AutoTilingTuner(Autotuner):
 
             max_workers = min(psutil.cpu_count(logical=False) // 2, len(pruned_configs))
             with (
-                ThreadPoolExecutor(max_workers=max_workers) as executor,
-                triton.AsyncCompileMode(executor),
+                    ThreadPoolExecutor(max_workers=max_workers) as executor,
+                    triton.AsyncCompileMode(executor),
             ):
                 for config in pruned_configs:
-                    ret.append(self.fn.warmup(
-                        *args,
-                        **kwargs,
-                        **config.all_kwargs()
-                    ))
+                    ret.append(self.fn.warmup(*args, **kwargs, **config.all_kwargs()))
         else:
             for config in pruned_configs:
-                ret.append(self.fn.warmup(
-                    *args,
-                    **kwargs,
-                    **config.all_kwargs()
-                ))
+                ret.append(self.fn.warmup(*args, **kwargs, **config.all_kwargs()))
         self.nargs = None
         return ret
 
@@ -2466,9 +2255,7 @@ class AutoTilingTuner(Autotuner):
 
         kernel_call = self._make_kernel_call(*args, config=config, **meta)
         fn = functools.partial(kernel_call, warmup=False)
-        do_bench_npu(
-            fn, prof_dir=self.auto_profile_dir, keep_res=True
-        )
+        do_bench_npu(fn, prof_dir=self.auto_profile_dir, keep_res=True)
 
     def _autoparse_split_params(self, candidates_params: List[str]) -> Dict[str, str]:
         """
@@ -2482,11 +2269,9 @@ class AutoTilingTuner(Autotuner):
         self.split_params = dict(split_axes)
         self._refresh_vector_axes()
         if self.print_autotuning:
-            print(
-                f"Ascend autotuning parse split axes: {split_axes}, "
-                f"split axis pid dims: {self.split_axis_pid_dims}, "
-                f"axis pid dims: {self.axis_pid_dims}"
-            )
+            print(f"Ascend autotuning parse split axes: {split_axes}, "
+                  f"split axis pid dims: {self.split_axis_pid_dims}, "
+                  f"axis pid dims: {self.axis_pid_dims}")
         return split_axes
 
     def _autoparse_axis_pid_dims(self) -> Dict[str, int]:
@@ -2505,10 +2290,8 @@ class AutoTilingTuner(Autotuner):
         self.split_axis_pid_dims = dict(getattr(parser, "split_axis_pid_dims", {}))
         self._refresh_vector_axes()
         if self.print_autotuning:
-            print(
-                "Ascend autotuning parse axis pid dims (independent): "
-                f"{self.axis_pid_dims}"
-            )
+            print("Ascend autotuning parse axis pid dims (independent): "
+                  f"{self.axis_pid_dims}")
         return self.axis_pid_dims
 
     def _get_constexpr_candidates(self) -> List[str]:
@@ -2526,12 +2309,8 @@ class AutoTilingTuner(Autotuner):
                 if not isinstance(arg, ast.arg):
                     continue
                 ann = arg.annotation
-                if (
-                    isinstance(ann, ast.Attribute)
-                    and isinstance(ann.value, ast.Name)
-                    and ann.value.id == "tl"
-                    and ann.attr == "constexpr"
-                ):
+                if (isinstance(ann, ast.Attribute) and isinstance(ann.value, ast.Name) and ann.value.id == "tl"
+                        and ann.attr == "constexpr"):
                     constexpr_names.append(arg.arg)
             break
         return constexpr_names
@@ -2550,7 +2329,7 @@ class AutoTilingTuner(Autotuner):
 
     def _extract_fixed_grid_dims(self, grid) -> Dict[int, int]:
         if isinstance(grid, int):
-            grid = (grid,)
+            grid = (grid, )
         if not isinstance(grid, (tuple, list)):
             return {}
         fixed_dims = {}
@@ -2561,7 +2340,7 @@ class AutoTilingTuner(Autotuner):
 
     def _normalize_grid_tuple(self, grid_out):
         if isinstance(grid_out, int):
-            return (grid_out,)
+            return (grid_out, )
         if isinstance(grid_out, (tuple, list)):
             return tuple(grid_out)
         return None
@@ -2626,17 +2405,13 @@ class AutoTilingTuner(Autotuner):
         Extracts the tiling axis parameters from triton kernel code.
         """
         func_ast = self.fn.parse()
-        parser_axis_arg_names = self._normalize_axis_name_mapping(
-            self._get_parser_axis_arg_names()
-        )
+        parser_axis_arg_names = self._normalize_axis_name_mapping(self._get_parser_axis_arg_names())
         parser = TilingAxesParser(func_ast, parser_axis_arg_names, candidates_params)
         tiling_axes = parser.parse()
         self.tiling_params = dict(tiling_axes)
         self._refresh_vector_axes()
         if self.print_autotuning:
-            print(
-                f"Ascend autotuning parse tiling axes: {tiling_axes}"
-            )
+            print(f"Ascend autotuning parse tiling axes: {tiling_axes}")
         return tiling_axes
 
     def _autoparse_reduction_axes(self) -> List[str]:
@@ -2655,10 +2430,8 @@ class AutoTilingTuner(Autotuner):
         self._refresh_vector_axes()
 
         if self.print_autotuning:
-            print(
-                f"Ascend autotuning parse axis arg names: {self.axis_arg_names} \n"
-                f"Ascend autotuning parse reduction axes: {reduction_axes}"
-            )
+            print(f"Ascend autotuning parse axis arg names: {self.axis_arg_names} \n"
+                  f"Ascend autotuning parse reduction axes: {reduction_axes}")
         return reduction_axes
 
     def _autoparse_low_dim_axes(self) -> List[str]:
@@ -2666,9 +2439,7 @@ class AutoTilingTuner(Autotuner):
         Extracts the low dimension axis from triton kernel code.
         """
         func_ast = self.fn.parse()
-        parser_axis_arg_names = self._normalize_axis_name_mapping(
-            self._get_parser_axis_arg_names()
-        )
+        parser_axis_arg_names = self._normalize_axis_name_mapping(self._get_parser_axis_arg_names())
         parser = LowDimsAxesParser(func_ast, parser_axis_arg_names)
         low_dim_axes = parser.parse()
         if len(low_dim_axes) < 1:
@@ -2678,9 +2449,7 @@ class AutoTilingTuner(Autotuner):
         self.low_dim_axes = list(low_dim_axes)
         self._refresh_vector_axes()
         if self.print_autotuning:
-            print(
-                f"Ascend autotuning parse low dimensional axes: {low_dim_axes}"
-            )
+            print(f"Ascend autotuning parse low dimensional axes: {low_dim_axes}")
         return low_dim_axes
 
     def _autoparse_ptr_nums(self, all_args: dict) -> int:
@@ -2695,9 +2464,7 @@ class AutoTilingTuner(Autotuner):
                 ptr_params.append(k)
 
         if self.print_autotuning:
-            print(
-                f"Ascend autotuning parse pointer params: {ptr_params}, pointer nums: {ptr_nums}"
-            )
+            print(f"Ascend autotuning parse pointer params: {ptr_params}, pointer nums: {ptr_nums}")
         return ptr_nums
 
     def _get_persistent_reduction_threshold(self, reduction_axis: str) -> int:
@@ -2706,11 +2473,7 @@ class AutoTilingTuner(Autotuner):
         # Reduction axes are stored as base axis names; compare directly with
         # the low-dim base axis.
         reduction_axis_base = self._get_axis_base_name(reduction_axis)
-        low_dim_axis_base = (
-            self._get_axis_base_name(self.low_dim_axes[0])
-            if self.low_dim_axes
-            else None
-        )
+        low_dim_axis_base = (self._get_axis_base_name(self.low_dim_axes[0]) if self.low_dim_axes else None)
         if reduction_axis_base is not None and reduction_axis_base == low_dim_axis_base:
             return 1024
         return 64
@@ -2780,13 +2543,15 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     def decorator(fn):
         return AutoTilingTuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                                post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
-                               use_cuda_graph=use_cuda_graph, do_bench=do_bench, auto_profile_dir=auto_prof_dir, hints=hints)
+                               use_cuda_graph=use_cuda_graph, do_bench=do_bench, auto_profile_dir=auto_prof_dir,
+                               hints=hints)
 
     return decorator
 
 
 _ALL_PARAMS = {
-    "num_stages", "unit_flag",
+    "num_stages",
+    "unit_flag",
     "multibuffer",
     "limit_auto_multi_buffer_only_for_local_buffer",
     "limit_auto_multi_buffer_of_local_buffer",
@@ -2823,7 +2588,8 @@ _VALID_VALUES = {
 _CUBE_PARAMS = {"num_stages", "unit_flag", "limit_auto_multi_buffer_of_local_buffer"}
 
 _MIXCV_PARAMS = {
-    "num_stages", "unit_flag",
+    "num_stages",
+    "unit_flag",
     "limit_auto_multi_buffer_only_for_local_buffer",
     "limit_auto_multi_buffer_of_local_buffer",
     "set_workspace_multibuffer",
@@ -2853,41 +2619,31 @@ def _check_int_in_set(val, valid_set, param_name):
 
 _VALIDATION_RULES = {
     "num_stages": {
-        "desc": f"must be one or more of: {_VALID_VALUES['num_stages']}",
-        "check": lambda val, p: _check_int_in_set(val, _VALID_VALUES['num_stages'], p)
+        "desc": f"must be one or more of: {_VALID_VALUES['num_stages']}", "check":
+        lambda val, p: _check_int_in_set(val, _VALID_VALUES['num_stages'], p)
     },
-    "unit_flag": {
-        "desc": "must be non-empty list/tuple of boolean values",
-        "check": _check_boolean_list
-    },
-    "limit_auto_multi_buffer_only_for_local_buffer": {
-        "desc": "must be non-empty list/tuple of boolean values",
-        "check": _check_boolean_list
-    },
+    "unit_flag": {"desc": "must be non-empty list/tuple of boolean values", "check": _check_boolean_list},
+    "limit_auto_multi_buffer_only_for_local_buffer":
+    {"desc": "must be non-empty list/tuple of boolean values", "check": _check_boolean_list},
     "limit_auto_multi_buffer_of_local_buffer": {
-        "desc": f"must be one or more of: {_VALID_VALUES['limit_auto_multi_buffer_of_local_buffer']}",
-        "check": lambda val, p: _check_string_in_set(val, _VALID_VALUES['limit_auto_multi_buffer_of_local_buffer'], p)
+        "desc": f"must be one or more of: {_VALID_VALUES['limit_auto_multi_buffer_of_local_buffer']}", "check":
+        lambda val, p: _check_string_in_set(val, _VALID_VALUES['limit_auto_multi_buffer_of_local_buffer'], p)
     },
     "set_workspace_multibuffer": {
-        "desc": f"must be one or more of: {_VALID_VALUES['set_workspace_multibuffer']}",
-        "check": lambda val, p: _check_int_in_set(val, _VALID_VALUES['set_workspace_multibuffer'], p)
+        "desc": f"must be one or more of: {_VALID_VALUES['set_workspace_multibuffer']}", "check":
+        lambda val, p: _check_int_in_set(val, _VALID_VALUES['set_workspace_multibuffer'], p)
     },
-    "enable_hivm_auto_cv_balance": {
-        "desc": "must be non-empty list/tuple of boolean values",
-        "check": _check_boolean_list
-    },
+    "enable_hivm_auto_cv_balance":
+    {"desc": "must be non-empty list/tuple of boolean values", "check": _check_boolean_list},
     "tile_mix_vector_loop": {
-        "desc": f"must be one or more of: {_VALID_VALUES['tile_mix_vector_loop']}",
-        "check": lambda val, p: _check_int_in_set(val, _VALID_VALUES['tile_mix_vector_loop'], p)
+        "desc": f"must be one or more of: {_VALID_VALUES['tile_mix_vector_loop']}", "check":
+        lambda val, p: _check_int_in_set(val, _VALID_VALUES['tile_mix_vector_loop'], p)
     },
     "tile_mix_cube_loop": {
-        "desc": f"must be one or more of: {_VALID_VALUES['tile_mix_cube_loop']}",
-        "check": lambda val, p: _check_int_in_set(val, _VALID_VALUES['tile_mix_cube_loop'], p)
+        "desc": f"must be one or more of: {_VALID_VALUES['tile_mix_cube_loop']}", "check":
+        lambda val, p: _check_int_in_set(val, _VALID_VALUES['tile_mix_cube_loop'], p)
     },
-    "enable_ubuf_saving": {
-        "desc": "must be non-empty list/tuple of boolean values",
-        "check": _check_boolean_list
-    },
+    "enable_ubuf_saving": {"desc": "must be non-empty list/tuple of boolean values", "check": _check_boolean_list},
 }
 
 
@@ -2896,6 +2652,7 @@ class BaseAutotuner:
     Base class for generating auto-tuning configurations without block dimensions.
     Users must provide fixed dimension parameters when calling the kernel.
     """
+
     def __init__(self, operator_name, supported_params, default_params, validation_rules):
         self.operator_name = operator_name
         self.supported_params = supported_params
@@ -2952,33 +2709,18 @@ class BaseAutotuner:
                 else:
                     config_kwargs[pname] = val
 
-            configs.append(Config(
-                kwargs=config_kwargs,
-                num_stages=num_stages_val if num_stages_val is not None else 2
-            ))
+            configs.append(Config(kwargs=config_kwargs, num_stages=num_stages_val if num_stages_val is not None else 2))
         return configs
 
 
-CubeAutotuner = BaseAutotuner(
-    operator_name="cube",
-    supported_params=_CUBE_PARAMS,
-    default_params=_DEFAULTS,
-    validation_rules=_VALIDATION_RULES
-)
+CubeAutotuner = BaseAutotuner(operator_name="cube", supported_params=_CUBE_PARAMS, default_params=_DEFAULTS,
+                              validation_rules=_VALIDATION_RULES)
 
-MixcvAutotuner = BaseAutotuner(
-    operator_name="mixcv",
-    supported_params=_MIXCV_PARAMS,
-    default_params=_DEFAULTS,
-    validation_rules=_VALIDATION_RULES
-)
+MixcvAutotuner = BaseAutotuner(operator_name="mixcv", supported_params=_MIXCV_PARAMS, default_params=_DEFAULTS,
+                               validation_rules=_VALIDATION_RULES)
 
-VectorAutotuner = BaseAutotuner(
-    operator_name="vector",
-    supported_params=_VECTOR_PARAMS,
-    default_params=_DEFAULTS,
-    validation_rules=_VALIDATION_RULES
-)
+VectorAutotuner = BaseAutotuner(operator_name="vector", supported_params=_VECTOR_PARAMS, default_params=_DEFAULTS,
+                                validation_rules=_VALIDATION_RULES)
 
 
 def get_autotune_cube_config(**kwargs: Any) -> List[triton.Config]:
@@ -3032,7 +2774,9 @@ def get_max_configs(config, kernel_type="mixcv", **kwargs):
     # Warn about unsupported parameters provided in kwargs
     unsupported = [k for k in kwargs if k not in supported and k in _ALL_PARAMS]
     if unsupported:
-        print(f"[WARNING] The following parameters are not supported for kernel_type '{kernel_type}': {unsupported}. They will be ignored.")
+        print(
+            f"[WARNING] The following parameters are not supported for kernel_type '{kernel_type}': {unsupported}. They will be ignored."
+        )
 
     # Build value lists for each parameter (priority: kwargs > base config > defaults)
     param_values = {}
@@ -3080,27 +2824,19 @@ def get_max_configs(config, kernel_type="mixcv", **kwargs):
                 # Overwrite or add the parameter to kwargs
                 new_kwargs[pname] = val
 
-        new_config = Config(
-            kwargs=new_kwargs,
-            num_warps=config.num_warps,
-            num_stages=num_stages_val if num_stages_val is not None else config.num_stages,
-            num_ctas=config.num_ctas,
-            num_buffers_warp_spec=config.num_buffers_warp_spec,
-            num_consumer_groups=config.num_consumer_groups,
-            reg_dec_producer=config.reg_dec_producer,
-            reg_inc_consumer=config.reg_inc_consumer,
-            maxnreg=config.maxnreg,
-            pre_hook=config.pre_hook
-        )
+        new_config = Config(kwargs=new_kwargs, num_warps=config.num_warps,
+                            num_stages=num_stages_val if num_stages_val is not None else config.num_stages,
+                            num_ctas=config.num_ctas, num_buffers_warp_spec=config.num_buffers_warp_spec,
+                            num_consumer_groups=config.num_consumer_groups, reg_dec_producer=config.reg_dec_producer,
+                            reg_inc_consumer=config.reg_inc_consumer, maxnreg=config.maxnreg, pre_hook=config.pre_hook)
         new_configs.append(new_config)
 
     return new_configs
 
 
-def max_autotune(configs, key, kernel_type="mixcv",
-                 prune_configs_by=None, reset_to_zero=None, restore_value=None,
-                 pre_hook=None, post_hook=None, warmup=None, rep=None,
-                 use_cuda_graph=False, do_bench=None, **tuning_params):
+def max_autotune(configs, key, kernel_type="mixcv", prune_configs_by=None, reset_to_zero=None, restore_value=None,
+                 pre_hook=None, post_hook=None, warmup=None, rep=None, use_cuda_graph=False, do_bench=None,
+                 **tuning_params):
     """
     Decorator that expands each base Config with tuning parameters before auto-tuning.
 
@@ -3124,6 +2860,7 @@ def max_autotune(configs, key, kernel_type="mixcv",
                           Each value must be a list; the Cartesian product of these lists
                           will be combined with each base config.
     """
+
     def decorator(fn):
         if not configs or len(configs) == 0:
             raise ValueError("[max_autotune] The argument 'configs' cannot be empty. "
@@ -3135,17 +2872,9 @@ def max_autotune(configs, key, kernel_type="mixcv",
             expanded_configs.extend(expanded)
 
         # Call the original autotune decorator with the expanded configs
-        return autotune(
-            configs=expanded_configs,
-            key=key,
-            prune_configs_by=prune_configs_by,
-            reset_to_zero=reset_to_zero,
-            restore_value=restore_value,
-            pre_hook=pre_hook,
-            post_hook=post_hook,
-            warmup=warmup,
-            rep=rep,
-            use_cuda_graph=use_cuda_graph,
-            do_bench=do_bench
-        )(fn)
+        return autotune(configs=expanded_configs, key=key, prune_configs_by=prune_configs_by,
+                        reset_to_zero=reset_to_zero, restore_value=restore_value, pre_hook=pre_hook,
+                        post_hook=post_hook, warmup=warmup, rep=rep, use_cuda_graph=use_cuda_graph,
+                        do_bench=do_bench)(fn)
+
     return decorator
