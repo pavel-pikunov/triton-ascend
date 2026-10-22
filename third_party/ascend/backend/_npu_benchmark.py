@@ -108,7 +108,7 @@ class NpuBenchmarkOptions:
         if self.quality_check:
             from ._benchmark_quality import THRESHOLDS
             thresholds = tuple(sorted(THRESHOLDS.items()))
-        return ("npu-benchmark", 9, self.effective_policy(), thresholds)
+        return ("npu-benchmark", 10, self.effective_policy(), thresholds)
 
 
 def resolve_options():
@@ -610,7 +610,7 @@ def benchmark_result(measurements, report_sink):
 
 def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name, *, options=None,
               pre_hook_scope=None, report_sink=None, timings=None, config_numbers=None):
-    """Run one profiler batch per attempt and retain each candidate's fastest score."""
+    """Measure candidates in batches and confirm their minimum scores."""
     options = resolve_options() if options is None else options
     funcs = funcs if isinstance(funcs, list) else [funcs]
     if not funcs:
@@ -666,6 +666,7 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
     best_reports = [None] * len(funcs)
     stability_runs = options.stability_runs if options.quality_check else 1
     windows = {index: deque(maxlen=stability_runs) for index in indices} if stability_runs > 1 else {}
+    passed_reports = {}
     unconfirmed = "stability not confirmed"
     root = Path(prof_dir) if prof_dir is not None else Path(
         runtime.cache.get_home_dir()) / ".triton" / "profile_results"
@@ -703,51 +704,61 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
             for index, measurement in zip(selected, measurements):
                 with timing_stage(timings, "quality"):
                     metrics, failures = evaluate_quality(*measurement.samples) if options.quality_check else ({}, [])
-                    if windows:
+                record = replace(measurement, samples=None, attempt=attempt + 1, quality_failures=tuple(failures),
+                                 quality_checked=options.quality_check, quality_metrics=metrics)
+                if measurement.score_ms < getattr(best_reports[index], "score_ms", float("inf")):
+                    best_reports[index] = record
+                retry = bool(failures)
+                if windows:
+                    with timing_stage(timings, "quality"):
+                        if not failures:
+                            passed_reports[index] = record
+                        best = best_reports[index] or record
                         window = windows[index]
-                        window.append((attempt + 1, measurement.mean_ms))
-                        means = [mean for _, mean in window]
-                        ratio = (max(means) / min(means) if len(window) == stability_runs
+                        window.append((record.attempt, record.mean_ms))
+                        others = [(number, mean)
+                                  for number, mean in window
+                                  if number != best.attempt][-(stability_runs - 1):]
+                        means = [best.mean_ms] + [mean for _, mean in others]
+                        ratio = (max(means) / min(means) if len(means) == stability_runs
                                  and all(math.isfinite(mean) and mean > 0 for mean in means) else float("inf"))
                         metrics["stability_relative_spread"] = ratio - 1
-                if measurement.score_ms < getattr(best_reports[index], "score_ms", float("inf")):
-                    best_reports[index] = replace(
-                        measurement, samples=None, attempt=attempt + 1,
-                        quality_failures=tuple(failures) + ((unconfirmed, ) if windows else ()),
-                        quality_checked=options.quality_check, quality_metrics=metrics)
-                if windows:
-                    best = best_reports[index]
-                    if ratio <= 1 + options.stability_tolerance:
-                        if best is not None and best.attempt >= window[0][0]:
+                        clean = best if not best.quality_failures else passed_reports.get(index)
+                        retry = not (ratio <= 1 + options.stability_tolerance and clean is not None and
+                                     (clean is best or clean.attempt >= others[0][0]))
+                        if not retry:
                             best_reports[index] = replace(
-                                best, quality_failures=tuple(reason for reason in best.quality_failures
-                                                             if reason != unconfirmed),
-                                quality_metrics={**best.quality_metrics, "stability_relative_spread": ratio - 1})
-                    else:
-                        failures = [*failures, unconfirmed]
+                                clean,
+                                quality_metrics={**clean.quality_metrics, "stability_relative_spread": ratio - 1})
+                            passed_reports.pop(index, None)
+                        else:
+                            failures = [*failures, unconfirmed]
                 log_stage(
                     options.log_level, "Config measurement", f"config={index}, attempt={attempt + 1}, "
                     f"active={options.active}, score_ms={measurement.score_ms:.8g}, mean_ms={measurement.mean_ms:.8g}, "
-                    f"metrics={metrics}, failures={failures}", detailed=True)
-                if failures:
+                    f"metrics={metrics}, failures={failures}, candidate_passed={not retry}", detailed=True)
+                if retry:
                     pending.append(index)
             log_stage(
                 options.log_level, "Quality/acquisition result", f"{len(selected) - len(pending)}/"
                 f"{len(selected)} candidates passed; retry candidates={len(pending)}")
             if not pending:
                 break
+    if windows:
+        for index in pending:
+            if best_reports[index] is not None:
+                best_reports[index] = replace(best_reports[index],
+                                              quality_failures=best_reports[index].quality_failures + (unconfirmed, ))
     measured = [record for record in best_reports if record is not None and math.isfinite(record.score_ms)]
     if not measured:
         raise RuntimeError("NPU benchmark: no usable profiler measurements") from last_acquisition_error
     best = min(measured, key=lambda record: record.score_ms)
-    if options.quality_check and (pending or (windows and best.quality_failures)):
+    if pending and options.quality_check:
         index = next(index for index, record in enumerate(best_reports) if record is best)
         winner = (f"config #{config_numbers[index]}" if config_numbers is not None and config_numbers[index] is not None
                   else f"benchmark candidate #{index + 1}")
-        message = ("Not all configurations passed quality checks. "
-                   if pending else "The selected result did not pass quality checks. ")
         report_safely(
-            lambda: print(f"\033[33m{message}"
+            lambda: print("\033[33mNot all configurations passed quality checks. "
                           f"Selected {winner}: lowest score {best.score_ms * 1000:.6g} us; "
                           f"selected attempt quality: {'failed' if best.quality_failures else 'pass'}.\033[0m"))
     if options.quality_check:
