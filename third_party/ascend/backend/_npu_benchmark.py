@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import deque
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
@@ -36,7 +37,9 @@ def capture_npu_reports(sink):
 
 ENV_PREFIX = "TRITON_NPU_BENCH_"
 TIMING_STAGES = ("generation_pruning", "compilation", "slow_filter", "calibration", "measurements")
-COUNT_MINIMUMS = {"warmup": 0, "active": 1, "max_retries": 0, "calibration_runs": 2, "slow_config_rounds": 1}
+COUNT_MINIMUMS = {
+    "warmup": 0, "active": 1, "max_retries": 0, "stability_runs": 1, "calibration_runs": 2, "slow_config_rounds": 1
+}
 
 
 class ProfilerResultMismatchError(RuntimeError):
@@ -65,6 +68,8 @@ class NpuBenchmarkOptions:
     quality_check: bool = True
     quality_check_all: bool = False
     max_retries: int = 5
+    stability_runs: int = 2
+    stability_tolerance: float = 0.03
     measure_budget_ms: float | None = 10.0
     calibration_runs: int = 10
     filter_slow_configs: bool = True
@@ -81,6 +86,8 @@ class NpuBenchmarkOptions:
             "report_best_config": False,
             "report_timing": False,
             "quality_check_all": False,
+            "stability_runs": self.quality_check,
+            "stability_tolerance": self.quality_check and self.stability_runs > 1,
             "calibration_runs": self.measure_budget_ms is not None or self.filter_slow_configs,
             "slow_config_rounds": self.filter_slow_configs,
             "slow_config_factor": self.filter_slow_configs,
@@ -622,6 +629,7 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
         options.log_level, "Benchmark settings", f"cache={'cold' if clear_l2_cache else 'hot'}, "
         f"profiler_mode={options.profiler_mode}, warmup={warmup}, active={active}, quality_check={options.quality_check}, "
         f"quality_check_all={options.quality_check_all}, "
+        f"stability_runs={options.stability_runs}, stability_tolerance={options.stability_tolerance}, "
         f"quantiles=({options.lower_quantile}, {options.upper_quantile})", detailed=True)
     if not (options.quality_check or options.max_retries or options.measure_budget_ms is not None
             or options.filter_slow_configs):
@@ -656,6 +664,9 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
         if options.quality_check_all:
             evaluate_quality = partial(evaluate_quality, check_all=True)
     best_reports = [None] * len(funcs)
+    stability_runs = options.stability_runs if options.quality_check else 1
+    windows = {index: deque(maxlen=stability_runs) for index in indices} if stability_runs > 1 else {}
+    unconfirmed = "stability not confirmed"
     root = Path(prof_dir) if prof_dir is not None else Path(
         runtime.cache.get_home_dir()) / ".triton" / "profile_results"
     root.mkdir(parents=True, exist_ok=True)
@@ -677,7 +688,7 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
     pending = indices
     last_acquisition_error = None
     with timing_stage(timings, "measurements"):
-        for attempt in range(options.max_retries + 1):
+        for attempt in range(stability_runs + options.max_retries):
             selected = pending
             log_stage(options.log_level, "Profiler measurement", f"Attempt {attempt + 1}: {len(selected)} candidates")
             log_stage(options.log_level, "Measurement settings", f"configs={selected}, warmup={options.warmup}, "
@@ -692,10 +703,28 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
             for index, measurement in zip(selected, measurements):
                 with timing_stage(timings, "quality"):
                     metrics, failures = evaluate_quality(*measurement.samples) if options.quality_check else ({}, [])
+                    if windows:
+                        window = windows[index]
+                        window.append((attempt + 1, measurement.mean_ms))
+                        means = [mean for _, mean in window]
+                        ratio = (max(means) / min(means) if len(window) == stability_runs
+                                 and all(math.isfinite(mean) and mean > 0 for mean in means) else float("inf"))
+                        metrics["stability_relative_spread"] = ratio - 1
                 if measurement.score_ms < getattr(best_reports[index], "score_ms", float("inf")):
-                    best_reports[index] = replace(measurement, samples=None, attempt=attempt + 1,
-                                                  quality_failures=tuple(failures),
-                                                  quality_checked=options.quality_check, quality_metrics=metrics)
+                    best_reports[index] = replace(
+                        measurement, samples=None, attempt=attempt + 1,
+                        quality_failures=tuple(failures) + ((unconfirmed, ) if windows else ()),
+                        quality_checked=options.quality_check, quality_metrics=metrics)
+                if windows:
+                    best = best_reports[index]
+                    if ratio <= 1 + options.stability_tolerance:
+                        if best is not None and best.attempt >= window[0][0]:
+                            best_reports[index] = replace(
+                                best, quality_failures=tuple(reason for reason in best.quality_failures
+                                                             if reason != unconfirmed),
+                                quality_metrics={**best.quality_metrics, "stability_relative_spread": ratio - 1})
+                    else:
+                        failures = [*failures, unconfirmed]
                 log_stage(
                     options.log_level, "Config measurement", f"config={index}, attempt={attempt + 1}, "
                     f"active={options.active}, score_ms={measurement.score_ms:.8g}, mean_ms={measurement.mean_ms:.8g}, "
@@ -711,12 +740,14 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
     if not measured:
         raise RuntimeError("NPU benchmark: no usable profiler measurements") from last_acquisition_error
     best = min(measured, key=lambda record: record.score_ms)
-    if pending and options.quality_check:
+    if options.quality_check and (pending or (windows and best.quality_failures)):
         index = next(index for index, record in enumerate(best_reports) if record is best)
         winner = (f"config #{config_numbers[index]}" if config_numbers is not None and config_numbers[index] is not None
                   else f"benchmark candidate #{index + 1}")
+        message = ("Not all configurations passed quality checks. "
+                   if pending else "The selected result did not pass quality checks. ")
         report_safely(
-            lambda: print("\033[33mNot all configurations passed quality checks. "
+            lambda: print(f"\033[33m{message}"
                           f"Selected {winner}: lowest score {best.score_ms * 1000:.6g} us; "
                           f"selected attempt quality: {'failed' if best.quality_failures else 'pass'}.\033[0m"))
     if options.quality_check:

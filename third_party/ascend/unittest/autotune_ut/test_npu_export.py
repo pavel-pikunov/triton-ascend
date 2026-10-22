@@ -129,7 +129,7 @@ def test_mode_and_timing_reach_the_profiler(backend, monkeypatch, tmp_path, mode
     clock, timings, calls = [0.], {}, []
     monkeypatch.setattr(policy.time, "perf_counter", lambda: clock[0])
     options = replace(policy.resolve_options(), profiler_mode=mode, active=2, warmup=0, max_retries=0,
-                      measure_budget_ms=None, filter_slow_configs=False, log_level="off")
+                      measure_budget_ms=None, filter_slow_configs=False, stability_runs=1, log_level="off")
     measurement = policy.NpuMeasurementReport({}, 2, 0, 2, "hot", .01, .01, samples=(np.arange(2), np.full(2, 10.)))
 
     def profile(*args, **kwargs):
@@ -306,7 +306,7 @@ def test_fixed_kernel_benchmark_propagates_errors(backend, jit_kernel, monkeypat
 @pytest.mark.parametrize("export", [False, True])
 def test_callable_benchmark_uses_quality_retries(backend, monkeypatch, capsys, tmp_path, reports, export):
     policy, testing = backend.policy, backend.testing
-    for name, value in dict(ACTIVE=8, WARMUP=2, MEASURE_BUDGET_MS=0, MAX_RETRIES=1,
+    for name, value in dict(ACTIVE=8, WARMUP=2, MEASURE_BUDGET_MS=0, MAX_RETRIES=1, STABILITY_RUNS=1,
                             REPORT_BEST_CONFIG=int(reports)).items():
         monkeypatch.setenv(policy.ENV_PREFIX + name, str(value))
     monkeypatch.setenv("TRITON_AUTOTUNE_REPORT_TIMING", str(int(reports)))
@@ -517,7 +517,7 @@ def test_batch_quality_status_survives_a_passing_winner(backend, monkeypatch, tm
         backend.quality, "evaluate_quality", lambda times, durations:
         ({}, ["unstable"] if durations[0] == 20 and (exhausted or len(calls) == 1) else []))
     options = replace(policy.resolve_options(), active=4, warmup=0, measure_budget_ms=None, filter_slow_configs=False,
-                      max_retries=1, log_level="off")
+                      max_retries=1, stability_runs=1, log_level="off")
     costs = policy.bench_npu(profile, [fast, slow], 0, 4, False, tmp_path, False, None, options=options,
                              report_sink=retained.extend)
     assert costs == [.01, .02] and calls == [[fast, slow], [slow]]
@@ -525,3 +525,182 @@ def test_batch_quality_status_survives_a_passing_winner(backend, monkeypatch, tm
     assert all(record.all_configs_passed == (not exhausted) for record in retained)
     # A later pass does not replace the earlier equally fast rejected attempt.
     assert retained[1].quality_failures == ("unstable", )
+
+
+@pytest.fixture
+def stability_benchmark(backend, monkeypatch, tmp_path):
+
+    def run(series, *, scores=None, quality_failures=(), acquisition_failures=(), **settings):
+        policy = backend.policy
+        funcs = [lambda: None for _ in series]
+        positions, batches, retained = [0] * len(funcs), [], []
+
+        def profile(selected, warmup, active, *args, **kwargs):
+            indices = [funcs.index(fn) for fn in selected]
+            batches.append(indices)
+            if len(batches) in acquisition_failures:
+                raise OSError("missing CSV")
+            records = []
+            for index in indices:
+                position = positions[index]
+                positions[index] += 1
+                mean = series[index][position]
+                score = mean if scores is None else scores[index][position]
+                records.append(
+                    policy.NpuMeasurementReport(
+                        {}, active, warmup, active, "hot", mean, score,
+                        samples=(np.array([index, position]),
+                                 np.full(active, mean)) if kwargs.get("_return_samples") else None))
+            return records
+
+        monkeypatch.setattr(
+            backend.quality, "evaluate_quality", lambda times, durations, **kwargs:
+            ({"intrinsic": 0.}, ["intrinsic failure"] if tuple(times) in quality_failures else []))
+        options = replace(
+            policy.resolve_options(),
+            **dict(dict(active=2, warmup=0, measure_budget_ms=None, filter_slow_configs=False, log_level="off"),
+                   **settings))
+        costs = policy.bench_npu(profile, funcs, 0, 2, False, tmp_path, False, "same", options=options,
+                                 report_sink=retained.extend)
+        assert all(record.samples is None for record in retained)
+        return costs, retained, batches
+
+    return run
+
+
+def test_stability_compares_each_candidate_and_retries_only_pending(stability_benchmark):
+    costs, records, batches = stability_benchmark([[10., 10.3], [100., 110., 111.], [1000., 1001., 1002.]],
+                                                  quality_failures={(2, 1)})
+    assert batches == [[0, 1, 2], [0, 1, 2], [1, 2]]
+    assert costs == [10., 100., 1000.]
+    assert [bool(record.quality_failures) for record in records] == [False, True, False]
+    assert records[0].quality_metrics["stability_relative_spread"] == pytest.approx(.03)
+    assert all(record.all_configs_passed for record in records)
+
+
+@pytest.mark.parametrize("runs", [2, 3])
+def test_stability_requires_n_measurements_without_extra_retries(stability_benchmark, runs):
+    cost, records, batches = stability_benchmark([[10.] * runs], stability_runs=runs, max_retries=0)
+    assert cost == 10. and batches == [[0]] * runs
+    assert not records[0].quality_failures and records[0].attempt == 1
+
+
+def test_stability_slides_the_full_window_and_keeps_an_unconfirmed_minimum(stability_benchmark, capsys):
+    cost, records, batches = stability_benchmark([[10., 11., 11.1, 11.2]], stability_runs=3, max_retries=1)
+    assert cost == 10. and batches == [[0]] * 4
+    assert records[0].quality_failures == ("stability not confirmed", )
+    assert records[0].all_configs_passed
+    text = capsys.readouterr().out
+    assert "selected attempt quality: failed" in text
+    assert "Not all configurations" not in text
+
+
+def test_stability_confirmation_does_not_clear_the_selected_attempt_quality_failure(stability_benchmark):
+    cost, records, _ = stability_benchmark([[10., 10.1]], quality_failures={(0, 0)})
+    assert cost == 10. and records[0].quality_failures == ("intrinsic failure", )
+    assert records[0].all_configs_passed
+
+
+def test_stability_keeps_confirmation_after_the_selected_attempt_leaves_the_window(stability_benchmark):
+    cost, records, batches = stability_benchmark([[10., 10.1, 11., 11.1]], quality_failures={(0, 1)})
+    assert cost == 10. and batches == [[0]] * 4
+    assert not records[0].quality_failures and records[0].all_configs_passed
+
+
+def test_stability_selects_by_score_but_compares_untrimmed_means(stability_benchmark):
+    cost, records, batches = stability_benchmark([[10., 11., 11.1]], scores=[[9., 8., 7.]])
+    assert cost == 7. and batches == [[0]] * 3
+    assert records[0].attempt == 3 and not records[0].quality_failures
+
+
+def test_stability_acquisition_failure_does_not_confirm_an_old_minimum(stability_benchmark):
+    cost, records, batches = stability_benchmark([[10., 11., 11.1]], acquisition_failures={2}, max_retries=2)
+    assert cost == 10. and batches == [[0]] * 4
+    assert records[0].quality_failures == ("stability not confirmed", )
+    assert records[0].all_configs_passed
+
+
+def test_stability_acquisition_failure_before_the_selected_attempt(stability_benchmark):
+    cost, records, batches = stability_benchmark([[10., 10.1]], acquisition_failures={1}, max_retries=1)
+    assert cost == 10. and batches == [[0]] * 3
+    assert records[0].attempt == 2 and not records[0].quality_failures
+
+
+def test_stability_reads_one_shared_csv_per_attempt(backend, monkeypatch, tmp_path, write_profile):
+    policy = backend.policy
+    reads, batches, retained = [], [], []
+    read_csv = pd.read_csv
+
+    def read(*args, **kwargs):
+        reads.append(args[0])
+        return read_csv(*args, **kwargs)
+
+    def profile(funcs, warmup, active, cold, directory, keep, names, **kwargs):
+        batches.append(len(funcs))
+        write_profile(directory, [("same", 10.), ("same", 100.)], warmup, active)
+        return policy._collect_prof_result(directory, funcs, warmup, active, names,
+                                           _return_samples=kwargs["_return_samples"],
+                                           _capture_report=kwargs["_capture_report"], _quantiles=kwargs["_quantiles"])
+
+    monkeypatch.setattr(pd, "read_csv", read)
+    options = replace(policy.resolve_options(), active=8, warmup=1, measure_budget_ms=None, filter_slow_configs=False,
+                      max_retries=0, log_level="off")
+    costs = policy.bench_npu(profile, [lambda: None, lambda: None], 1, 8, False, tmp_path, False, "same",
+                             options=options, report_sink=retained.extend)
+    assert costs == [.01, .1] and batches == [2, 2] and len(reads) == 2
+    assert all(not record.quality_failures and record.all_configs_passed for record in retained)
+
+
+def test_stability_exhaustion_reports_pending_configs_and_winner_status(stability_benchmark, capsys):
+    costs, records, batches = stability_benchmark([[10., 10.1], [100., 110., 120.]], max_retries=1)
+    assert costs == [10., 100.] and batches == [[0, 1], [0, 1], [1]]
+    assert not records[0].quality_failures
+    assert not any(record.all_configs_passed for record in records)
+    text = capsys.readouterr().out
+    assert "Not all configurations passed quality checks" in text
+    assert "benchmark candidate #1" in text and "selected attempt quality: pass" in text
+
+
+@pytest.mark.parametrize("settings", [{"stability_runs": 1}, {"quality_check": False}])
+def test_stability_can_preserve_single_attempt_behavior(stability_benchmark, settings):
+    cost, records, batches = stability_benchmark([[10.]], max_retries=0, **settings)
+    assert cost == 10. and batches == [[0]]
+    assert not records[0].quality_failures
+    assert "stability_relative_spread" not in records[0].quality_metrics
+
+
+def test_stability_single_run_keeps_the_old_quality_retry_and_minimum(stability_benchmark, capsys):
+    cost, records, batches = stability_benchmark([[10., 11.]], stability_runs=1, max_retries=1,
+                                                 quality_failures={(0, 0)})
+    assert cost == 10. and batches == [[0], [0]]
+    assert records[0].quality_failures == ("intrinsic failure", )
+    assert records[0].all_configs_passed and capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("tolerance,attempts", [(0., 3), (.03, 3), (.05, 2)])
+def test_stability_tolerance_controls_confirmation(stability_benchmark, tolerance, attempts):
+    cost, records, batches = stability_benchmark([[10., 10.5, 10.5]], stability_tolerance=tolerance)
+    assert cost == 10. and len(batches) == attempts
+    assert records[0].all_configs_passed
+
+
+def test_stability_environment_defaults_and_cache_keys(backend, monkeypatch):
+    policy = backend.policy
+    options = policy.resolve_options()
+    assert (options.stability_runs, options.stability_tolerance) == (2, .03)
+    assert options.cache_key() != replace(options, stability_tolerance=.04).cache_key()
+    monkeypatch.setenv("TRITON_NPU_BENCH_STABILITY_RUNS", "1")
+    monkeypatch.setenv("TRITON_NPU_BENCH_STABILITY_TOLERANCE", "0.05")
+    single = policy.resolve_options()
+    assert (single.stability_runs, single.stability_tolerance) == (1, .05)
+    assert single.cache_key() == replace(single, stability_tolerance=.5).cache_key()
+    disabled = replace(options, quality_check=False)
+    assert disabled.cache_key() == replace(disabled, stability_runs=5, stability_tolerance=.5).cache_key()
+
+
+@pytest.mark.parametrize("name,value", [("RUNS", "0"), ("RUNS", "2.5"), ("TOLERANCE", "-0.01"), ("TOLERANCE", "nan"),
+                                        ("TOLERANCE", "inf")])
+def test_stability_rejects_invalid_environment(backend, monkeypatch, name, value):
+    monkeypatch.setenv("TRITON_NPU_BENCH_STABILITY_" + name, value)
+    with pytest.raises(ValueError, match="STABILITY_" + name):
+        backend.policy.resolve_options()
