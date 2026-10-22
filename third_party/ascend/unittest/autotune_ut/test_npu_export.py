@@ -569,11 +569,11 @@ def stability_benchmark(backend, monkeypatch, tmp_path):
 
 
 def test_stability_compares_each_candidate_and_retries_only_pending(stability_benchmark):
-    costs, records, batches = stability_benchmark([[10., 10.3], [100., 110., 111.], [1000., 1001., 1002.]],
+    costs, records, batches = stability_benchmark([[10., 10.3], [100., 110., 100.5], [1000., 1001.]],
                                                   quality_failures={(2, 1)})
-    assert batches == [[0, 1, 2], [0, 1, 2], [1, 2]]
+    assert batches == [[0, 1, 2], [0, 1, 2], [1]]
     assert costs == [10., 100., 1000.]
-    assert [bool(record.quality_failures) for record in records] == [False, True, False]
+    assert not any(record.quality_failures for record in records)
     assert records[0].quality_metrics["stability_relative_spread"] == pytest.approx(.03)
     assert all(record.all_configs_passed for record in records)
 
@@ -585,26 +585,64 @@ def test_stability_requires_n_measurements_without_extra_retries(stability_bench
     assert not records[0].quality_failures and records[0].attempt == 1
 
 
-def test_stability_slides_the_full_window_and_keeps_an_unconfirmed_minimum(stability_benchmark, capsys):
+def test_stability_later_windows_cannot_confirm_a_different_minimum(stability_benchmark, capsys):
     cost, records, batches = stability_benchmark([[10., 11., 11.1, 11.2]], stability_runs=3, max_retries=1)
     assert cost == 10. and batches == [[0]] * 4
     assert records[0].quality_failures == ("stability not confirmed", )
-    assert records[0].all_configs_passed
+    assert not records[0].all_configs_passed
     text = capsys.readouterr().out
     assert "selected attempt quality: failed" in text
-    assert "Not all configurations" not in text
+    assert "Not all configurations" in text
 
 
-def test_stability_confirmation_does_not_clear_the_selected_attempt_quality_failure(stability_benchmark):
+def test_stability_returns_a_clean_equivalent_when_the_minimum_failed_quality(stability_benchmark):
     cost, records, _ = stability_benchmark([[10., 10.1]], quality_failures={(0, 0)})
-    assert cost == 10. and records[0].quality_failures == ("intrinsic failure", )
+    assert cost == 10.1 and not records[0].quality_failures
+    assert records[0].attempt == 2
     assert records[0].all_configs_passed
 
 
-def test_stability_keeps_confirmation_after_the_selected_attempt_leaves_the_window(stability_benchmark):
-    cost, records, batches = stability_benchmark([[10., 10.1, 11., 11.1]], quality_failures={(0, 1)})
-    assert cost == 10. and batches == [[0]] * 4
+def test_stability_a_failed_nonminimum_does_not_block_a_confirmed_minimum(stability_benchmark):
+    cost, records, batches = stability_benchmark([[10., 10.1]], quality_failures={(0, 1)})
+    assert cost == 10. and batches == [[0]] * 2
     assert not records[0].quality_failures and records[0].all_configs_passed
+
+
+def test_stability_can_confirm_the_minimum_after_unstable_intermediate_attempts(stability_benchmark):
+    cost, records, batches = stability_benchmark([[10., 11., 10.1, 10.2]], stability_runs=3, quality_failures={(0, 1),
+                                                                                                               (0, 3)})
+    assert cost == 10. and batches == [[0]] * 4
+    assert records[0].attempt == 1 and not records[0].quality_failures
+    assert records[0].quality_metrics["stability_relative_spread"] == pytest.approx(.02)
+
+
+def test_stability_can_return_an_earlier_clean_member_of_a_mixed_group(stability_benchmark):
+    cost, records, batches = stability_benchmark([[10., 10.1, 10.2]], stability_runs=3, quality_failures={(0, 0),
+                                                                                                          (0, 2)})
+    assert cost == 10.1 and batches == [[0]] * 3
+    assert records[0].attempt == 2 and not records[0].quality_failures
+
+
+def test_stability_a_new_failed_minimum_can_be_confirmed_by_an_older_clean_attempt(stability_benchmark):
+    cost, records, batches = stability_benchmark([[10., 9.9]], quality_failures={(0, 1)})
+    assert cost == 10. and batches == [[0]] * 2
+    assert records[0].attempt == 1 and not records[0].quality_failures
+
+
+def test_stability_exhaustion_returns_the_absolute_minimum_even_if_all_attempts_failed(stability_benchmark):
+    cost, records, batches = stability_benchmark([[10., 10.1, 10.2]], max_retries=1, quality_failures={(0, 0), (0, 1),
+                                                                                                       (0, 2)})
+    assert cost == 10. and batches == [[0]] * 3
+    assert records[0].attempt == 1 and "intrinsic failure" in records[0].quality_failures
+    assert not records[0].all_configs_passed
+
+
+def test_stability_a_clean_attempt_outside_the_group_cannot_confirm_the_minimum(stability_benchmark):
+    cost, records, batches = stability_benchmark([[10., 10.1, 11., 10.2, 10.1]], stability_runs=3, max_retries=2,
+                                                 quality_failures={(0, 0), (0, 2), (0, 3), (0, 4)})
+    assert cost == 10. and batches == [[0]] * 5
+    assert records[0].attempt == 1 and not records[0].all_configs_passed
+    assert "stability not confirmed" in records[0].quality_failures
 
 
 def test_stability_selects_by_score_but_compares_untrimmed_means(stability_benchmark):
@@ -617,7 +655,7 @@ def test_stability_acquisition_failure_does_not_confirm_an_old_minimum(stability
     cost, records, batches = stability_benchmark([[10., 11., 11.1]], acquisition_failures={2}, max_retries=2)
     assert cost == 10. and batches == [[0]] * 4
     assert records[0].quality_failures == ("stability not confirmed", )
-    assert records[0].all_configs_passed
+    assert not records[0].all_configs_passed
 
 
 def test_stability_acquisition_failure_before_the_selected_attempt(stability_benchmark):
@@ -679,7 +717,7 @@ def test_stability_single_run_keeps_the_old_quality_retry_and_minimum(stability_
 
 @pytest.mark.parametrize("tolerance,attempts", [(0., 3), (.03, 3), (.05, 2)])
 def test_stability_tolerance_controls_confirmation(stability_benchmark, tolerance, attempts):
-    cost, records, batches = stability_benchmark([[10., 10.5, 10.5]], stability_tolerance=tolerance)
+    cost, records, batches = stability_benchmark([[10., 10.5, 10.]], stability_tolerance=tolerance)
     assert cost == 10. and len(batches) == attempts
     assert records[0].all_configs_passed
 

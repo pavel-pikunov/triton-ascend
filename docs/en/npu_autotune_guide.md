@@ -42,7 +42,7 @@ export TRITON_PRINT_AUTOTUNING=0
 | `TRITON_NPU_BENCH_QUALITY_CHECK` | `1`; evaluate the predefined sample-quality metrics. |
 | `TRITON_NPU_BENCH_QUALITY_CHECK_ALL` | `0`; stop after the first failed check. `1` computes all quality metrics for diagnostics, including rejected attempts. Does not change retry decisions or the selection-cache key. |
 | `TRITON_NPU_BENCH_MAX_RETRIES` | `5`; additional attempts beyond `STABILITY_RUNS` when quality is enabled, otherwise beyond one attempt. Failed acquisition also consumes an attempt. |
-| `TRITON_NPU_BENCH_STABILITY_RUNS` | `2`; compare the last N complete measurement means of each candidate. Integer >= 1; `1` restores the previous quality/retry behavior. Inactive with `QUALITY_CHECK=0`. |
+| `TRITON_NPU_BENCH_STABILITY_RUNS` | `2`; compare each candidate's retained minimum with its latest N-1 other measurement means. Integer >= 1; `1` restores the previous quality/retry behavior. Inactive with `QUALITY_CHECK=0`. |
 | `TRITON_NPU_BENCH_STABILITY_TOLERANCE` | `0.03`; require `max(means) / min(means) <= 1 + tolerance`. Finite and >= 0; `0.03` permits a 3% spread between extremes. Inactive with N=1 or quality disabled. |
 | `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | `10`; estimated accumulated device-time budget per candidate, in milliseconds. `0` disables it; other values must be finite and positive. |
 | `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; measured launches per short event estimate, used by filtering and budget calibration; integer >= 2. |
@@ -132,25 +132,28 @@ Kernel execution and synchronization failures propagate without retries.
 
 With quality enabled, each candidate receives at least `STABILITY_RUNS` attempts,
 subject to acquisition failures, followed by at most `MAX_RETRIES` additional
-attempts. Each successful acquisition adds its untrimmed arithmetic mean to that
-candidate's sliding window, including attempts that fail another quality check.
-Compare A1 with A2, B1 with B2, and so on; means of different candidates are never
-compared by this check. A candidate finishes when the current sample-quality
-checks pass and its full window satisfies the stability tolerance. Only unfinished
-candidates continue. N=1 disables the window check. No extra compilation,
-filtering or calibration is performed; windows retain only means and attempt
-numbers, not raw samples or additional reports.
+attempts. Each candidate retains its minimum score regardless of quality. Compare
+the untrimmed mean of that attempt with the latest N-1 other measurement means,
+including attempts that fail another quality check. Every comparison group must
+include the retained minimum. For example, 10, 11, 11.1 does
+not confirm the minimum 10 at N=2; a subsequent 10.1 can confirm it. Means of
+different candidates are never compared by this check.
 
-Each candidate retains its minimum measured score regardless of quality. A faster
-failed-quality attempt remains eligible after a slower successful attempt. With
-N > 1, the retained attempt is trusted only if its own sample-quality checks passed
-and it belonged to at least one window that passed stability. A later stable
-window without that attempt cannot confirm it. Confirmation is retained after
-the attempt leaves the window. Thus all candidates can finish while the selected
-minimum remains untrusted. `quality_failures` records either kind of failure;
-`all_configs_passed` separately reports whether any candidates remain pending.
-If the retry limit is exhausted with pending quality checks, or the new stability
-mode retains an untrusted winner, one yellow message reports
+When the full group meets the tolerance, return the minimum attempt if its own
+sample-quality checks passed. Otherwise return the latest quality-passing attempt
+within that group: their times are equivalent within the requested tolerance.
+Other group members may fail sample quality without blocking this clean result.
+If no clean member exists, continue measuring. Only unfinished candidates retry.
+At exhaustion, an unfinished candidate returns its absolute minimum with
+`stability not confirmed`, even if later attempts passed sample quality. Thus
+neither a later slow stable group nor an unrelated clean attempt ends confirmation.
+
+N=1 retains the previous minimum-selection and quality-retry behavior. No extra
+compilation, filtering or calibration is performed. Store only the minimum and
+latest clean reports plus bounded mean/attempt histories, not N raw sample arrays.
+`quality_failures` describes the returned attempt; `all_configs_passed` separately
+reports whether any candidates remain pending. At exhaustion with unfinished
+candidates, a yellow message reports
 the selected configuration number, lowest retained score and selected-attempt
 pass/failed status independently of the logging
 level. ANSI coloring is unconditional, including redirected output. The message
