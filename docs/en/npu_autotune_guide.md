@@ -133,24 +133,29 @@ Kernel execution and synchronization failures propagate without retries.
 With quality enabled, each candidate receives at least `STABILITY_RUNS` attempts,
 subject to acquisition failures, followed by at most `MAX_RETRIES` additional
 attempts. Each candidate retains its minimum score regardless of quality. Compare
-the untrimmed mean of that attempt with the latest N-1 other measurement means,
-including attempts that fail another quality check. Every comparison group must
-include the retained minimum. For example, 10, 11, 11.1 does
-not confirm the minimum 10 at N=2; a subsequent 10.1 can confirm it. Means of
-different candidates are never compared by this check.
+the untrimmed mean of that attempt with N-1 other attempts that passed their own
+sample-quality checks, searching the entire history of this candidate. Every
+comparison group includes the retained minimum, and its maximum/minimum mean
+ratio must not exceed `1 + STABILITY_TOLERANCE`. For example, 10, 11, 11.1 does
+not confirm the minimum 10 at N=2; a subsequent quality-passing 10.1 can confirm
+it. Means of different candidates are never compared by this check.
 
 When the full group meets the tolerance, return the minimum attempt if its own
-sample-quality checks passed. Otherwise return the latest quality-passing attempt
-within that group: their times are equivalent within the requested tolerance.
-Other group members may fail sample quality without blocking this clean result.
-If no clean member exists, continue measuring. Only unfinished candidates retry.
+sample-quality checks passed. Otherwise return the lowest-score quality-passing
+attempt from a matching group: their times are equivalent within the requested
+tolerance. Failed attempts cannot corroborate another minimum. For example,
+10 (failed), 9.9 (passed) requires another quality-passing measurement near 9.9;
+the old failed 10 cannot confirm it. Older passing attempts can confirm a new
+minimum immediately. Only unfinished candidates retry.
 At exhaustion, an unfinished candidate returns its absolute minimum with
 `stability not confirmed`, even if later attempts passed sample quality. Thus
 neither a later slow stable group nor an unrelated clean attempt ends confirmation.
 
 N=1 retains the previous minimum-selection and quality-retry behavior. No extra
-compilation, filtering or calibration is performed. Store only the minimum and
-latest clean reports plus bounded mean/attempt histories, not N raw sample arrays.
+compilation, filtering or calibration is performed. Keep the minimum report and
+sample-free quality-passing reports, bounded by N + MAX_RETRIES attempts. The
+compatibility helper retains aggregated CSV results for passing history and raw
+rows only for the minimum, rather than retaining every attempt's sample arrays.
 `quality_failures` describes the returned attempt; `all_configs_passed` separately
 reports whether any candidates remain pending. At exhaustion with unfinished
 candidates, a yellow message reports

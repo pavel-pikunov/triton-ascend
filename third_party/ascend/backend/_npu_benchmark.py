@@ -11,7 +11,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import deque
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
@@ -108,7 +107,7 @@ class NpuBenchmarkOptions:
         if self.quality_check:
             from ._benchmark_quality import THRESHOLDS
             thresholds = tuple(sorted(THRESHOLDS.items()))
-        return ("npu-benchmark", 10, self.effective_policy(), thresholds)
+        return ("npu-benchmark", 11, self.effective_policy(), thresholds)
 
 
 def resolve_options():
@@ -665,8 +664,7 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
             evaluate_quality = partial(evaluate_quality, check_all=True)
     best_reports = [None] * len(funcs)
     stability_runs = options.stability_runs if options.quality_check else 1
-    windows = {index: deque(maxlen=stability_runs) for index in indices} if stability_runs > 1 else {}
-    passed_reports = {}
+    histories = {index: [] for index in indices} if stability_runs > 1 else {}
     unconfirmed = "stability not confirmed"
     root = Path(prof_dir) if prof_dir is not None else Path(
         runtime.cache.get_home_dir()) / ".triton" / "profile_results"
@@ -709,30 +707,36 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
                 if measurement.score_ms < getattr(best_reports[index], "score_ms", float("inf")):
                     best_reports[index] = record
                 retry = bool(failures)
-                if windows:
+                if histories:
                     with timing_stage(timings, "quality"):
+                        history = histories[index]
                         if not failures:
-                            passed_reports[index] = record
+                            history.append(record)
                         best = best_reports[index] or record
-                        window = windows[index]
-                        window.append((record.attempt, record.mean_ms))
-                        others = [(number, mean)
-                                  for number, mean in window
-                                  if number != best.attempt][-(stability_runs - 1):]
-                        means = [best.mean_ms] + [mean for _, mean in others]
-                        ratio = (max(means) / min(means) if len(means) == stability_runs
-                                 and all(math.isfinite(mean) and mean > 0 for mean in means) else float("inf"))
-                        metrics["stability_relative_spread"] = ratio - 1
-                        clean = best if not best.quality_failures else passed_reports.get(index)
-                        retry = not (ratio <= 1 + options.stability_tolerance and clean is not None and
-                                     (clean is best or clean.attempt >= others[0][0]))
-                        if not retry:
-                            best_reports[index] = replace(
-                                clean,
-                                quality_metrics={**clean.quality_metrics, "stability_relative_spread": ratio - 1})
-                            passed_reports.pop(index, None)
-                        else:
+                        others = sorted((item for item in history if item is not best), key=lambda item: item.mean_ms)
+                        confirmed, spread = None, float("inf")
+                        # Every group includes the minimum; only quality-passing history can confirm it.
+                        for start in range(len(others) - stability_runs + 2):
+                            group = [best, *others[start:start + stability_runs - 1]]
+                            means = [item.mean_ms for item in group]
+                            ratio = (max(means) / min(means) if all(math.isfinite(mean) and mean > 0
+                                                                    for mean in means) else float("inf"))
+                            spread = min(spread, ratio - 1)
+                            if ratio <= 1 + options.stability_tolerance:
+                                clean = min((item for item in group if not item.quality_failures), key=lambda item:
+                                            (item.score_ms, item.attempt))
+                                if confirmed is None or clean.score_ms < confirmed.score_ms:
+                                    confirmed = replace(
+                                        clean, quality_metrics={
+                                            **clean.quality_metrics, "stability_relative_spread": ratio - 1
+                                        })
+                        metrics["stability_relative_spread"] = spread
+                        retry = confirmed is None
+                        if retry:
                             failures = [*failures, unconfirmed]
+                        else:
+                            best_reports[index] = confirmed
+                            histories.pop(index)
                 log_stage(
                     options.log_level, "Config measurement", f"config={index}, attempt={attempt + 1}, "
                     f"active={options.active}, score_ms={measurement.score_ms:.8g}, mean_ms={measurement.mean_ms:.8g}, "
@@ -744,7 +748,7 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
                 f"{len(selected)} candidates passed; retry candidates={len(pending)}")
             if not pending:
                 break
-    if windows:
+    if histories:
         for index in pending:
             if best_reports[index] is not None:
                 best_reports[index] = replace(best_reports[index],
