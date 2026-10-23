@@ -109,7 +109,7 @@ class NpuBenchmarkOptions:
         if self.quality_check and not self.stability_only:
             from ._benchmark_quality import THRESHOLDS
             thresholds = tuple(sorted(THRESHOLDS.items()))
-        return ("npu-benchmark", 12, self.effective_policy(), thresholds)
+        return ("npu-benchmark", 13, self.effective_policy(), thresholds)
 
 
 def resolve_options():
@@ -637,7 +637,7 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
         f"quantiles=({options.lower_quantile}, {options.upper_quantile})", detailed=True)
     if not (options.quality_check or options.max_retries or options.measure_budget_ms is not None
             or options.filter_slow_configs):
-        log_stage(options.log_level, "Profiler measurement", f"Attempt 1: {len(funcs)} candidates")
+        log_stage(options.log_level, "Profiler measurement", f"Batch 1: {len(funcs)} candidates, 1 series each")
         with timing_stage(timings, "measurements"):
             measurements = profile(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name,
                                    _pre_hook_scope=pre_hook_scope, _capture_report=report_sink is not None)
@@ -694,32 +694,43 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
     pending = indices
     last_acquisition_error = None
     with timing_stage(timings, "measurements"):
-        for attempt in range(stability_runs + options.max_retries):
+        for batch in range(max(1, options.max_retries)):
             selected = pending
-            log_stage(options.log_level, "Profiler measurement", f"Attempt {attempt + 1}: {len(selected)} candidates")
+            sequence = selected * stability_runs
+            log_stage(options.log_level, "Profiler measurement", f"Batch {batch + 1}: {len(selected)} candidates, "
+                      f"{stability_runs} series each")
             log_stage(options.log_level, "Measurement settings", f"configs={selected}, warmup={options.warmup}, "
                       f"active={options.active}", detailed=True)
             try:
-                measurements = collect(selected)
+                measurements = collect(sequence)
             except ProfilerAcquisitionError as exc:
                 last_acquisition_error = exc
                 log_stage(options.log_level, "Profiler acquisition failed", str(exc), detailed=True)
                 continue
             pending = []
-            for index, measurement in zip(selected, measurements):
+            for position, (index, measurement) in enumerate(zip(sequence, measurements)):
+                attempt = batch * stability_runs + position // len(selected) + 1
                 with timing_stage(timings, "quality"):
                     metrics, failures = evaluate_quality(*measurement.samples) if options.quality_check else ({}, [])
-                record = replace(measurement, samples=None, attempt=attempt + 1, quality_failures=tuple(failures),
+                record = replace(measurement, samples=None, attempt=attempt, quality_failures=tuple(failures),
                                  quality_checked=options.quality_check, quality_metrics=metrics)
                 if measurement.score_ms < getattr(best_reports[index], "score_ms", float("inf")):
                     best_reports[index] = record
-                retry = bool(failures)
                 if histories:
+                    if not failures:
+                        histories[index].append(record)
+                elif failures:
+                    pending.append(index)
+                log_stage(
+                    options.log_level, "Config measurement", f"config={index}, batch={batch + 1}, attempt={attempt}, "
+                    f"active={options.active}, score_ms={measurement.score_ms:.8g}, mean_ms={measurement.mean_ms:.8g}, "
+                    f"metrics={metrics}, failures={failures}", detailed=True)
+            measurements.clear()
+            if histories:
+                for index in selected:
                     with timing_stage(timings, "quality"):
+                        best = best_reports[index]
                         history = histories[index]
-                        if not failures:
-                            history.append(record)
-                        best = best_reports[index] or record
                         others = sorted((item for item in history if item is not best), key=lambda item: item.mean_ms)
                         confirmed, spread = None, float("inf")
                         # Every group includes the minimum; only quality-passing history can confirm it.
@@ -737,19 +748,17 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
                                         clean, quality_metrics={
                                             **clean.quality_metrics, "stability_relative_spread": ratio - 1
                                         })
-                        metrics["stability_relative_spread"] = spread
+                        best.quality_metrics["stability_relative_spread"] = spread
                         retry = confirmed is None
                         if retry:
-                            failures = [*failures, unconfirmed]
+                            pending.append(index)
                         else:
                             best_reports[index] = confirmed
                             histories.pop(index)
-                log_stage(
-                    options.log_level, "Config measurement", f"config={index}, attempt={attempt + 1}, "
-                    f"active={options.active}, score_ms={measurement.score_ms:.8g}, mean_ms={measurement.mean_ms:.8g}, "
-                    f"metrics={metrics}, failures={failures}, candidate_passed={not retry}", detailed=True)
-                if retry:
-                    pending.append(index)
+                    log_stage(
+                        options.log_level, "Minimum confirmation", f"config={index}, "
+                        f"score_ms={best.score_ms:.8g}, mean_ms={best.mean_ms:.8g}, "
+                        f"stability_relative_spread={spread:.8g}, candidate_passed={not retry}", detailed=True)
             log_stage(
                 options.log_level, "Quality/acquisition result", f"{len(selected) - len(pending)}/"
                 f"{len(selected)} candidates passed; retry candidates={len(pending)}")

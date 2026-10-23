@@ -40,9 +40,12 @@ TRITON_NPU_BENCH_PROFILER_MODE=full python your_existing_case.py
 ```
 
 Both modes use the same candidate order, launch counts, cache policy, scores and
-five quality checks. The mode participates in the selection-cache key. Each
-attempt remains one profiler session, completed as one recording step for the
-entire batch. No step is added per kernel launch. Failures follow the existing
+enabled quality checks. The mode participates in the selection-cache key. Each
+batch uses one profiler session for N complete passes over its candidates, where
+N is `STABILITY_RUNS` with quality enabled, otherwise one. It is completed as one
+recording step; no step is added per kernel launch. `MAX_RETRIES` now limits the
+total number of batches, including the first (`0` still allows one initial batch).
+Confirmation uses each candidate's history across all batches. Failures follow the existing
 acquisition-retry policy; a failed summary export does not silently switch modes.
 
 The final timing block splits `Measurements` into launch/synchronization time,
