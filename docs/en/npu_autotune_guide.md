@@ -39,10 +39,11 @@ export TRITON_PRINT_AUTOTUNING=0
 | `TRITON_NPU_BENCH_ACTIVE` | `250`; minimum measured launches per candidate; integer >= 1, or >= 2 with quality checks. |
 | `TRITON_NPU_BENCH_LOWER_QUANTILE` | `0.25`; lower quantile boundary of the measured durations averaged for selection. |
 | `TRITON_NPU_BENCH_UPPER_QUANTILE` | `0.75`; upper quantile boundary of the measured durations averaged for selection. |
-| `TRITON_NPU_BENCH_QUALITY_CHECK` | `1`; evaluate the predefined sample-quality metrics. |
+| `TRITON_NPU_BENCH_QUALITY_CHECK` | `1`; enable quality checks and minimum confirmation. |
 | `TRITON_NPU_BENCH_QUALITY_CHECK_ALL` | `0`; stop after the first failed check. `1` computes all quality metrics for diagnostics, including rejected attempts. Does not change retry decisions or the selection-cache key. |
+| `TRITON_NPU_BENCH_STABILITY_ONLY` | `0`; `1` skips all five sample-quality metrics and retains only minimum confirmation. Requires `STABILITY_RUNS >= 2` when quality is enabled; inactive with `QUALITY_CHECK=0`. |
 | `TRITON_NPU_BENCH_MAX_RETRIES` | `5`; additional attempts beyond `STABILITY_RUNS` when quality is enabled, otherwise beyond one attempt. Failed acquisition also consumes an attempt. |
-| `TRITON_NPU_BENCH_STABILITY_RUNS` | `2`; compare each candidate's retained minimum with its latest N-1 other measurement means. Integer >= 1; `1` restores the previous quality/retry behavior. Inactive with `QUALITY_CHECK=0`. |
+| `TRITON_NPU_BENCH_STABILITY_RUNS` | `2`; confirm each candidate's retained minimum with N-1 other quality-passing measurement means from its complete history. Integer >= 1; `1` restores the previous quality/retry behavior. Inactive with `QUALITY_CHECK=0`. |
 | `TRITON_NPU_BENCH_STABILITY_TOLERANCE` | `0.03`; require `max(means) / min(means) <= 1 + tolerance`. Finite and >= 0; `0.03` permits a 3% spread between extremes. Inactive with N=1 or quality disabled. |
 | `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | `10`; estimated accumulated device-time budget per candidate, in milliseconds. `0` disables it; other values must be finite and positive. |
 | `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; measured launches per short event estimate, used by filtering and budget calibration; integer >= 2. |
@@ -173,6 +174,34 @@ Effective measurement policies participate in the selection-cache key. Logging
 and reports do not. `CALIBRATION_RUNS` is inactive unless a budget or filtering is
 enabled; other filtering settings are inactive when filtering is disabled. A recheck
 delay is inactive with one filtering round. No additional warnings are emitted for inactive settings.
+
+## Minimum confirmation without sample-quality metrics
+
+The comparison branch supports a minimal experiment with fixed launch counts,
+no event calibration or slow filtering, and only confirmation of each candidate's
+minimum. For three agreeing attempts, a 3% tolerance and 30 measured launches:
+
+```bash
+export TRITON_BENCH_METHOD=npu
+export TRITON_NPU_BENCH_ACTIVE=30
+export TRITON_NPU_BENCH_WARMUP=3
+export TRITON_NPU_BENCH_MEASURE_BUDGET_MS=0
+export TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS=0
+export TRITON_NPU_BENCH_QUALITY_CHECK=1
+export TRITON_NPU_BENCH_STABILITY_ONLY=1
+export TRITON_NPU_BENCH_STABILITY_RUNS=3
+export TRITON_NPU_BENCH_STABILITY_TOLERANCE=0.03
+export TRITON_NPU_BENCH_MAX_RETRIES=5
+```
+
+`QUALITY_CHECK=1` keeps confirmation enabled. In stability-only mode, the five
+sample metrics are not calculated and all usable attempts can corroborate the
+minimum. Invalid profiler data and execution errors retain their existing handling.
+Only unfinished candidates retry, with at most N + MAX_RETRIES attempts per
+candidate. Unconfirmed minima retain the existing failure status at exhaustion.
+The compatibility utils inherit this mode through the shared benchmark path.
+The score's quantile boundaries and the selected cache mode remain unchanged.
+Set `STABILITY_ONLY=0` to restore the five statistical checks.
 
 ## Console diagnostics
 

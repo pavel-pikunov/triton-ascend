@@ -271,8 +271,10 @@ def _theil_sen(t, y):
                                   median=True)
 
 
-def evaluate_quality(times, durations, *, check_all=False):
+def evaluate_quality(times, durations, *, check_all=False, stability_only=False):
     """Return retry metrics; check_all also evaluates checks after the first failure."""
+    if stability_only:
+        return {}, []
     order = np.argsort(times, kind="stable")
     times, values = np.asarray(times)[order], np.asarray(durations)[order]
     n = len(values)

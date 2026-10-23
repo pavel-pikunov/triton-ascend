@@ -66,6 +66,7 @@ class NpuBenchmarkOptions:
     upper_quantile: float = 0.75
     quality_check: bool = True
     quality_check_all: bool = False
+    stability_only: bool = False
     max_retries: int = 5
     stability_runs: int = 2
     stability_tolerance: float = 0.03
@@ -85,6 +86,7 @@ class NpuBenchmarkOptions:
             "report_best_config": False,
             "report_timing": False,
             "quality_check_all": False,
+            "stability_only": self.quality_check,
             "stability_runs": self.quality_check,
             "stability_tolerance": self.quality_check and self.stability_runs > 1,
             "calibration_runs": self.measure_budget_ms is not None or self.filter_slow_configs,
@@ -104,10 +106,10 @@ class NpuBenchmarkOptions:
 
     def cache_key(self):
         thresholds = ()
-        if self.quality_check:
+        if self.quality_check and not self.stability_only:
             from ._benchmark_quality import THRESHOLDS
             thresholds = tuple(sorted(THRESHOLDS.items()))
-        return ("npu-benchmark", 11, self.effective_policy(), thresholds)
+        return ("npu-benchmark", 12, self.effective_policy(), thresholds)
 
 
 def resolve_options():
@@ -149,6 +151,8 @@ def resolve_options():
         raise ValueError("TRITON_NPU_BENCH quantiles must satisfy 0 <= LOWER_QUANTILE < UPPER_QUANTILE <= 1")
     if values["quality_check"] and values["active"] is not None and values["active"] < 2:
         raise ValueError("quality_check requires active >= 2")
+    if values["quality_check"] and values["stability_only"] and values["stability_runs"] < 2:
+        raise ValueError("STABILITY_ONLY requires STABILITY_RUNS >= 2")
     return NpuBenchmarkOptions(**values)
 
 
@@ -628,6 +632,7 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
         options.log_level, "Benchmark settings", f"cache={'cold' if clear_l2_cache else 'hot'}, "
         f"profiler_mode={options.profiler_mode}, warmup={warmup}, active={active}, quality_check={options.quality_check}, "
         f"quality_check_all={options.quality_check_all}, "
+        f"stability_only={options.stability_only}, "
         f"stability_runs={options.stability_runs}, stability_tolerance={options.stability_tolerance}, "
         f"quantiles=({options.lower_quantile}, {options.upper_quantile})", detailed=True)
     if not (options.quality_check or options.max_retries or options.measure_budget_ms is not None
@@ -660,6 +665,8 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
                           timings, config_numbers=None):
     if options.quality_check:
         from ._benchmark_quality import evaluate_quality
+        if options.stability_only:
+            evaluate_quality = partial(evaluate_quality, stability_only=True)
         if options.quality_check_all:
             evaluate_quality = partial(evaluate_quality, check_all=True)
     best_reports = [None] * len(funcs)
