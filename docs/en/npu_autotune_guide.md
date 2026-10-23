@@ -42,8 +42,8 @@ export TRITON_PRINT_AUTOTUNING=0
 | `TRITON_NPU_BENCH_QUALITY_CHECK` | `1`; enable quality checks and minimum confirmation. |
 | `TRITON_NPU_BENCH_QUALITY_CHECK_ALL` | `0`; stop after the first failed check. `1` computes all quality metrics for diagnostics, including rejected attempts. Does not change retry decisions or the selection-cache key. |
 | `TRITON_NPU_BENCH_STABILITY_ONLY` | `0`; `1` skips all five sample-quality metrics and retains only minimum confirmation. Requires `STABILITY_RUNS >= 2` when quality is enabled; inactive with `QUALITY_CHECK=0`. |
-| `TRITON_NPU_BENCH_MAX_RETRIES` | `5`; additional attempts beyond `STABILITY_RUNS` when quality is enabled, otherwise beyond one attempt. Failed acquisition also consumes an attempt. |
-| `TRITON_NPU_BENCH_STABILITY_RUNS` | `2`; confirm each candidate's retained minimum with N-1 other quality-passing measurement means from its complete history. Integer >= 1; `1` restores the previous quality/retry behavior. Inactive with `QUALITY_CHECK=0`. |
+| `TRITON_NPU_BENCH_MAX_RETRIES` | `5`; maximum profiler batches in total, including the first. `0` permits one initial batch. Failed acquisition also consumes a batch. |
+| `TRITON_NPU_BENCH_STABILITY_RUNS` | `2`; N series per batch and N results needed to confirm each candidate's minimum using its complete history. Integer >= 1; `1` disables cross-series confirmation. With `QUALITY_CHECK=0`, each batch has one series. |
 | `TRITON_NPU_BENCH_STABILITY_TOLERANCE` | `0.03`; require `max(means) / min(means) <= 1 + tolerance`. Finite and >= 0; `0.03` permits a 3% spread between extremes. Inactive with N=1 or quality disabled. |
 | `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | `10`; estimated accumulated device-time budget per candidate, in milliseconds. `0` disables it; other values must be finite and positive. |
 | `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; measured launches per short event estimate, used by filtering and budget calibration; integer >= 2. |
@@ -103,7 +103,9 @@ not a guarantee of accumulated kernel time or a wall-clock timeout.
 
 ## Profiler attempts and selection
 
-All current candidates share one profiler session and one active count per attempt.
+All current candidates share one profiler session and one active count per batch.
+With N=3, launch all candidates once, then repeat the same order twice:
+`A1 B1 C1, A2 B2 C2, A3 B3 C3`. Each series has its own warmup and active launches.
 The original pandas collector reads the common CSV
 once, filters target kernels and cache operations, and splits candidates by
 equal `warmup + active` blocks. Each candidate's warmup rows are excluded. Identical target
@@ -131,9 +133,10 @@ Only failing candidates receive quality retries. Failed acquisition of the share
 CSV retries the current batch. The shared count is retained across retries without recalibration.
 Kernel execution and synchronization failures propagate without retries.
 
-With quality enabled, each candidate receives at least `STABILITY_RUNS` attempts,
-subject to acquisition failures, followed by at most `MAX_RETRIES` additional
-attempts. Each candidate retains its minimum score regardless of quality. Compare
+With quality enabled, each unfinished candidate receives `STABILITY_RUNS` series
+per batch, subject to acquisition failures. `MAX_RETRIES=5` permits at most five
+batches, not the first plus five repeats. Each candidate retains its minimum score
+regardless of quality. After processing the entire batch, compare
 the untrimmed mean of that attempt with N-1 other attempts that passed their own
 sample-quality checks, searching the entire history of this candidate. Every
 comparison group includes the retained minimum, and its maximum/minimum mean
@@ -148,13 +151,19 @@ tolerance. Failed attempts cannot corroborate another minimum. For example,
 10 (failed), 9.9 (passed) requires another quality-passing measurement near 9.9;
 the old failed 10 cannot confirm it. Older passing attempts can confirm a new
 minimum immediately. Only unfinished candidates retry.
+History spans all batches of the same candidate: a second batch at N=3 adds
+three means to the first three. A new minimum must be confirmed against that
+complete history. Confirmation earlier inside a batch cannot hide a later,
+lower unconfirmed result. Compare candidates for the final winner only after
+all candidates finish or the batch limit is reached.
 At exhaustion, an unfinished candidate returns its absolute minimum with
 `stability not confirmed`, even if later attempts passed sample quality. Thus
 neither a later slow stable group nor an unrelated clean attempt ends confirmation.
 
-N=1 retains the previous minimum-selection and quality-retry behavior. No extra
+N=1 retains minimum selection and per-series quality retries, with one series
+per batch. No extra
 compilation, filtering or calibration is performed. Keep the minimum report and
-sample-free quality-passing reports, bounded by N + MAX_RETRIES attempts. The
+sample-free quality-passing reports, bounded by N * max(1, MAX_RETRIES) series. The
 compatibility helper retains aggregated CSV results for passing history and raw
 rows only for the minimum, rather than retaining every attempt's sample arrays.
 `quality_failures` describes the returned attempt; `all_configs_passed` separately
@@ -197,8 +206,10 @@ export TRITON_NPU_BENCH_MAX_RETRIES=5
 `QUALITY_CHECK=1` keeps confirmation enabled. In stability-only mode, the five
 sample metrics are not calculated and all usable attempts can corroborate the
 minimum. Invalid profiler data and execution errors retain their existing handling.
-Only unfinished candidates retry, with at most N + MAX_RETRIES attempts per
-candidate. Unconfirmed minima retain the existing failure status at exhaustion.
+Only unfinished candidates retry. With these settings, each profiler batch
+contains three series per unfinished candidate, and at most five batches are
+allowed: fifteen series per candidate. Unconfirmed minima retain the existing
+failure status at exhaustion.
 The compatibility utils inherit this mode through the shared benchmark path.
 The score's quantile boundaries and the selected cache mode remain unchanged.
 Set `STABILITY_ONLY=0` to restore the five statistical checks.
