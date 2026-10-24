@@ -36,17 +36,17 @@ export TRITON_PRINT_AUTOTUNING=0
 | --- | --- |
 | `TRITON_NPU_BENCH_CACHE_MODE` | `hot`; `cold` evicts L2; `hot` does not explicitly evict it between profiler launches. |
 | `TRITON_NPU_BENCH_WARMUP` | Unset: `ceil(active / 10)` for the current batch. An explicit integer >= 0 overrides it; `0` disables profiler warmup. |
-| `TRITON_NPU_BENCH_ACTIVE` | `250`; measured launches per series in the first batch and minimum for subsequent batches; integer >= 1, or >= 2 with quality checks. |
+| `TRITON_NPU_BENCH_ACTIVE` | `30`; measured launches per series in the first batch and minimum for subsequent batches; integer >= 1, or >= 2 with quality checks. |
 | `TRITON_NPU_BENCH_LOWER_QUANTILE` | `0.25`; lower quantile boundary of the measured durations averaged for selection. |
 | `TRITON_NPU_BENCH_UPPER_QUANTILE` | `0.75`; upper quantile boundary of the measured durations averaged for selection. |
 | `TRITON_NPU_BENCH_QUALITY_CHECK` | `1`; enable quality checks and minimum confirmation. |
 | `TRITON_NPU_BENCH_QUALITY_CHECK_ALL` | `0`; stop after the first failed check. `1` computes all quality metrics for diagnostics, including rejected attempts. Does not change retry decisions or the selection-cache key. |
 | `TRITON_NPU_BENCH_STABILITY_ONLY` | `0`; `1` skips all five sample-quality metrics and retains only minimum confirmation. Requires `STABILITY_RUNS >= 2` when quality is enabled; inactive with `QUALITY_CHECK=0`. |
 | `TRITON_NPU_BENCH_MAX_RETRIES` | `5`; maximum profiler batches in total, including the first. `0` permits one initial batch. Failed acquisition also consumes a batch. |
-| `TRITON_NPU_BENCH_BATCH_RUNS` | `2`; M series per candidate in one profiler batch; integer >= 1. Independent of N. With `QUALITY_CHECK=0`, each batch has one series. |
-| `TRITON_NPU_BENCH_STABILITY_RUNS` | `2`; N results needed to confirm each candidate's minimum using its complete history; integer >= 1. `1` disables cross-series confirmation. |
-| `TRITON_NPU_BENCH_STABILITY_TOLERANCE` | `0.03`; require `max(means) / min(means) <= 1 + tolerance`. Finite and >= 0; `0.03` permits a 3% spread between extremes. Inactive with N=1 or quality disabled. |
-| `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | `10`; estimated device time per series in subsequent batches, based on the first successful profile. No extra batch is forced. `0` disables it; other values must be finite and positive. |
+| `TRITON_NPU_BENCH_BATCH_RUNS` | `5`; M series per candidate in one profiler batch; integer >= 1. Independent of N. With `QUALITY_CHECK=0`, each batch has one series. |
+| `TRITON_NPU_BENCH_STABILITY_RUNS` | `7`; N results needed to confirm each candidate's minimum using its complete history; integer >= 1. `1` disables cross-series confirmation. |
+| `TRITON_NPU_BENCH_STABILITY_TOLERANCE` | `0.005`; require `max(means) / min(means) <= 1 + tolerance`. Finite and >= 0; `0.005` permits a 0.5% spread between extremes. Inactive with N=1 or quality disabled. |
+| `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | `15`; estimated device time per series in subsequent batches, based on the first successful profile. No extra batch is forced. `0` disables it; other values must be finite and positive. |
 | `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; measured launches per short event estimate for slow filtering only; integer >= 2. |
 | `TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS` | `1`; enable preliminary filtering through NPU events under the selected cache policy. |
 | `TRITON_NPU_BENCH_SLOW_CONFIG_ROUNDS` | `10`; total filtering rounds per winner, including the first; integer >= 1. |
@@ -55,6 +55,11 @@ export TRITON_PRINT_AUTOTUNING=0
 
 Boolean values accept `0`, `1`, `false`, and `true`. Settings do not enable one
 another: quality checks do not automatically enable retries, filtering, or a budget.
+The default M=5 and N=7 require at least two successful profiler batches;
+the first uses 30 active launches per series, and later batches use the retry budget.
+The tolerance bounds the full relative range of a confirming group's ordinary
+means, not a confidence interval. The group is searched across candidate history;
+other series can lie outside it. Selection still uses the configured quantile score.
 
 The new NPU defaults override the call's warmup, active and cache arguments,
 including standalone `do_bench_npu`, without changing public signatures.
