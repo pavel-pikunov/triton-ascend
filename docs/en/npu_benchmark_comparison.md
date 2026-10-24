@@ -41,8 +41,9 @@ TRITON_NPU_BENCH_PROFILER_MODE=full python your_existing_case.py
 
 Both modes use the same candidate order, launch counts, cache policy, scores and
 enabled quality checks. The mode participates in the selection-cache key. Each
-batch uses one profiler session for N complete passes over its candidates, where
-N is `STABILITY_RUNS` with quality enabled, otherwise one. It is completed as one
+batch uses one profiler session for M complete passes over its candidates, where
+M is `BATCH_RUNS` with quality enabled, otherwise one. `STABILITY_RUNS` independently
+sets the number of historical results required to confirm each minimum. It is completed as one
 recording step; no step is added per kernel launch. `MAX_RETRIES` now limits the
 total number of batches, including the first (`0` still allows one initial batch).
 Confirmation uses each candidate's history across all batches. Failures follow the existing
@@ -218,10 +219,11 @@ This is a policy check with potentially multiple attempts, separate from the
 original-path comparison above. The minimum score across measured attempts
 remains the selection criterion regardless of quality; the winner report shows
 that score and its attempt's ordinary mean separately.
-Filtering and budget calibration share minimum event estimates. A new filtering
-winner restarts suspect rounds against its lower threshold. A budget sets one
-common active count from the fastest retained event launch; quality retries keep
-that count even when only a subset of candidates is measured.
+Filtering retains minimum event estimates. A new filtering winner restarts suspect
+rounds against its lower threshold. The first profiler batch uses `ACTIVE`; its
+smallest ordinary series mean sets the common budget-based active count for any
+subsequent batches. No separate calibration runs. If all minima are confirmed in
+the first batch, the budget adds no measurements. History survives count changes.
 
 ## Repeat autotuning and save per-config CSV statistics
 
@@ -357,7 +359,7 @@ benchmark_npu(my_kernel, grid, x, y, n, BLOCK_SIZE=256)
 
 For a fixed JIT kernel, this test-only wrapper measures initial compilation/launch,
 then runs the current NPU pipeline with slow filtering disabled. It reuses the same
-event calibration, shared active/warmup calculation, cache policy, quantile score,
+first-profile retry budget, shared active/warmup calculation, cache policy, quantile score,
 quality checks, retries, profiler mode and timing/winner reports. The profiler target
 name comes from the compiled kernel. Reports include actual compiled constants and
 compiler metadata. Existing environment flags control output; this wrapper always

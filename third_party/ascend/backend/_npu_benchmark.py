@@ -37,7 +37,8 @@ def capture_npu_reports(sink):
 ENV_PREFIX = "TRITON_NPU_BENCH_"
 TIMING_STAGES = ("generation_pruning", "compilation", "slow_filter", "calibration", "measurements")
 COUNT_MINIMUMS = {
-    "warmup": 0, "active": 1, "max_retries": 0, "stability_runs": 1, "calibration_runs": 2, "slow_config_rounds": 1
+    "warmup": 0, "active": 1, "max_retries": 0, "batch_runs": 1, "stability_runs": 1, "calibration_runs": 2,
+    "slow_config_rounds": 1
 }
 
 
@@ -68,6 +69,7 @@ class NpuBenchmarkOptions:
     quality_check_all: bool = False
     stability_only: bool = False
     max_retries: int = 5
+    batch_runs: int = 2
     stability_runs: int = 2
     stability_tolerance: float = 0.03
     measure_budget_ms: float | None = 10.0
@@ -87,9 +89,10 @@ class NpuBenchmarkOptions:
             "report_timing": False,
             "quality_check_all": False,
             "stability_only": self.quality_check,
+            "batch_runs": self.quality_check,
             "stability_runs": self.quality_check,
             "stability_tolerance": self.quality_check and self.stability_runs > 1,
-            "calibration_runs": self.measure_budget_ms is not None or self.filter_slow_configs,
+            "calibration_runs": self.filter_slow_configs,
             "slow_config_rounds": self.filter_slow_configs,
             "slow_config_factor": self.filter_slow_configs,
             "slow_config_recheck_delay_s": self.filter_slow_configs and self.slow_config_rounds > 1,
@@ -109,7 +112,7 @@ class NpuBenchmarkOptions:
         if self.quality_check and not self.stability_only:
             from ._benchmark_quality import THRESHOLDS
             thresholds = tuple(sorted(THRESHOLDS.items()))
-        return ("npu-benchmark", 13, self.effective_policy(), thresholds)
+        return ("npu-benchmark", 14, self.effective_policy(), thresholds)
 
 
 def resolve_options():
@@ -551,30 +554,6 @@ def event_timer(clear_l2_cache, pre_hook_scope):
         buffer = None
 
 
-def calibrate_active(funcs, indices, durations, options, active, clear_l2_cache, pre_hook_scope):
-    if options.measure_budget_ms is None:
-        return active
-    missing = [index for index in indices if index not in durations]
-    log_stage(
-        options.log_level, "Calibration", f"Reusing slow-filter events: {len(indices) - len(missing)}/"
-        f"{len(indices)}; event calibration: {len(missing)} candidates")
-    if missing:
-        with event_timer(clear_l2_cache, pre_hook_scope) as measure:
-            for index in missing:
-                durations[index] = measure(funcs[index], options.calibration_runs)
-    for index in indices:
-        duration = durations[index]
-        if not math.isfinite(duration) or duration <= 0:
-            raise ValueError(f"Invalid NPU event calibration time for config {index}: {duration}")
-    required = options.measure_budget_ms / min(durations[index] for index in indices)
-    if not math.isfinite(required):
-        raise ValueError("Unrepresentable NPU benchmark sample count")
-    active = max(active, math.ceil(required))
-    log_stage(options.log_level, "Calibration settings", f"budget_ms={options.measure_budget_ms}, "
-              f"event_min_ms={durations}, active={active}", detailed=True)
-    return active
-
-
 @contextmanager
 def result_scope(remove):
     """Keep a primary failure if cleanup also fails."""
@@ -633,7 +612,8 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
         f"profiler_mode={options.profiler_mode}, warmup={warmup}, active={active}, quality_check={options.quality_check}, "
         f"quality_check_all={options.quality_check_all}, "
         f"stability_only={options.stability_only}, "
-        f"stability_runs={options.stability_runs}, stability_tolerance={options.stability_tolerance}, "
+        f"batch_runs={options.batch_runs}, stability_runs={options.stability_runs}, "
+        f"stability_tolerance={options.stability_tolerance}, "
         f"quantiles=({options.lower_quantile}, {options.upper_quantile})", detailed=True)
     if not (options.quality_check or options.max_retries or options.measure_budget_ms is not None
             or options.filter_slow_configs):
@@ -647,14 +627,10 @@ def bench_npu(profile, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res
              if target_kernel_name is None or isinstance(target_kernel_name, str) else list(target_kernel_name))
     if len(names) != len(funcs):
         raise ValueError("Provide one target kernel name per function")
-    indices, durations = list(range(len(funcs))), {}
+    indices = list(range(len(funcs)))
     with timing_stage(timings, "slow_filter"):
         if options.filter_slow_configs:
-            indices, durations = filter_slow_configs(funcs, options, clear_l2_cache, pre_hook_scope)
-    with timing_stage(timings, "calibration"):
-        active = calibrate_active(funcs, indices, durations, options, active, clear_l2_cache, pre_hook_scope)
-        options = replace(options, active=active,
-                          warmup=(active + 9) // 10 if options.warmup is None else options.warmup)
+            indices, _ = filter_slow_configs(funcs, options, clear_l2_cache, pre_hook_scope)
     measurements = _profile_with_retries(profile, funcs, names, indices, options, prof_dir, keep_res, pre_hook_scope,
                                          capture_report=report_sink is not None, timings=timings,
                                          config_numbers=config_numbers)
@@ -670,8 +646,10 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
         if options.quality_check_all:
             evaluate_quality = partial(evaluate_quality, check_all=True)
     best_reports = [None] * len(funcs)
+    batch_runs = options.batch_runs if options.quality_check else 1
     stability_runs = options.stability_runs if options.quality_check else 1
     histories = {index: [] for index in indices} if stability_runs > 1 else {}
+    active, retry_active = options.active, None
     unconfirmed = "stability not confirmed"
     root = Path(prof_dir) if prof_dir is not None else Path(
         runtime.cache.get_home_dir()) / ".triton" / "profile_results"
@@ -682,9 +660,9 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
         directory = tempfile.mkdtemp(prefix="npu_bench_", dir=root)
         with result_scope(lambda: shutil.rmtree(directory) if not keep_res else None):
             try:
-                return profile([funcs[index] for index in selected], options.warmup, options.active,
-                               options.cache_mode == "cold", directory, True, [names[index] for index in selected],
-                               _return_samples=True, _pre_hook_scope=pre_hook_scope, _execution_state=execution_state,
+                return profile([funcs[index] for index in selected], warmup, active, options.cache_mode == "cold",
+                               directory, True, [names[index] for index in selected], _return_samples=True,
+                               _pre_hook_scope=pre_hook_scope, _execution_state=execution_state,
                                _capture_report=capture_report)
             except (RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 if execution_state["failed"]:
@@ -696,20 +674,35 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
     with timing_stage(timings, "measurements"):
         for batch in range(max(1, options.max_retries)):
             selected = pending
-            sequence = selected * stability_runs
+            sequence = selected * batch_runs
+            warmup = (active + 9) // 10 if options.warmup is None else options.warmup
             log_stage(options.log_level, "Profiler measurement", f"Batch {batch + 1}: {len(selected)} candidates, "
-                      f"{stability_runs} series each")
-            log_stage(options.log_level, "Measurement settings", f"configs={selected}, warmup={options.warmup}, "
-                      f"active={options.active}", detailed=True)
+                      f"{batch_runs} series each")
+            log_stage(options.log_level, "Measurement settings", f"configs={selected}, warmup={warmup}, "
+                      f"active={active}", detailed=True)
             try:
                 measurements = collect(sequence)
             except ProfilerAcquisitionError as exc:
                 last_acquisition_error = exc
                 log_stage(options.log_level, "Profiler acquisition failed", str(exc), detailed=True)
                 continue
+            if retry_active is None:
+                retry_active = active
+                if options.measure_budget_ms is not None:
+                    duration = min(record.mean_ms for record in measurements)
+                    if not math.isfinite(duration) or duration <= 0:
+                        raise ValueError(f"Invalid NPU profiler budget estimate: {duration}")
+                    required = options.measure_budget_ms / duration
+                    if not math.isfinite(required):
+                        raise ValueError("Unrepresentable NPU benchmark sample count")
+                    retry_active = max(active, math.ceil(required))
+                    log_stage(
+                        options.log_level, "Retry budget settings", f"budget_ms={options.measure_budget_ms}, "
+                        f"first_profile_min_mean_ms={duration:.8g}, active={retry_active}", detailed=True)
             pending = []
+            passed = set()
             for position, (index, measurement) in enumerate(zip(sequence, measurements)):
-                attempt = batch * stability_runs + position // len(selected) + 1
+                attempt = batch * batch_runs + position // len(selected) + 1
                 with timing_stage(timings, "quality"):
                     metrics, failures = evaluate_quality(*measurement.samples) if options.quality_check else ({}, [])
                 record = replace(measurement, samples=None, attempt=attempt, quality_failures=tuple(failures),
@@ -719,11 +712,11 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
                 if histories:
                     if not failures:
                         histories[index].append(record)
-                elif failures:
-                    pending.append(index)
+                elif not failures:
+                    passed.add(index)
                 log_stage(
                     options.log_level, "Config measurement", f"config={index}, batch={batch + 1}, attempt={attempt}, "
-                    f"active={options.active}, score_ms={measurement.score_ms:.8g}, mean_ms={measurement.mean_ms:.8g}, "
+                    f"active={active}, score_ms={measurement.score_ms:.8g}, mean_ms={measurement.mean_ms:.8g}, "
                     f"metrics={metrics}, failures={failures}", detailed=True)
             measurements.clear()
             if histories:
@@ -759,11 +752,14 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
                         options.log_level, "Minimum confirmation", f"config={index}, "
                         f"score_ms={best.score_ms:.8g}, mean_ms={best.mean_ms:.8g}, "
                         f"stability_relative_spread={spread:.8g}, candidate_passed={not retry}", detailed=True)
+            else:
+                pending = [index for index in selected if index not in passed]
             log_stage(
                 options.log_level, "Quality/acquisition result", f"{len(selected) - len(pending)}/"
                 f"{len(selected)} candidates passed; retry candidates={len(pending)}")
             if not pending:
                 break
+            active = retry_active
     if histories:
         for index in pending:
             if best_reports[index] is not None:
