@@ -35,18 +35,19 @@ export TRITON_PRINT_AUTOTUNING=0
 | Environment variable | Default / meaning |
 | --- | --- |
 | `TRITON_NPU_BENCH_CACHE_MODE` | `hot`; `cold` evicts L2; `hot` does not explicitly evict it between profiler launches. |
-| `TRITON_NPU_BENCH_WARMUP` | Unset: `ceil(active / 10)` using the final budget-adjusted active. An explicit integer >= 0 overrides it; `0` disables profiler warmup. |
-| `TRITON_NPU_BENCH_ACTIVE` | `250`; minimum measured launches per candidate; integer >= 1, or >= 2 with quality checks. |
+| `TRITON_NPU_BENCH_WARMUP` | Unset: `ceil(active / 10)` for the current batch. An explicit integer >= 0 overrides it; `0` disables profiler warmup. |
+| `TRITON_NPU_BENCH_ACTIVE` | `250`; measured launches per series in the first batch and minimum for subsequent batches; integer >= 1, or >= 2 with quality checks. |
 | `TRITON_NPU_BENCH_LOWER_QUANTILE` | `0.25`; lower quantile boundary of the measured durations averaged for selection. |
 | `TRITON_NPU_BENCH_UPPER_QUANTILE` | `0.75`; upper quantile boundary of the measured durations averaged for selection. |
 | `TRITON_NPU_BENCH_QUALITY_CHECK` | `1`; enable quality checks and minimum confirmation. |
 | `TRITON_NPU_BENCH_QUALITY_CHECK_ALL` | `0`; stop after the first failed check. `1` computes all quality metrics for diagnostics, including rejected attempts. Does not change retry decisions or the selection-cache key. |
 | `TRITON_NPU_BENCH_STABILITY_ONLY` | `0`; `1` skips all five sample-quality metrics and retains only minimum confirmation. Requires `STABILITY_RUNS >= 2` when quality is enabled; inactive with `QUALITY_CHECK=0`. |
 | `TRITON_NPU_BENCH_MAX_RETRIES` | `5`; maximum profiler batches in total, including the first. `0` permits one initial batch. Failed acquisition also consumes a batch. |
-| `TRITON_NPU_BENCH_STABILITY_RUNS` | `2`; N series per batch and N results needed to confirm each candidate's minimum using its complete history. Integer >= 1; `1` disables cross-series confirmation. With `QUALITY_CHECK=0`, each batch has one series. |
+| `TRITON_NPU_BENCH_BATCH_RUNS` | `2`; M series per candidate in one profiler batch; integer >= 1. Independent of N. With `QUALITY_CHECK=0`, each batch has one series. |
+| `TRITON_NPU_BENCH_STABILITY_RUNS` | `2`; N results needed to confirm each candidate's minimum using its complete history; integer >= 1. `1` disables cross-series confirmation. |
 | `TRITON_NPU_BENCH_STABILITY_TOLERANCE` | `0.03`; require `max(means) / min(means) <= 1 + tolerance`. Finite and >= 0; `0.03` permits a 3% spread between extremes. Inactive with N=1 or quality disabled. |
-| `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | `10`; estimated accumulated device-time budget per candidate, in milliseconds. `0` disables it; other values must be finite and positive. |
-| `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; measured launches per short event estimate, used by filtering and budget calibration; integer >= 2. |
+| `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | `10`; estimated device time per series in subsequent batches, based on the first successful profile. No extra batch is forced. `0` disables it; other values must be finite and positive. |
+| `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; measured launches per short event estimate for slow filtering only; integer >= 2. |
 | `TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS` | `1`; enable preliminary filtering through NPU events under the selected cache policy. |
 | `TRITON_NPU_BENCH_SLOW_CONFIG_ROUNDS` | `10`; total filtering rounds per winner, including the first; integer >= 1. |
 | `TRITON_NPU_BENCH_SLOW_CONFIG_FACTOR` | `2.5`; recheck candidates above this multiple of the current winner's retained minimum; finite and >= 1. |
@@ -60,12 +61,12 @@ including standalone `do_bench_npu`, without changing public signatures.
 Fixed active counts and the budget bypass CV count calculation and its
 200-second estimated measurement cap. Hot mode cannot guarantee L2 residency.
 
-## Slow filtering and calibration
+## Slow filtering and retry budget
 
 The first filtering round benchmarks every candidate through NPU events, returning
 the minimum event duration. Each estimate uses one preliminary call followed by
-`CALIBRATION_RUNS` measured launches. All filtering rounds, budget calibration and
-main profiler measurements use the same selected `CACHE_MODE`. Cold event estimates
+`CALIBRATION_RUNS` measured launches. All filtering rounds and main profiler
+measurements use the same selected `CACHE_MODE`. Cold event estimates
 evict L2 before recording each measured launch; hot estimates do not explicitly evict it.
 Each candidate retains its lowest event duration across rounds. The threshold is
 the current winner's retained minimum multiplied by `SLOW_CONFIG_FACTOR`.
@@ -74,8 +75,8 @@ current winner. If another candidate obtains a strictly lower minimum, it become
 the winner: all original candidates are reclassified and the round counter restarts
 at 1. Ties preserve the current winner. Previously retained candidates can become
 suspects under the new threshold. Candidates still slow after the configured number
-of rounds are excluded. One round permits immediate filtering; the default seven
-rounds provide six rechecks per winner.
+of rounds are excluded. One round permits immediate filtering; the default ten
+rounds provide nine rechecks per winner.
 
 There is one pause before each needed recheck round. No pause or recheck occurs
 without suspects, with fewer than two candidates, or with one configured round.
@@ -87,24 +88,23 @@ series; cold estimates also retain the existing cache-preparation synchronizatio
 The release CV time-limit pruning also retains its original implementation; explicit
 `ACTIVE` or `MEASURE_BUDGET_MS` bypasses that separate pruning and count calculation.
 
-A measurement budget sets
-one shared `active = max(active, ceil(measure_budget_ms / minimum_event_duration_ms))`
-for all surviving candidates, using the fastest retained event launch.
-Calibration reuses slow-filter minima.
-Profiler warmup defaults to `(active + 9) // 10` after the shared active count is
-calibrated: active 50 gives 5 warmup launches, 51 gives 6, and 250 gives 25.
-An explicit `TRITON_NPU_BENCH_WARMUP` is preserved, including zero.
-When those results are unavailable, one preliminary call and `CALIBRATION_RUNS`
-event measurements estimate each candidate under the requested profiler cache
-policy. Calibration creates no profiler session or CSV. Event estimates determine
-the shared count only; final ranking uses profiler kernel durations. Without a
-budget, the original active count is retained. The budget is an estimate,
-not a guarantee of accumulated kernel time or a wall-clock timeout.
+The first successful profiler batch always uses `ACTIVE`. If candidates need
+another batch, its shared count becomes
+`max(ACTIVE, ceil(MEASURE_BUDGET_MS / first_profile_min_mean_ms))`, where the
+denominator is the smallest ordinary series mean from the first successful batch.
+All subsequent batches reuse this count, including when only some candidates retry.
+No separate calibration is run, and event minima from slow filtering do not set
+the budget. If the first batch confirms every candidate, no second batch is added.
+With the budget disabled, every batch uses `ACTIVE`.
+Profiler warmup defaults to `(active + 9) // 10` for each batch; an explicit
+`WARMUP` is preserved, including zero. Earlier series keep their original counts
+and remain in the confirmation history. The budget estimates device time per
+series in later batches, not total batch time or a wall-clock timeout.
 
 ## Profiler attempts and selection
 
 All current candidates share one profiler session and one active count per batch.
-With N=3, launch all candidates once, then repeat the same order twice:
+With M=3, launch all candidates once, then repeat the same order twice:
 `A1 B1 C1, A2 B2 C2, A3 B3 C3`. Each series has its own warmup and active launches.
 The original pandas collector reads the common CSV
 once, filters target kernels and cache operations, and splits candidates by
@@ -130,10 +130,10 @@ all five checks even after a failure. Both modes use all untrimmed samples and
 the same statistics and thresholds. Pairwise statistics use linear auxiliary
 memory; sampled slopes suggest search pivots, never replace the full-sample median.
 Only failing candidates receive quality retries. Failed acquisition of the shared
-CSV retries the current batch. The shared count is retained across retries without recalibration.
+CSV retries the current batch. Before the first successful profile, the count remains `ACTIVE`.
 Kernel execution and synchronization failures propagate without retries.
 
-With quality enabled, each unfinished candidate receives `STABILITY_RUNS` series
+With quality enabled, each unfinished candidate receives `BATCH_RUNS` series
 per batch, subject to acquisition failures. `MAX_RETRIES=5` permits at most five
 batches, not the first plus five repeats. Each candidate retains its minimum score
 regardless of quality. After processing the entire batch, compare
@@ -151,8 +151,9 @@ tolerance. Failed attempts cannot corroborate another minimum. For example,
 10 (failed), 9.9 (passed) requires another quality-passing measurement near 9.9;
 the old failed 10 cannot confirm it. Older passing attempts can confirm a new
 minimum immediately. Only unfinished candidates retry.
-History spans all batches of the same candidate: a second batch at N=3 adds
-three means to the first three. A new minimum must be confirmed against that
+History spans all batches of the same candidate: a second batch at M=3 adds
+three means to the first three, even if its active count increased. N independently
+sets the size of the confirming group. A new minimum must be confirmed against that
 complete history. Confirmation earlier inside a batch cannot hide a later,
 lower unconfirmed result. Compare candidates for the final winner only after
 all candidates finish or the batch limit is reached.
@@ -160,10 +161,11 @@ At exhaustion, an unfinished candidate returns its absolute minimum with
 `stability not confirmed`, even if later attempts passed sample quality. Thus
 neither a later slow stable group nor an unrelated clean attempt ends confirmation.
 
-N=1 retains minimum selection and per-series quality retries, with one series
-per batch. No extra
-compilation, filtering or calibration is performed. Keep the minimum report and
-sample-free quality-passing reports, bounded by N * max(1, MAX_RETRIES) series. The
+N=1 disables confirmation; a candidate completes when any series in its batch
+passes sample quality, retaining its minimum regardless of quality. Set M=1 too
+for the previous one-series-per-batch behavior. No extra compilation, filtering
+or calibration is performed for retries. Keep the minimum report and
+sample-free quality-passing reports, bounded by M * max(1, MAX_RETRIES) series. The
 compatibility helper retains aggregated CSV results for passing history and raw
 rows only for the minimum, rather than retaining every attempt's sample arrays.
 `quality_failures` describes the returned attempt; `all_configs_passed` separately
@@ -180,8 +182,8 @@ new NPU defaults are active measurement policies: single surviving candidates
 still use profiling, and row mismatches do not silently fall back to event timing.
 
 Effective measurement policies participate in the selection-cache key. Logging
-and reports do not. `CALIBRATION_RUNS` is inactive unless a budget or filtering is
-enabled; other filtering settings are inactive when filtering is disabled. A recheck
+and reports do not. `CALIBRATION_RUNS` and other filtering settings are inactive
+when filtering is disabled. A recheck
 delay is inactive with one filtering round. No additional warnings are emitted for inactive settings.
 
 ## Minimum confirmation without sample-quality metrics
@@ -198,6 +200,7 @@ export TRITON_NPU_BENCH_MEASURE_BUDGET_MS=0
 export TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS=0
 export TRITON_NPU_BENCH_QUALITY_CHECK=1
 export TRITON_NPU_BENCH_STABILITY_ONLY=1
+export TRITON_NPU_BENCH_BATCH_RUNS=3
 export TRITON_NPU_BENCH_STABILITY_RUNS=3
 export TRITON_NPU_BENCH_STABILITY_TOLERANCE=0.03
 export TRITON_NPU_BENCH_MAX_RETRIES=5
