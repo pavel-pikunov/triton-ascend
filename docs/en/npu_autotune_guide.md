@@ -44,8 +44,8 @@ export TRITON_PRINT_AUTOTUNING=0
 | `TRITON_NPU_BENCH_STABILITY_ONLY` | `0`; `1` skips all five sample-quality metrics and retains only minimum confirmation. Requires `STABILITY_RUNS >= 2` when quality is enabled; inactive with `QUALITY_CHECK=0`. |
 | `TRITON_NPU_BENCH_MAX_RETRIES` | `5`; maximum profiler batches in total, including the first. `0` permits one initial batch. Failed acquisition also consumes a batch. |
 | `TRITON_NPU_BENCH_BATCH_RUNS` | `5`; M series per candidate in one profiler batch; integer >= 1. Independent of N. With `QUALITY_CHECK=0`, each batch has one series. |
-| `TRITON_NPU_BENCH_STABILITY_RUNS` | `7`; N results needed to confirm each candidate's minimum using its complete history; integer >= 1. `1` disables cross-series confirmation. |
-| `TRITON_NPU_BENCH_STABILITY_TOLERANCE` | `0.005`; require `max(means) / min(means) <= 1 + tolerance`. Finite and >= 0; `0.005` permits a 0.5% spread between extremes. Inactive with N=1 or quality disabled. |
+| `TRITON_NPU_BENCH_STABILITY_RUNS` | `5`; N results including the minimum needed to confirm each candidate using its complete history; integer >= 1. `1` disables cross-series confirmation. |
+| `TRITON_NPU_BENCH_STABILITY_TOLERANCE` | `0.01`; every score in a confirming group must be <= the candidate's retained minimum score times `1 + tolerance`. Finite and >= 0; `0.01` permits scores up to 1% above that minimum. Inactive with N=1 or quality disabled. |
 | `TRITON_NPU_BENCH_MEASURE_BUDGET_MS` | `15`; estimated device time per series in subsequent batches, based on the first successful profile. No extra batch is forced. `0` disables it; other values must be finite and positive. |
 | `TRITON_NPU_BENCH_CALIBRATION_RUNS` | `10`; measured launches per short event estimate for slow filtering only; integer >= 2. |
 | `TRITON_NPU_BENCH_FILTER_SLOW_CONFIGS` | `1`; enable preliminary filtering through NPU events under the selected cache policy. |
@@ -55,11 +55,12 @@ export TRITON_PRINT_AUTOTUNING=0
 
 Boolean values accept `0`, `1`, `false`, and `true`. Settings do not enable one
 another: quality checks do not automatically enable retries, filtering, or a budget.
-The default M=5 and N=7 require at least two successful profiler batches;
-the first uses 30 active launches per series, and later batches use the retry budget.
-The tolerance bounds the full relative range of a confirming group's ordinary
-means, not a confidence interval. The group is searched across candidate history;
-other series can lie outside it. Selection still uses the configured quantile score.
+The default M=5 and N=5 can confirm a candidate in the first profiler batch.
+The first uses 30 active launches per series, and later batches use the retry budget.
+Confirmation uses the same configured quantile score as selection: by default,
+the central-half mean. Every score in its group must lie between the retained
+minimum and `minimum * (1 + tolerance)`. The group is searched across candidate
+history; other series can lie outside it. This is not a confidence interval.
 
 The new NPU defaults override the call's warmup, active and cache arguments,
 including standalone `do_bench_npu`, without changing public signatures.
@@ -142,12 +143,13 @@ With quality enabled, each unfinished candidate receives `BATCH_RUNS` series
 per batch, subject to acquisition failures. `MAX_RETRIES=5` permits at most five
 batches, not the first plus five repeats. Each candidate retains its minimum score
 regardless of quality. After processing the entire batch, compare
-the untrimmed mean of that attempt with N-1 other attempts that passed their own
+the quantile score of that attempt with N-1 other attempts that passed their own
 sample-quality checks, searching the entire history of this candidate. Every
-comparison group includes the retained minimum, and its maximum/minimum mean
-ratio must not exceed `1 + STABILITY_TOLERANCE`. For example, 10, 11, 11.1 does
+comparison group includes the retained minimum, and its maximum score divided
+by that minimum must not exceed `1 + STABILITY_TOLERANCE`. For example, 10, 11, 11.1 does
 not confirm the minimum 10 at N=2; a subsequent quality-passing 10.1 can confirm
-it. Means of different candidates are never compared by this check.
+it. Scores of different candidates are never compared by this check. Ordinary
+untrimmed means remain available for reporting and the first-profile retry budget.
 
 When the full group meets the tolerance, return the minimum attempt if its own
 sample-quality checks passed. Otherwise return the lowest-score quality-passing
@@ -157,7 +159,7 @@ tolerance. Failed attempts cannot corroborate another minimum. For example,
 the old failed 10 cannot confirm it. Older passing attempts can confirm a new
 minimum immediately. Only unfinished candidates retry.
 History spans all batches of the same candidate: a second batch at M=3 adds
-three means to the first three, even if its active count increased. N independently
+three scores to the first three, even if its active count increased. N independently
 sets the size of the confirming group. A new minimum must be confirmed against that
 complete history. Confirmation earlier inside a batch cannot hide a later,
 lower unconfirmed result. Compare candidates for the final winner only after

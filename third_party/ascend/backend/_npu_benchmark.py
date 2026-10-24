@@ -70,8 +70,8 @@ class NpuBenchmarkOptions:
     stability_only: bool = False
     max_retries: int = 5
     batch_runs: int = 5
-    stability_runs: int = 7
-    stability_tolerance: float = 0.005
+    stability_runs: int = 5
+    stability_tolerance: float = 0.01
     measure_budget_ms: float | None = 15.0
     calibration_runs: int = 10
     filter_slow_configs: bool = True
@@ -112,7 +112,7 @@ class NpuBenchmarkOptions:
         if self.quality_check and not self.stability_only:
             from ._benchmark_quality import THRESHOLDS
             thresholds = tuple(sorted(THRESHOLDS.items()))
-        return ("npu-benchmark", 14, self.effective_policy(), thresholds)
+        return ("npu-benchmark", 15, self.effective_policy(), thresholds)
 
 
 def resolve_options():
@@ -724,29 +724,23 @@ def _profile_with_retries(profile, funcs, names, indices, options, prof_dir, kee
                     with timing_stage(timings, "quality"):
                         best = best_reports[index]
                         history = histories[index]
-                        others = sorted((item for item in history if item is not best), key=lambda item: item.mean_ms)
-                        confirmed, spread = None, float("inf")
-                        # Every group includes the minimum; only quality-passing history can confirm it.
-                        for start in range(len(others) - stability_runs + 2):
-                            group = [best, *others[start:start + stability_runs - 1]]
-                            means = [item.mean_ms for item in group]
-                            ratio = (max(means) / min(means) if all(math.isfinite(mean) and mean > 0
-                                                                    for mean in means) else float("inf"))
-                            spread = min(spread, ratio - 1)
-                            if ratio <= 1 + options.stability_tolerance:
-                                clean = min((item for item in group if not item.quality_failures), key=lambda item:
-                                            (item.score_ms, item.attempt))
-                                if confirmed is None or clean.score_ms < confirmed.score_ms:
-                                    confirmed = replace(
-                                        clean, quality_metrics={
-                                            **clean.quality_metrics, "stability_relative_spread": ratio - 1
-                                        })
+                        # The closest quality-passing scores suffice to confirm the retained minimum.
+                        others = sorted((item for item in history if item is not best),
+                                        key=lambda item: item.score_ms)[:stability_runs - 1]
+                        group = [best, *others]
+                        scores = [item.score_ms for item in group]
+                        ratio = (max(scores) / best.score_ms if len(group) == stability_runs
+                                 and all(math.isfinite(score) and score > 0 for score in scores) else float("inf"))
+                        spread = ratio - 1
                         best.quality_metrics["stability_relative_spread"] = spread
-                        retry = confirmed is None
+                        retry = ratio > 1 + options.stability_tolerance
                         if retry:
                             pending.append(index)
                         else:
-                            best_reports[index] = confirmed
+                            clean = min((item for item in group if not item.quality_failures), key=lambda item:
+                                        (item.score_ms, item.attempt))
+                            best_reports[index] = replace(
+                                clean, quality_metrics={**clean.quality_metrics, "stability_relative_spread": spread})
                             histories.pop(index)
                     log_stage(
                         options.log_level, "Minimum confirmation", f"config={index}, "
