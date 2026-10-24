@@ -296,7 +296,7 @@ launch counts, quantile boundaries, quality checks, retries, event calibration,
 and slow-filter rounds. No benchmark-policy arguments are added to the decorators.
 See [NPU autotune policies](npu_autotune_guide.md) for defaults and behavior.
 
-This test branch additionally supports `npu_legacy`, repeated autotune decisions,
+This test branch additionally supports repeated autotune decisions,
 and CSV statistics. Winner/timing reports work across all three benchmark paths;
 measurement controls apply only to the current NPU path, except for shared cache mode.
 See [Three benchmark paths](npu_benchmark_comparison.md) for comparison commands,

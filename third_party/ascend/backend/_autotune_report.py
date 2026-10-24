@@ -16,7 +16,7 @@ from numbers import Integral, Real
 from pathlib import Path
 from statistics import fmean
 
-from ._npu_benchmark import NpuMeasurementReport, resolve_options
+from ._npu_benchmark import NpuMeasurementReport
 from ._npu_benchmark import print_timing_report as print_timing_report
 
 REPORT_ENV = "TRITON_NPU_BENCH_REPORT_BEST_CONFIG"
@@ -34,6 +34,7 @@ class ScoreReport:
     warmup: int | None = None
     active: int | None = None
     cache_mode: str | None = None
+    quantiles: tuple | None = None
 
 
 def _canonical(value):
@@ -216,14 +217,16 @@ def _decision_record(function_name, config, number, measurement, selection):
     if selection is not None and selection["scored_ids"] is None:
         method = "unmeasured"
     if isinstance(measurement, NpuMeasurementReport):
-        options = resolve_options()
-        bounds = (options.lower_quantile, options.upper_quantile)
+        from .testing import _npu_bench_options
+        bounds = _npu_bench_options()[5:7]
         estimator = "mean" if bounds == (0.0, 1.0) else "trimmed_mean"
         method, score = "npu", measurement.score_ms
     elif isinstance(measurement, ScoreReport):
         method = measurement.benchmark_method or ("custom" if measurement.custom else "default")
-        if method == "npu_legacy":
-            estimator, score = "mean", measurement.score
+        if method == "npu":
+            bounds = measurement.quantiles
+            estimator = "mean" if bounds == (0.0, 1.0) else "trimmed_mean"
+            score = measurement.score
         elif not measurement.custom and isinstance(measurement.score, (list, tuple)) and len(measurement.score) == 3:
             estimator, score = "median", measurement.score[0]
         else:
@@ -241,7 +244,7 @@ def _decision_record(function_name, config, number, measurement, selection):
         "score_kind": estimator,
         "score_ms": score,
     }
-    if isinstance(measurement, NpuMeasurementReport):
+    if isinstance(measurement, NpuMeasurementReport) or isinstance(measurement, ScoreReport) and method == "npu":
         record["score_quantiles"] = bounds
     if selection is not None:
         ids = selection["candidate_ids"]
@@ -328,10 +331,9 @@ def print_best_config_report(function_name, configs, config, measurement=None, *
     elif isinstance(measurement, ScoreReport):
         if measurement.custom:
             stream.write(f"Returned score: {measurement.score!r}\n")
-        elif measurement.benchmark_method == "npu_legacy":
-            stream.write(f"Mean duration: {measurement.score * 1000:.12g} us ({measurement.score:.12g} ms)\n")
-            stream.write(f"cache={measurement.cache_mode}, warmup={measurement.warmup}, "
-                         f"active={measurement.active}; estimator=legacy mean\n")
+        elif measurement.benchmark_method == "npu":
+            stream.write(f"Selection score: {measurement.score * 1000:.12g} us ({measurement.score:.12g} ms)\n")
+            stream.write(f"cache={measurement.cache_mode}, quantiles={measurement.quantiles}\n")
         elif isinstance(measurement.score, (list, tuple)) and len(measurement.score) == 3:
             median, low, high = measurement.score
             stream.write(f"Median: {median!r} ms; quantiles 20%/80%: {low!r}/{high!r} ms\n")

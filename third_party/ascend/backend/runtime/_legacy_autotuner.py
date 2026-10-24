@@ -31,7 +31,6 @@ import inspect
 import os
 import pprint
 import time
-import warnings
 from concurrent.futures import ThreadPoolExecutor
 import itertools
 from collections.abc import Sequence
@@ -2391,41 +2390,7 @@ class AutoTilingTuner(Autotuner):
         if (self.parser_mode in ("cube", "mix") and self.cv_parse_result is not None):
             run_fns = npu_tuning.call_stage(self, "slow_filter", self._prune_by_time_limit, run_fns)
 
-        use_profiling = os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu_legacy"
-        # Respect user-provided benchmarkers even when NPU profiling mode is enabled.
-        use_npu_profiling = use_profiling and not self.user_defined_do_bench
-        if use_npu_profiling:
-            from .._legacy_testing import ProfilerResultMismatchError, do_bench_npu
-
-            cv_mode = self.parser_mode in ("cube", "mix") and self.cv_parse_result is not None
-            warmup = self.cv_warmup if cv_mode else 5
-            active = self.cv_repeat if cv_mode else 30
-            target_kernel_name = self._resolve_target_kernel_name(kernels_call, run_fns.keys())
-            try:
-                time_cost = npu_tuning.call_stage(
-                    self,
-                    "measurements",
-                    do_bench_npu,
-                    list(run_fns.values()),
-                    warmup=warmup,
-                    active=active,
-                    clear_l2_cache=True,
-                    target_kernel_name=target_kernel_name,
-                )
-                assert len(time_cost) == len(run_fns)
-                npu_tuning.legacy_profile_scores(run_fns, time_cost, _report_sink, warmup, active)
-                return {config: cost for config, cost in zip(run_fns.keys(), time_cost)}
-            except ProfilerResultMismatchError as exc:
-                warnings.warn(
-                    "Filtered profiler rows do not match the expected count for autotune benchmarking; "
-                    f"target_kernel_name={exc.target_kernel_name!r}, expected_rows={exc.expected_rows}, "
-                    f"actual_rows={exc.actual_rows}. fallback to default do_bench.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                return npu_tuning.bench_events(self, run_fns, _report_sink)
-        else:
-            return npu_tuning.bench_events(self, run_fns, _report_sink)
+        return npu_tuning.bench_events(self, run_fns, _report_sink)
 
     def _resolve_target_kernel_name(self, kernels_call, configs) -> Optional[str]:
         for config in configs:

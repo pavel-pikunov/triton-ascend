@@ -19,6 +19,7 @@
 # THE SOFTWARE.
 
 import builtins
+import math
 import multiprocessing
 import os
 from datetime import datetime, timezone
@@ -26,7 +27,38 @@ from typing import Optional
 
 import triton.runtime as runtime
 
-from ._npu_benchmark import ProfilerResultMismatchError as ProfilerResultMismatchError
+
+class ProfilerResultMismatchError(RuntimeError):
+    def __init__(self, target_kernel_name: str, expected_rows: int, actual_rows: int):
+        self.target_kernel_name = target_kernel_name
+        self.expected_rows = expected_rows
+        self.actual_rows = actual_rows
+        super().__init__(
+            "Profiler rows filtered by target kernel name do not match the expected count. "
+            f"target_kernel_name={target_kernel_name!r}, expected_rows={expected_rows}, actual_rows={actual_rows}"
+        )
+
+
+def _npu_bench_options(warmup=5, active=30, clear_l2_cache=False):
+    values = tuple(
+        type(default)(os.getenv("TRITON_NPU_BENCH_" + name, default)) for name, default in (
+            ("WARMUP", 5 if warmup is None else warmup),
+            ("ACTIVE", active),
+            ("BATCH_RUNS", 1),
+            ("STABILITY_RUNS", 1),
+            ("STABILITY_TOLERANCE", 0.01),
+            ("LOWER_QUANTILE", 0.0),
+            ("UPPER_QUANTILE", 1.0),
+            ("MEASURE_BUDGET_MS", 0.0),
+            ("MAX_RETRIES", 0),
+            ("CACHE_MODE", "cold" if clear_l2_cache else "hot"),
+        ))
+    warmup, active, batch_runs, confirmations, tolerance, lower, upper, budget, batches, mode = values
+    if not (warmup >= 0 and active > 0 and batch_runs > 0 and confirmations > 0 and batches >= 0
+            and math.isfinite(tolerance) and tolerance >= 0 and math.isfinite(budget) and budget >= 0
+            and 0 <= lower < upper <= 1 and mode in ("hot", "cold")):
+        raise ValueError("Invalid TRITON_NPU_BENCH settings")
+    return values
 
 
 def do_bench_npu(
@@ -37,101 +69,35 @@ def do_bench_npu(
     prof_dir=None,
     keep_res=False,
     target_kernel_name: Optional[str] = None,
+    _active_limit=None,
 ):
-    """Profile NPU kernels with optional TRITON_NPU_BENCH_* environment policies."""
-    if os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu_legacy":
-        from ._legacy_testing import do_bench_npu as legacy_do_bench_npu
-        return legacy_do_bench_npu(funcs, warmup=warmup, active=active, clear_l2_cache=clear_l2_cache,
-                                   prof_dir=prof_dir, keep_res=keep_res, target_kernel_name=target_kernel_name)
-    from ._npu_benchmark import bench_npu
-    return bench_npu(_profile_npu, funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name)
-
-
-def benchmark_npu(kernel, grid=None, *args, **kwargs):
-    """Launch a Triton kernel; benchmark/report fixed kernels, delegate autotuned ones.
-
-    With grid=None, accepts a zero-argument operation (also exported as perf_npu).
-    Returns the original launch result. Fixed kernels are measured on every call
-    using NPU environment policies with slow filtering disabled.
+    """Confirm minima when TRITON_NPU_BENCH_STABILITY_RUNS > 1, within STABILITY_TOLERANCE.
+    Retry budgets use ordinary means from the first profile.
     """
-    launch = kernel if grid is None else lambda: kernel[grid](*args, **kwargs)
-    fn = kernel
-    while grid is not None and hasattr(fn, "fn"):
-        if isinstance(fn, runtime.Autotuner):
-            return launch()
-        fn = fn.fn
-
-    import time
-    from dataclasses import replace
-    from types import SimpleNamespace
-    from functools import partial
-    from ._autotune_comparison import _perf_measured
-    from . import _npu_benchmark as benchmark
-    from ._autotune_report import print_best_config_report
-
-    options = replace(benchmark.resolve_options(), filter_slow_configs=False)
-    timings = {} if options.report_timing else None
-    records = []
-    started = time.perf_counter()
-    token = _perf_measured.set(False)
-    try:
-        with benchmark.timing_stage(timings, "compilation"):
-            result = launch()
-        measured = _perf_measured.get()
-    finally:
-        _perf_measured.reset(token)
-    if measured:
-        _perf_measured.set(True)
-        return result
-    compiled = (result[0] if isinstance(result, tuple) else result) if grid is not None else None
-    name = compiled.src.name if compiled is not None else getattr(kernel, "__name__", "operation")
-    target = compiled.packed_metadata["kernel_name"] if compiled is not None else None
-    profile = _profile_npu if compiled is not None else partial(_profile_npu, _aggregate_calls=True)
-    sink = benchmark._perf_report_sink.get()
-    benchmark.bench_npu(profile, launch, options.warmup, options.active, options.cache_mode == "cold", None, False,
-                        target, options=options,
-                        report_sink=records.extend if options.report_best_config or sink is not None else None,
-                        timings=timings, config_numbers=[1])
-    if sink is not None:
-        sink(name, records[0])
-    if options.report_timing:
-        benchmark.report_safely(lambda: benchmark.print_timing_report(name, started, timings))
-    if options.report_best_config:
-        if compiled is None:
-            benchmark.report_safely(lambda: benchmark.print_operation_report(name, records[0]))
-        else:
-            config = SimpleNamespace(kwargs=compiled.src.constants, compiler_metadata=compiled.metadata._asdict())
-            benchmark.report_safely(lambda: print_best_config_report(name, [config], config, records[0]))
-    return result
-
-
-def _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, target_kernel_name, *,
-                 _return_samples=False, _pre_hook_scope=None, _execution_state=None, _capture_report=False,
-                 _quantiles=(0.0, 1.0), _timings=None, _profiler_mode="summary", _aggregate_calls=False):
     import torch
     import torch_npu
-    from ._npu_benchmark import _collect_prof_result, export_npu_summary, profile_scope, result_scope, timing_stage
 
     if not isinstance(funcs, list):
         funcs = [funcs]
-
-    def run(fn):
-        try:
-            fn()
-            torch.npu.synchronize()
-        except Exception:
-            if _execution_state is not None:
-                _execution_state["failed"] = True
-            raise
+    warmup_limit = warmup
+    warmup, active, batch_runs, confirmations, tolerance, lower, upper, budget, batches, mode = _npu_bench_options(
+        warmup, active, clear_l2_cache)
+    clear_l2_cache = mode == "cold"
+    if _active_limit is not None:
+        warmup = min(warmup, warmup_limit)
+        active = min(active, _active_limit)
+        budget = 0
 
     # warmup kernel
     for fn in funcs:
-        run(fn)
+        fn()
+        torch.npu.synchronize()
 
-    summary = _profiler_mode == "summary"
+    aic_metrics = torch_npu.profiler.AiCMetrics.AiCoreNone
+    if os.getenv("TRITON_NPU_BENCH_PIPE_UTILIZATION", "1") == "1":
+        aic_metrics = torch_npu.profiler.AiCMetrics.PipeUtilization
     experimental_config = torch_npu.profiler._ExperimentalConfig(
-        aic_metrics=(torch_npu.profiler.AiCMetrics.AiCoreNone
-                     if summary else torch_npu.profiler.AiCMetrics.PipeUtilization),
+        aic_metrics=aic_metrics,
         profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
         l2_cache=False,
         data_simplification=False,
@@ -144,64 +110,78 @@ def _profile_npu(funcs, warmup, active, clear_l2_cache, prof_dir, keep_res, targ
         pid = process.pid
         process_name = process.name
         timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-        base_path = os.path.join(runtime.cache.get_home_dir(), ".triton", "profile_results")
+        base_path = os.path.join(
+            runtime.cache.get_home_dir(), ".triton", "profile_results"
+        )
         torch_path = os.path.join(base_path, f"prof_{timestamp}_{process_name}-{pid}")
 
+    buffer = None
     if clear_l2_cache:
         buffer = runtime.driver.active.get_empty_cache_for_benchmark()
         buffer = buffer.float()  # to avoid type cast
         buffer.sum()
         torch.npu.synchronize()  # shake out of any npu error
 
-    handler = torch_npu.profiler.tensorboard_trace_handler(torch_path, analyse_flag=not summary)
+    histories = [[] for _ in funcs]
+    pending = list(builtins.range(len(funcs)))
+    for batch in builtins.range(max(1, batches)):
+        selected = [funcs[index] for index in pending] * batch_runs
+        batch_path = os.path.join(torch_path, f"batch_{batch}") if batches > 1 else torch_path
+        _profile_npu_batch(selected, warmup, active, buffer, batch_path, experimental_config)
+        means = []
+        try:
+            scores = _collect_prof_result(batch_path, selected, warmup, active, target_kernel_name, clear_l2_cache,
+                                          (lower, upper), means)
+        finally:
+            _rm_dic(keep_res, torch_path)
+        if len(selected) == 1:
+            scores = [scores]
+        for position, index in enumerate(pending):
+            histories[index] = sorted(histories[index] + scores[position::len(pending)])[:confirmations]
+        pending = [
+            index for index in pending
+            if confirmations > 1 and (len(histories[index]) < confirmations or not math.isfinite(histories[index][-1])
+                                      or histories[index][0] <= 0 or histories[index][-1] > histories[index][0] *
+                                      (1 + tolerance))
+        ]
+        if not pending:
+            break
+        if batch == 0 and batches > 1 and budget and means and math.isfinite(min(means)):
+            previous_active = active
+            active = max(active, math.ceil(budget / min(means)))
+            if active != previous_active:
+                for index in pending:
+                    histories[index].clear()
+    if clear_l2_cache:
+        del buffer
+    if pending:
+        print(f"NPU benchmark: minimum not confirmed for configurations {[index + 1 for index in pending]}")
+    time_cost = [history[0] for history in histories]
+    return time_cost[0] if len(funcs) == 1 else time_cost
 
-    def on_trace_ready(prof):
-        with timing_stage(_timings, "export"):
-            handler(prof)
 
-    try:
-        scope = profile_scope(buffer if clear_l2_cache else None, torch.npu.synchronize, _pre_hook_scope,
-                              lambda: _rm_dic(keep_res, torch_path))
-        with scope, torch_npu.profiler.profile(
-                activities=[torch_npu.profiler.ProfilerActivity.NPU],
-                on_trace_ready=on_trace_ready,
-                schedule=lambda step: (torch_npu.profiler.ProfilerAction.RECORD_AND_SAVE
-                                       if step == 0 else torch_npu.profiler.ProfilerAction.NONE),
-                record_shapes=False,
-                profile_memory=False,
-                with_stack=False,
-                with_flops=False,
-                with_modules=False,
-                experimental_config=experimental_config,
-        ) as prof:
-            with timing_stage(_timings, "profiler"):
-                for fn in funcs:
-                    for _ in builtins.range(warmup + active):
-                        if clear_l2_cache and _pre_hook_scope is None:
-                            buffer.sum()  # use buffer read to clear l2 cache
-                            torch.npu.synchronize()
-                        run(fn)
-            prof.step()  # Complete one recording step for the entire candidate batch.
-    finally:
-        if clear_l2_cache:
-            del buffer
+def _profile_npu_batch(funcs, warmup, active, buffer, torch_path, experimental_config):
+    import torch
+    import torch_npu
 
-    with result_scope(lambda: _rm_dic(keep_res, torch_path)):
-        if summary:
-            export_npu_summary(prof.prof_if.prof_path, _timings)
-        with timing_stage(_timings, "csv"):
-            return _collect_prof_result(
-                prof.prof_if.prof_path,
-                funcs,
-                warmup,
-                active,
-                target_kernel_name=target_kernel_name,
-                clear_l2_cache=clear_l2_cache,
-                _return_samples=_return_samples,
-                _capture_report=_capture_report,
-                _quantiles=_quantiles,
-                _aggregate_calls=_aggregate_calls,
-            )
+    total = warmup + active
+    with torch_npu.profiler.profile(
+        activities=[torch_npu.profiler.ProfilerActivity.NPU],
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+        experimental_config=experimental_config,
+    ) as prof:
+        for fn in funcs:
+            for _ in builtins.range(total):
+                if buffer is not None:
+                    buffer.sum()  # use buffer read to clear l2 cache
+                    torch.npu.synchronize()
+                fn()
+                torch.npu.synchronize()
 
 
 def _rm_dic(keep_res, torch_path):
@@ -211,3 +191,96 @@ def _rm_dic(keep_res, torch_path):
 
     if os.path.exists(torch_path):
         shutil.rmtree(torch_path)
+
+
+def _collect_prof_result(
+    base_dir: str,
+    funcs,
+    num_warmup: int,
+    num_active: int,
+    target_kernel_name: Optional[str] = None,
+    clear_l2_cache: bool = False,
+    quantiles=(0, 1),
+    means=None,
+):
+    """
+    Collect kernel performance from kernel_details.csv, returned in millisecond.
+    The first `num_warmup` rows of each function are warmup data and will be ignored, the next `num_active` rows will be averaged.
+
+    :param base_dir: the profiler path
+    :type base_dir: str
+    :param funcs: a list of Callable being profiled
+    :type funcs: List[Callable]
+    :param num_warmup: warmup count in kernel_details.csv of each fn
+    :type num_warmup: int
+    :param num_active: active count in kernel_details.csv of each fn
+    :type num_active: int
+    :param target_kernel_name: target triton kernel name reported by profiler
+    :type target_kernel_name: Optional[str]
+    :param quantiles: lower and upper sorted-sample boundaries; retain at least one duration
+    :param means: optional output list of ordinary means in milliseconds, before trimming
+    """
+
+    import numpy as np
+    import pandas as pd
+
+    kernel_details_file = None
+    for root, _, files in os.walk(base_dir):
+        for file in files:
+            if file == "kernel_details.csv":
+                kernel_details_file = os.path.join(root, file)
+                break
+    num_funcs = len(funcs)
+    if kernel_details_file is None:
+        if num_funcs == 1:
+            return float("inf")
+        else:
+            return [float("inf")] * num_funcs
+
+    df = pd.read_csv(kernel_details_file)
+    # filter out l2 cache clearing operation
+    filter_cond = (not clear_l2_cache) | ~df["Type"].str.contains(r"^ReduceSum$", case=False, na=False)
+    filter_df = df[filter_cond]
+    if target_kernel_name is not None:
+        filter_df = filter_df[filter_df["Name"] == target_kernel_name]
+
+    expected_rows = num_funcs * (num_warmup + num_active)
+    actual_rows = len(filter_df)
+    if target_kernel_name is not None and actual_rows != expected_rows:
+        raise ProfilerResultMismatchError(target_kernel_name, expected_rows, actual_rows)
+
+    durations = filter_df["Duration(us)"].to_numpy(dtype=float)[:expected_rows].reshape(
+        num_funcs, num_warmup + num_active)
+    samples = durations[:, num_warmup:] / 1e3
+    valid = np.isfinite(samples).all(axis=1) & (samples > 0).all(axis=1)
+    if means is not None:
+        means.extend(np.where(valid, samples.mean(axis=1), np.inf).tolist())
+    start, end = (int(num_active * quantile) for quantile in quantiles)
+    time_cost = (samples.mean(axis=1) if quantiles == (0, 1) else np.where(
+        valid,
+        np.sort(samples, axis=1)[:, start:max(start + 1, end)].mean(axis=1), np.inf)).tolist()
+
+    if num_funcs == 1:
+        return time_cost[0]
+    else:
+        return time_cost
+
+
+def benchmark_npu(kernel, grid=None, *args, **kwargs):
+    """Reuse autotune measurements, or benchmark a fixed launch through do_bench_npu."""
+    from ._autotune_comparison import _perf_measured
+
+    launch = kernel if grid is None else lambda: kernel[grid](*args, **kwargs)
+    token = _perf_measured.set(False)
+    try:
+        result = launch()
+        measured = _perf_measured.get()
+    finally:
+        _perf_measured.reset(token)
+    if measured:
+        _perf_measured.set(True)
+    else:
+        compiled = (result[0] if isinstance(result, tuple) else result) if grid is not None else None
+        target = getattr(compiled, "packed_metadata", {}).get("kernel_name")
+        do_bench_npu(launch, target_kernel_name=target)
+    return result
