@@ -120,6 +120,7 @@ def profile_npu(tuner, measure, *args, **kwargs):
 
 
 def start_timing(tuner):
+    _perf_measured.set(True)  # A cache hit is also handled by the autotuner.
     enabled = tuner.report_timing or tuner._autotune_comparison is not None
     tuner._autotune_timing = (time.perf_counter(), {}) if enabled else None
     # Production NPU helpers and comparison diagnostics write to the same stages.

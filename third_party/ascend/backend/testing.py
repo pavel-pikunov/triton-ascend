@@ -271,6 +271,11 @@ def benchmark_npu(kernel, grid=None, *args, **kwargs):
     from ._autotune_comparison import _perf_measured
 
     launch = kernel if grid is None else lambda: kernel[grid](*args, **kwargs)
+    fn = kernel
+    while grid is not None and hasattr(fn, "fn"):
+        if isinstance(fn, runtime.Autotuner):
+            return launch()
+        fn = fn.fn
     token = _perf_measured.set(False)
     try:
         result = launch()

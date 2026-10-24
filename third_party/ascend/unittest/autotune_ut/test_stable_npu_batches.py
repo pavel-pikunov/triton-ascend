@@ -71,3 +71,25 @@ def test_comparison_csv_counts_all_hundred_decisions(backend, tmp_path):
         rows = list(csv.DictReader(stream))
     assert [int(row["best_count"]) for row in rows] == [50, 50]
     assert all(row["total_runs"] == "100" and float(row["best_time_us"]) == 2 for row in rows)
+
+
+@pytest.mark.parametrize("grid", [None, (1, )])
+def test_benchmark_wrapper_does_not_measure_a_cached_tuner(backend, make_tuner, monkeypatch, grid):
+    monkeypatch.setenv("TRITON_BENCH_METHOD", "npu")
+    monkeypatch.setenv("TRITON_NPU_BENCH_SINGLE_CONFIG", "0")
+    tuner = make_tuner()
+    tuner.is_simt_mode = False
+    monkeypatch.setattr(tuner, "generate_key_and_configs", lambda *a, **k: (128, ))
+    monkeypatch.setattr(tuner, "prune_configs", lambda kwargs: tuner.configs)
+    result = object()
+    monkeypatch.setattr(tuner.fn, "run", lambda *a, **k: result)
+    assert tuner.run() is result
+
+    def duplicate(*args, **kwargs):
+        pytest.fail("benchmark_npu repeated measurements after an autotune cache hit")
+
+    monkeypatch.setattr(backend.testing, "do_bench_npu", duplicate)
+    if grid is None:
+        assert backend.testing.benchmark_npu(lambda: tuner.run()) is result
+    else:
+        assert backend.testing.benchmark_npu(tuner, grid) is result
