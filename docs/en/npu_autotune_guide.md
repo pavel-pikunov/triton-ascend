@@ -41,7 +41,7 @@ Each name below starts with `TRITON_NPU_BENCH_`. Defaults preserve the original 
 | MAX_RETRIES | 0 | Maximum batches in total. 0 permits one initial batch. |
 | CACHE_MODE | Caller mode | hot disables explicit eviction; cold retains the existing eviction mechanism. |
 | PIPE_UTILIZATION | 1 | 0 disables collection of pipe-utilization metrics. |
-| PROFILER_MODE | full | mspti collects kernel timestamps directly; summary exports CANN summary CSV; full retains the original analysis. |
+| PROFILER_MODE | torch_npu | mspti collects kernel timestamps directly; summary exports CANN summary CSV; torch_npu retains the original analysis. |
 | SINGLE_CONFIG | 0 | 1 also measures a single autotune candidate with NPU profiling. |
 
 Without new env, an initial single config skips measurement, while a single surviving
@@ -77,7 +77,7 @@ PROFILER_MODE controls export independently of PIPE_UTILIZATION. Summary mode co
 recording step for the batch, disables automatic TensorBoard analysis, and runs the CANN
 summary CSV exporter. It requires the same msprof installation used by the earlier comparison
 branch. The collector reads each summary file once, normalizes its columns and merges split
-files by start time before scoring. Set PROFILER_MODE=full to use the original export path.
+files by start time before scoring. Set PROFILER_MODE=torch_npu to use the original export path.
 Warmup, active counts, cache handling, scores, confirmation and retries are unchanged.
 
 For collection without offline CANN parsing, use the optional CANN msPTI Python API:
@@ -99,7 +99,7 @@ timeline or summary export is invoked. Capture is O(R), ordering O(R log R), and
 The launch loop and minimum confirmation are shared with the existing paths.
 For cold mode, one extra eviction-only capture identifies the cache kernel's actual name;
 its records are excluded from scoring. Pipe-utilization metrics are unavailable in msPTI mode,
-regardless of PIPE_UTILIZATION. Set PROFILER_MODE=summary or full to restore offline export.
-Hardware latency and agreement with the full profiler still require an A5 run.
+regardless of PIPE_UTILIZATION. Set PROFILER_MODE=summary or torch_npu to restore offline export.
+Hardware latency and agreement with the torch_npu profiler still require an A5 run.
 
 [Test-only repetitions, CSV and reports](npu_benchmark_comparison.md) remain available.

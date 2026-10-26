@@ -1,4 +1,4 @@
-"""Summary/full export controls and the shared pandas collector."""
+"""Summary/torch_npu export controls and the shared pandas collector."""
 
 import json
 from contextlib import contextmanager, nullcontext
@@ -114,16 +114,16 @@ def test_profiler_mode_defaults_and_cache_key(backend, monkeypatch):
     policy = backend.policy
     summary = policy.resolve_options()
     assert summary.profiler_mode == "summary"
-    monkeypatch.setenv("TRITON_NPU_BENCH_PROFILER_MODE", "full")
+    monkeypatch.setenv("TRITON_NPU_BENCH_PROFILER_MODE", "torch_npu")
     full = policy.resolve_options()
-    assert full.profiler_mode == "full" and full.cache_key() != summary.cache_key()
+    assert full.profiler_mode == "torch_npu" and full.cache_key() != summary.cache_key()
     assert asdict(replace(full, profiler_mode="summary")) == asdict(summary)
     monkeypatch.setenv("TRITON_NPU_BENCH_PROFILER_MODE", "invalid")
     with pytest.raises(ValueError, match="PROFILER_MODE"):
         policy.resolve_options()
 
 
-@pytest.mark.parametrize("mode", ["summary", "full"])
+@pytest.mark.parametrize("mode", ["summary", "torch_npu"])
 def test_mode_and_timing_reach_the_profiler(backend, monkeypatch, tmp_path, mode):
     policy = backend.policy
     clock, timings, calls = [0.], {}, []

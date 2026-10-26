@@ -15,7 +15,7 @@ from triton.backends.ascend.runtime import autotuner
 
 @pytest.mark.parametrize("decorator", ["autotune", "max_autotune"])
 @pytest.mark.parametrize("method,profiler_mode", [("default", None), ("npu_legacy", None), ("npu", "summary"),
-                                                  ("npu", "full")])
+                                                  ("npu", "torch_npu")])
 def test_npu_vector_tuning_and_cache(monkeypatch, capsys, tmp_path, decorator, method, profiler_mode):
     for name in tuple(os.environ):
         if name.startswith(("TRITON_NPU_BENCH_", "TRITON_AUTOTUNE_")) or name == "TRITON_PRINT_AUTOTUNING":

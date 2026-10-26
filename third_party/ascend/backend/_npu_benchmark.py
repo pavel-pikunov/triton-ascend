@@ -102,8 +102,8 @@ class NpuBenchmarkOptions:
     @property
     def is_default(self):
         """Whether measurement policies leave the original benchmark behavior intact."""
-        return (self.profiler_mode == "full" and self.cache_mode is None and self.warmup is None and self.active is None
-                and self.lower_quantile == 0 and self.upper_quantile == 1
+        return (self.profiler_mode == "torch_npu" and self.cache_mode is None and self.warmup is None
+                and self.active is None and self.lower_quantile == 0 and self.upper_quantile == 1
                 and not (self.quality_check or self.max_retries or self.measure_budget_ms is not None
                          or self.filter_slow_configs))
 
@@ -143,7 +143,7 @@ def resolve_options():
                 value = value.strip().lower()
                 allowed = {
                     "cache_mode": {"hot", "cold"}, "log_level": {"off", "brief", "detailed"}, "profiler_mode":
-                    {"summary", "full"}
+                    {"summary", "torch_npu"}
                 }[name]
                 if value not in allowed:
                     raise ValueError(f"expected one of {sorted(allowed)}")

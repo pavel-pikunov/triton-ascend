@@ -161,7 +161,7 @@ def test_current_collector_accepts_split_summary_csv(backend, monkeypatch, tmp_p
     assert len(calls) == len(set(calls)) == parts + 1
 
 
-@pytest.mark.parametrize("mode", [None, "full", "summary"])
+@pytest.mark.parametrize("mode", [None, "torch_npu", "summary"])
 @pytest.mark.parametrize("cold", [False, True])
 def test_current_profiler_export_mode(backend, monkeypatch, tmp_path, mode, cold):
     import torch
@@ -213,8 +213,9 @@ def test_current_profiler_export_mode(backend, monkeypatch, tmp_path, mode, cold
         assert not any(isinstance(call, tuple) and call[0] == "export" for call in calls)
 
 
-def test_current_profiler_rejects_unknown_export_mode(backend, monkeypatch, tmp_path):
-    monkeypatch.setenv("TRITON_NPU_BENCH_PROFILER_MODE", "invalid")
+@pytest.mark.parametrize("mode", ["full", "invalid"])
+def test_current_profiler_rejects_unknown_export_mode(backend, monkeypatch, tmp_path, mode):
+    monkeypatch.setenv("TRITON_NPU_BENCH_PROFILER_MODE", mode)
     with pytest.raises(ValueError, match="TRITON_NPU_BENCH_PROFILER_MODE"):
         backend.testing._profile_npu_batch([], 0, 1, None, str(tmp_path), None)
 

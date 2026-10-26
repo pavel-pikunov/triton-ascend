@@ -163,8 +163,8 @@ def _profile_npu_batch(funcs, warmup, active, buffer, torch_path, experimental_c
     import torch
     import torch_npu
 
-    mode = os.getenv("TRITON_NPU_BENCH_PROFILER_MODE", "full").strip().lower()
-    if mode not in ("full", "summary", "mspti"):
+    mode = os.getenv("TRITON_NPU_BENCH_PROFILER_MODE", "torch_npu").strip().lower()
+    if mode not in ("torch_npu", "summary", "mspti"):
         raise ValueError("Invalid TRITON_NPU_BENCH_PROFILER_MODE")
     summary = mode == "summary"
     total = warmup + active

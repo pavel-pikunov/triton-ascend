@@ -11,7 +11,7 @@ This branch compares two selectable paths:
 `default` route uses it; its obsolete legacy-profiler branch has been removed.
 
 The comparison branch additionally supports TRITON_NPU_BENCH_PROFILER_MODE=summary
-to skip TensorBoard analysis and read native CANN summary CSVs. The default is full.
+to skip TensorBoard analysis and read native CANN summary CSVs. The default is torch_npu.
 This changes export, not the minimum-confirmation algorithm. PIPE_UTILIZATION independently
 controls whether utilization counters are collected.
 The optional PROFILER_MODE=mspti instead collects kernel timestamps through CANN's
