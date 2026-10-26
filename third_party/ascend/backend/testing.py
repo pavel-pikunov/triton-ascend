@@ -164,16 +164,22 @@ def _profile_npu_batch(funcs, warmup, active, buffer, torch_path, experimental_c
     import torch
     import torch_npu
 
+    mode = os.getenv("TRITON_NPU_BENCH_PROFILER_MODE", "full").strip().lower()
+    if mode not in ("full", "summary"):
+        raise ValueError("Invalid TRITON_NPU_BENCH_PROFILER_MODE")
+    summary = mode == "summary"
     total = warmup + active
     with torch_npu.profiler.profile(
-        activities=[torch_npu.profiler.ProfilerActivity.NPU],
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-        with_flops=False,
-        with_modules=False,
-        experimental_config=experimental_config,
+            activities=[torch_npu.profiler.ProfilerActivity.NPU],
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path, analyse_flag=not summary),
+            schedule=(lambda step: torch_npu.profiler.ProfilerAction.RECORD_AND_SAVE
+                      if step == 0 else torch_npu.profiler.ProfilerAction.NONE) if summary else None,
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+            with_flops=False,
+            with_modules=False,
+            experimental_config=experimental_config,
     ) as prof:
         for fn in funcs:
             for _ in builtins.range(total):
@@ -182,6 +188,11 @@ def _profile_npu_batch(funcs, warmup, active, buffer, torch_path, experimental_c
                     torch.npu.synchronize()
                 fn()
                 torch.npu.synchronize()
+        if summary:
+            prof.step()
+    if summary:
+        from ._npu_benchmark import export_npu_summary
+        export_npu_summary(prof.prof_if.prof_path)
 
 
 def _rm_dic(keep_res, torch_path):
@@ -191,6 +202,22 @@ def _rm_dic(keep_res, torch_path):
 
     if os.path.exists(torch_path):
         shutil.rmtree(torch_path)
+
+
+def _read_npu_profile(base_dir):
+    from pathlib import Path
+    import pandas as pd
+
+    files = list(Path(base_dir).rglob("kernel_details.csv"))[:1] or sorted(Path(base_dir).rglob("op_summary*.csv"))
+    if not files:
+        return None
+    columns = {
+        "Op Name": "Name", "OP Type": "Type", "Task Start Time(us)": "Start Time(us)", "Task Duration(us)":
+        "Duration(us)", "Task Type": "Accelerator Core"
+    }
+    frames = [pd.read_csv(path).rename(columns=columns, copy=False) for path in files]
+    return frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True).sort_values(
+        "Start Time(us)", kind="stable")
 
 
 def _collect_prof_result(
@@ -204,7 +231,7 @@ def _collect_prof_result(
     means=None,
 ):
     """
-    Collect kernel performance from kernel_details.csv, returned in millisecond.
+    Collect kernel performance from kernel_details.csv or CANN op_summary CSVs, returned in milliseconds.
     The first `num_warmup` rows of each function are warmup data and will be ignored, the next `num_active` rows will be averaged.
 
     :param base_dir: the profiler path
@@ -222,22 +249,14 @@ def _collect_prof_result(
     """
 
     import numpy as np
-    import pandas as pd
-
-    kernel_details_file = None
-    for root, _, files in os.walk(base_dir):
-        for file in files:
-            if file == "kernel_details.csv":
-                kernel_details_file = os.path.join(root, file)
-                break
     num_funcs = len(funcs)
-    if kernel_details_file is None:
+    df = _read_npu_profile(base_dir)
+    if df is None:
         if num_funcs == 1:
             return float("inf")
         else:
             return [float("inf")] * num_funcs
 
-    df = pd.read_csv(kernel_details_file)
     # filter out l2 cache clearing operation
     filter_cond = (not clear_l2_cache) | ~df["Type"].str.contains(r"^ReduceSum$", case=False, na=False)
     filter_df = df[filter_cond]

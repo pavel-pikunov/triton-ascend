@@ -112,7 +112,7 @@ def profile_npu(tuner, measure, *args, **kwargs):
         series = int(os.getenv("TRITON_NPU_BENCH_BATCH_RUNS", "1"))
         benchmark.log_stage(
             level, "Profiler measurement", f"Batch {batch}: {len(funcs) // series} candidates, {series} series each; "
-            f"warmup={warmup}, active={active}")
+            f"warmup={warmup}, active={active}, export={os.getenv('TRITON_NPU_BENCH_PROFILER_MODE', 'full')}")
         return original(funcs, warmup, active, *rest)
 
     with patch.object(testing, "_profile_npu_batch", profile):

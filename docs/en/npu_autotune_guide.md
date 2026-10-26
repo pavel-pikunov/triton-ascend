@@ -1,6 +1,7 @@
 # Current NPU measurements on the comparison branch
 
-The `npu` route uses the measurement implementation from `StableAutotuner_3.2.2dev`.
+The `npu` route uses the measurement algorithm from `StableAutotuner_3.2.2dev`,
+with a test-only switch for faster summary export.
 The old sample-quality metrics, event calibration and fast filter do not run.
 The original CV event-based sorting and time-limit pruning remain in place.
 `npu_legacy` is no longer a selectable comparison route; `default` retains the original event tuner.
@@ -40,6 +41,7 @@ Each name below starts with `TRITON_NPU_BENCH_`. Defaults preserve the original 
 | MAX_RETRIES | 0 | Maximum batches in total. 0 permits one initial batch. |
 | CACHE_MODE | Caller mode | hot disables explicit eviction; cold retains the existing eviction mechanism. |
 | PIPE_UTILIZATION | 1 | 0 disables collection of pipe-utilization metrics. |
+| PROFILER_MODE | full | summary skips TensorBoard analysis and exports native CANN summary CSV; full retains the original analysis. |
 | SINGLE_CONFIG | 0 | 1 also measures a single autotune candidate with NPU profiling. |
 
 Without new env, an initial single config skips measurement, while a single surviving
@@ -62,12 +64,20 @@ export TRITON_NPU_BENCH_MEASURE_BUDGET_MS=15
 export TRITON_NPU_BENCH_MAX_RETRIES=5
 export TRITON_NPU_BENCH_CACHE_MODE=hot
 export TRITON_NPU_BENCH_PIPE_UTILIZATION=0
+export TRITON_NPU_BENCH_PROFILER_MODE=summary
 export TRITON_NPU_BENCH_SINGLE_CONFIG=1
 ```
 
 The former QUALITY_CHECK, QUALITY_CHECK_ALL, STABILITY_ONLY, FILTER_SLOW_CONFIGS,
-CALIBRATION_RUNS, SLOW_CONFIG_* and PROFILER_MODE policies do not control this NPU path.
+CALIBRATION_RUNS and SLOW_CONFIG_* policies do not control this NPU path.
 Remove them from old shell scripts. Use STABILITY_RUNS=1 for a benchmark without confirmation,
 and PIPE_UTILIZATION=0 for the lighter metrics configuration.
+
+PROFILER_MODE controls export independently of PIPE_UTILIZATION. Summary mode completes one
+recording step for the batch, disables automatic TensorBoard analysis, and runs the CANN
+summary CSV exporter. It requires the same msprof installation used by the earlier comparison
+branch. The collector reads each summary file once, normalizes its columns and merges split
+files by start time before scoring. Set PROFILER_MODE=full to use the original export path.
+Warmup, active counts, cache handling, scores, confirmation and retries are unchanged.
 
 [Test-only repetitions, CSV and reports](npu_benchmark_comparison.md) remain available.

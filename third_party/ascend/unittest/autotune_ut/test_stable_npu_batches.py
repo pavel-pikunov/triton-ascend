@@ -1,7 +1,9 @@
 """Regression checks for the current public NPU benchmark and comparison CSV."""
 
 import csv
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -93,3 +95,98 @@ def test_benchmark_wrapper_does_not_measure_a_cached_tuner(backend, make_tuner, 
         assert backend.testing.benchmark_npu(lambda: tuner.run()) is result
     else:
         assert backend.testing.benchmark_npu(tuner, grid) is result
+
+
+@pytest.mark.parametrize("cold", [False, True])
+@pytest.mark.parametrize("parts", [1, 2])
+def test_current_collector_accepts_split_summary_csv(backend, monkeypatch, tmp_path, cold, parts):
+    rows = []
+    for index in range(2):
+        for launch in range(6):
+            if cold:
+                rows.append(("flush", "ReduceSum", len(rows), 999.))
+            rows.append(("kernel", "Vector", len(rows), 999. if launch < 2 else 10 * (index + 1) + launch - 2))
+    frame = pd.DataFrame(rows, columns=["Name", "Type", "Start Time(us)", "Duration(us)"])
+    full, summary = tmp_path / "full", tmp_path / "summary"
+    full.mkdir()
+    summary.mkdir()
+    frame.to_csv(full / "kernel_details.csv", index=False)
+    frame = frame.rename(columns={
+        "Name": "Op Name", "Type": "OP Type", "Start Time(us)": "Task Start Time(us)", "Duration(us)":
+        "Task Duration(us)"
+    })
+    for part in range(parts):
+        frame.iloc[part::parts].to_csv(summary / f"op_summary_{part}.csv", index=False)
+    calls, original_read = [], pd.read_csv
+
+    def read_once(path, *args, **kwargs):
+        calls.append(Path(path))
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_csv", read_once)
+    arguments = ([None] * 2, 2, 4, "kernel", cold, (.25, .75))
+    expected_means, actual_means = [], []
+    expected = backend.testing._collect_prof_result(full, *arguments, expected_means)
+    actual = backend.testing._collect_prof_result(summary, *arguments, actual_means)
+    np.testing.assert_allclose(actual, expected)
+    np.testing.assert_allclose(actual_means, expected_means)
+    np.testing.assert_allclose(actual, [.0115, .0215])
+    assert len(calls) == len(set(calls)) == parts + 1
+
+
+@pytest.mark.parametrize("mode", [None, "full", "summary"])
+@pytest.mark.parametrize("cold", [False, True])
+def test_current_profiler_export_mode(backend, monkeypatch, tmp_path, mode, cold):
+    import torch
+    import torch_npu
+
+    if mode is None:
+        monkeypatch.delenv("TRITON_NPU_BENCH_PROFILER_MODE", raising=False)
+    else:
+        monkeypatch.setenv("TRITON_NPU_BENCH_PROFILER_MODE", mode)
+    calls, options = [], {}
+    profiler = SimpleNamespace(prof_if=SimpleNamespace(prof_path=str(tmp_path / "trace")),
+                               step=lambda: calls.append("step"))
+
+    def handler(path, **kwargs):
+        options["handler"] = (path, kwargs)
+        return lambda prof: calls.append("handler")
+
+    @contextmanager
+    def profile(**kwargs):
+        options.update(kwargs)
+        yield profiler
+        kwargs["on_trace_ready"](profiler)
+
+    monkeypatch.setattr(torch_npu.profiler, "tensorboard_trace_handler", handler)
+    monkeypatch.setattr(torch_npu.profiler, "profile", profile)
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: calls.append("sync"))
+    monkeypatch.setattr(backend.policy, "export_npu_summary", lambda path: calls.append(("export", path)))
+    buffer = SimpleNamespace(sum=lambda: calls.append("flush")) if cold else None
+    backend.testing._profile_npu_batch([lambda: calls.append("kernel")], 2, 3, buffer, str(tmp_path), "config")
+    assert calls.count("kernel") == 5 and calls.count("sync") == (10 if cold else 5)
+    assert calls.count("flush") == (5 if cold else 0)
+    assert options["experimental_config"] == "config"
+    if mode == "summary":
+        assert options["handler"][1] == {"analyse_flag": False}
+        assert options["schedule"](0) == torch_npu.profiler.ProfilerAction.RECORD_AND_SAVE
+        assert options["schedule"](1) == torch_npu.profiler.ProfilerAction.NONE
+        assert calls[-3:] == ["step", "handler", ("export", profiler.prof_if.prof_path)]
+
+        def failed_export(path):
+            raise backend.policy.ProfilerAcquisitionError("summary export failed")
+
+        monkeypatch.setattr(backend.policy, "export_npu_summary", failed_export)
+        with pytest.raises(backend.policy.ProfilerAcquisitionError, match="summary export failed"):
+            backend.testing._profile_npu_batch([], 0, 1, None, str(tmp_path), "config")
+    else:
+        assert options["handler"][1].get("analyse_flag", True)
+        assert options.get("schedule") is None
+        assert calls[-1] == "handler" and "step" not in calls
+        assert not any(isinstance(call, tuple) and call[0] == "export" for call in calls)
+
+
+def test_current_profiler_rejects_unknown_export_mode(backend, monkeypatch, tmp_path):
+    monkeypatch.setenv("TRITON_NPU_BENCH_PROFILER_MODE", "invalid")
+    with pytest.raises(ValueError, match="TRITON_NPU_BENCH_PROFILER_MODE"):
+        backend.testing._profile_npu_batch([], 0, 1, None, str(tmp_path), None)
