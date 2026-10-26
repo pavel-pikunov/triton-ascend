@@ -71,9 +71,6 @@ def do_bench_npu(
     target_kernel_name: Optional[str] = None,
     _active_limit=None,
 ):
-    """Confirm minima when TRITON_NPU_BENCH_STABILITY_RUNS > 1, within STABILITY_TOLERANCE.
-    Retry budgets use ordinary means from the first profile.
-    """
     import torch
     import torch_npu
 
