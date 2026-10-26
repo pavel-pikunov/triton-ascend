@@ -22,6 +22,7 @@ import builtins
 import math
 import multiprocessing
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -165,22 +166,23 @@ def _profile_npu_batch(funcs, warmup, active, buffer, torch_path, experimental_c
     import torch_npu
 
     mode = os.getenv("TRITON_NPU_BENCH_PROFILER_MODE", "full").strip().lower()
-    if mode not in ("full", "summary"):
+    if mode not in ("full", "summary", "mspti"):
         raise ValueError("Invalid TRITON_NPU_BENCH_PROFILER_MODE")
     summary = mode == "summary"
     total = warmup + active
-    with torch_npu.profiler.profile(
-            activities=[torch_npu.profiler.ProfilerActivity.NPU],
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path, analyse_flag=not summary),
-            schedule=(lambda step: torch_npu.profiler.ProfilerAction.RECORD_AND_SAVE
-                      if step == 0 else torch_npu.profiler.ProfilerAction.NONE) if summary else None,
-            record_shapes=False,
-            profile_memory=False,
-            with_stack=False,
-            with_flops=False,
-            with_modules=False,
-            experimental_config=experimental_config,
-    ) as prof:
+    profile = _mspti_npu_profile(torch_path, buffer) if mode == "mspti" else torch_npu.profiler.profile(
+        activities=[torch_npu.profiler.ProfilerActivity.NPU],
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path, analyse_flag=not summary),
+        schedule=(lambda step: torch_npu.profiler.ProfilerAction.RECORD_AND_SAVE
+                  if step == 0 else torch_npu.profiler.ProfilerAction.NONE) if summary else None,
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+        experimental_config=experimental_config,
+    )
+    with profile as prof:
         for fn in funcs:
             for _ in builtins.range(total):
                 if buffer is not None:
@@ -193,6 +195,52 @@ def _profile_npu_batch(funcs, warmup, active, buffer, torch_path, experimental_c
     if summary:
         from ._npu_benchmark import export_npu_summary
         export_npu_summary(prof.prof_if.prof_path)
+
+
+@contextmanager
+def _mspti_npu_profile(torch_path, buffer):
+    import csv
+    import torch
+    from mspti import KernelMonitor, MsptiResult
+
+    monitor, rows = KernelMonitor(), []
+
+    def capture(data):
+        rows.append((data.name, data.start, data.end, data.type))
+
+    @contextmanager
+    def record():
+        result = monitor.start(capture)
+        if result != MsptiResult.MSPTI_SUCCESS:
+            raise RuntimeError(f"msPTI start failed: {result}")
+        try:
+            yield
+        finally:
+            result = monitor.stop()
+            if result != MsptiResult.MSPTI_SUCCESS:
+                raise RuntimeError(f"msPTI stop failed: {result}")
+
+    cache_names = set()
+    if buffer is not None:
+        # msPTI reports kernel types, not operator types; identify the eviction kernel once.
+        with record():
+            buffer.sum()
+            torch.npu.synchronize()
+        if not rows:
+            raise RuntimeError("msPTI did not record the L2 eviction kernel; check LD_PRELOAD and CANN support")
+        cache_names = {row[0] for row in rows}
+        rows.clear()
+    with record():
+        yield
+    if not rows or any(start <= 0 or end <= start for _, start, end, _ in rows):
+        raise RuntimeError("msPTI returned missing or invalid kernel timestamps; check LD_PRELOAD and CANN support")
+    rows.sort(key=lambda row: row[1])
+    os.makedirs(torch_path, exist_ok=True)
+    with open(os.path.join(torch_path, "kernel_details.csv"), "w", newline="", encoding="utf-8") as output:
+        writer = csv.writer(output)
+        writer.writerow(("Name", "Type", "Start Time(us)", "Duration(us)", "Accelerator Core"))
+        writer.writerows((name, "ReduceSum" if name in cache_names else kind, start / 1e3, (end - start) / 1e3, kind)
+                         for name, start, end, kind in rows)
 
 
 def _rm_dic(keep_res, torch_path):
@@ -208,7 +256,9 @@ def _read_npu_profile(base_dir):
     from pathlib import Path
     import pandas as pd
 
-    files = list(Path(base_dir).rglob("kernel_details.csv"))[:1] or sorted(Path(base_dir).rglob("op_summary*.csv"))
+    direct = Path(base_dir) / "kernel_details.csv"
+    files = [direct] if direct.is_file() else (list(Path(base_dir).rglob("kernel_details.csv"))[:1]
+                                               or sorted(Path(base_dir).rglob("op_summary*.csv")))
     if not files:
         return None
     columns = {

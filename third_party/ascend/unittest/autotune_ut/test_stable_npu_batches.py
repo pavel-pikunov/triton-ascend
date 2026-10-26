@@ -190,3 +190,69 @@ def test_current_profiler_rejects_unknown_export_mode(backend, monkeypatch, tmp_
     monkeypatch.setenv("TRITON_NPU_BENCH_PROFILER_MODE", "invalid")
     with pytest.raises(ValueError, match="TRITON_NPU_BENCH_PROFILER_MODE"):
         backend.testing._profile_npu_batch([], 0, 1, None, str(tmp_path), None)
+
+
+@pytest.mark.parametrize("cold", [False, True])
+@pytest.mark.parametrize("failure", [None, "start", "stop", "kernel", "empty", "timestamps"])
+def test_mspti_records_use_the_same_collector(backend, monkeypatch, tmp_path, cold, failure):
+    import sys
+    from enum import Enum
+    import torch
+    import torch_npu
+
+    class Result(Enum):
+        MSPTI_SUCCESS = 0
+        ERROR = 1
+
+    calls, queued, clock = [], [], [10**18]
+
+    def enqueue(name, duration):
+        clock[0] += 10000
+        queued.append(SimpleNamespace(name=name, start=clock[0], end=clock[0] + duration, type="KERNEL_AIV"))
+
+    class Monitor:
+
+        def start(self, callback):
+            calls.append("start")
+            self.callback = callback
+            return Result.ERROR if failure == "start" else Result.MSPTI_SUCCESS
+
+        def stop(self):
+            calls.append("stop")
+            if failure != "empty":
+                for record in reversed(queued):
+                    self.callback(record)
+            queued.clear()
+            return Result.ERROR if failure == "stop" else Result.MSPTI_SUCCESS
+
+    def forbidden(**kwargs):
+        pytest.fail("msPTI must not start a torch_npu profiler or CANN exporter")
+
+    monkeypatch.setitem(sys.modules, "mspti", SimpleNamespace(KernelMonitor=Monitor, MsptiResult=Result))
+    monkeypatch.setattr(torch_npu.profiler, "profile", forbidden)
+    monkeypatch.setattr(backend.policy, "export_npu_summary", forbidden)
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: calls.append("sync"))
+    monkeypatch.setenv("TRITON_NPU_BENCH_PROFILER_MODE", "mspti")
+    buffer = SimpleNamespace(sum=lambda: enqueue("unknown_eviction_name", 9000)) if cold else None
+    launched = []
+
+    def kernel():
+        if failure == "kernel":
+            raise RuntimeError("kernel launch failed")
+        launched.append(1)
+        enqueue("kernel", 0 if failure == "timestamps" else 2000 + len(launched))
+
+    if failure:
+        with pytest.raises(RuntimeError, match="msPTI|kernel launch failed"):
+            backend.testing._profile_npu_batch([kernel], 1, 3, buffer, str(tmp_path), None)
+        assert not (tmp_path / "kernel_details.csv").exists()
+        assert calls.count("stop") == calls.count("start") - (failure == "start")
+    else:
+        backend.testing._profile_npu_batch([kernel], 1, 3, buffer, str(tmp_path), None)
+        frame = backend.testing._read_npu_profile(tmp_path)
+        assert calls.count("start") == calls.count("stop") == (2 if cold else 1)
+        assert len(launched) == 4 and len(frame) == (8 if cold else 4)
+        assert len(frame[frame["Type"] == "ReduceSum"]) == (4 if cold else 0)
+        assert frame["Start Time(us)"].is_monotonic_increasing
+        score = backend.testing._collect_prof_result(tmp_path, [kernel], 1, 3, "kernel", cold)
+        assert np.isclose(score, .002003, rtol=0, atol=1e-12)

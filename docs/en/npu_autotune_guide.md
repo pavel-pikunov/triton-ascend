@@ -1,7 +1,7 @@
 # Current NPU measurements on the comparison branch
 
 The `npu` route uses the measurement algorithm from `StableAutotuner_3.2.2dev`,
-with a test-only switch for faster summary export.
+with test-only summary export and direct msPTI kernel collection.
 The old sample-quality metrics, event calibration and fast filter do not run.
 The original CV event-based sorting and time-limit pruning remain in place.
 `npu_legacy` is no longer a selectable comparison route; `default` retains the original event tuner.
@@ -41,7 +41,7 @@ Each name below starts with `TRITON_NPU_BENCH_`. Defaults preserve the original 
 | MAX_RETRIES | 0 | Maximum batches in total. 0 permits one initial batch. |
 | CACHE_MODE | Caller mode | hot disables explicit eviction; cold retains the existing eviction mechanism. |
 | PIPE_UTILIZATION | 1 | 0 disables collection of pipe-utilization metrics. |
-| PROFILER_MODE | full | summary skips TensorBoard analysis and exports native CANN summary CSV; full retains the original analysis. |
+| PROFILER_MODE | full | mspti collects kernel timestamps directly; summary exports CANN summary CSV; full retains the original analysis. |
 | SINGLE_CONFIG | 0 | 1 also measures a single autotune candidate with NPU profiling. |
 
 Without new env, an initial single config skips measurement, while a single surviving
@@ -79,5 +79,27 @@ summary CSV exporter. It requires the same msprof installation used by the earli
 branch. The collector reads each summary file once, normalizes its columns and merges split
 files by start time before scoring. Set PROFILER_MODE=full to use the original export path.
 Warmup, active counts, cache handling, scores, confirmation and retries are unchanged.
+
+For collection without offline CANN parsing, use the optional CANN msPTI Python API:
+
+```bash
+# Source your CANN set_env.sh first; start a new Python process after setting LD_PRELOAD.
+export LD_PRELOAD="${ASCEND_HOME_PATH}/lib64/libmspti.so${LD_PRELOAD:+:$LD_PRELOAD}"
+export TRITON_NPU_BENCH_PROFILER_MODE=mspti
+python -c 'from mspti import KernelMonitor, MsptiResult'
+```
+
+msPTI is supported on Ascend 950 products and requires CANN's `mspti` Python package.
+It must not run together with another profiler. Missing support or invalid timestamps
+raise an error; the benchmark does not silently switch timing methods.
+The callback copies kernel names and integer nanosecond timestamps; durations are subtracted
+before conversion to microseconds. Records are sorted once by start time and written to a
+minimal temporary kernel_details.csv for the existing collector and utils. No CANN database,
+timeline or summary export is invoked. Capture is O(R), ordering O(R log R), and storage O(R).
+The launch loop and minimum confirmation are shared with the existing paths.
+For cold mode, one extra eviction-only capture identifies the cache kernel's actual name;
+its records are excluded from scoring. Pipe-utilization metrics are unavailable in msPTI mode,
+regardless of PIPE_UTILIZATION. Set PROFILER_MODE=summary or full to restore offline export.
+Hardware latency and agreement with the full profiler still require an A5 run.
 
 [Test-only repetitions, CSV and reports](npu_benchmark_comparison.md) remain available.

@@ -169,7 +169,7 @@ def report_safely(action):
 
 def log_stage(level, title, message, *, detailed=False):
     if level != "off" and (not detailed or level == "detailed"):
-        report_safely(lambda: print(f"NPU autotune: {title}\n  {message}"))
+        report_safely(lambda: print(f"NPU autotune: {title}\n  {message}", flush=True))
 
 
 @contextmanager

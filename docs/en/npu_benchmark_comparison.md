@@ -14,6 +14,10 @@ The comparison branch additionally supports TRITON_NPU_BENCH_PROFILER_MODE=summa
 to skip TensorBoard analysis and read native CANN summary CSVs. The default is full.
 This changes export, not the minimum-confirmation algorithm. PIPE_UTILIZATION independently
 controls whether utilization counters are collected.
+The optional PROFILER_MODE=mspti instead collects kernel timestamps through CANN's
+KernelMonitor without offline export. It requires the mspti Python package and
+libmspti.so preloaded before Python starts; utilization metrics are unavailable.
+The CSV reader and minimum-confirmation algorithm are shared by all three modes.
 
 ## Repeating decisions
 

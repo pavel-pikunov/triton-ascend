@@ -113,7 +113,10 @@ def profile_npu(tuner, measure, *args, **kwargs):
         benchmark.log_stage(
             level, "Profiler measurement", f"Batch {batch}: {len(funcs) // series} candidates, {series} series each; "
             f"warmup={warmup}, active={active}, export={os.getenv('TRITON_NPU_BENCH_PROFILER_MODE', 'full')}")
-        return original(funcs, warmup, active, *rest)
+        started = time.perf_counter()
+        result = original(funcs, warmup, active, *rest)
+        benchmark.log_stage(level, "Profiler complete", f"Batch {batch}: {time.perf_counter() - started:.3f} s")
+        return result
 
     with patch.object(testing, "_profile_npu_batch", profile):
         return call_stage(tuner, "measurements", measure, *args, **kwargs)
