@@ -43,7 +43,6 @@ class ProfilerResultMismatchError(RuntimeError):
 def _npu_bench_options(warmup=5, active=30, clear_l2_cache=False):
     values = tuple(
         type(default)(os.getenv("TRITON_NPU_BENCH_" + name, default)) for name, default in (
-            ("WARMUP", 5 if warmup is None else warmup),
             ("ACTIVE", active),
             ("BATCH_RUNS", 1),
             ("STABILITY_RUNS", 1),
@@ -54,12 +53,12 @@ def _npu_bench_options(warmup=5, active=30, clear_l2_cache=False):
             ("MAX_RETRIES", 0),
             ("CACHE_MODE", "cold" if clear_l2_cache else "hot"),
         ))
-    warmup, active, batch_runs, confirmations, tolerance, lower, upper, budget, batches, mode = values
-    if not (warmup >= 0 and active > 0 and batch_runs > 0 and confirmations > 0 and batches >= 0
+    active, batch_runs, confirmations, tolerance, lower, upper, budget, batches, mode = values
+    if not (active > 0 and batch_runs > 0 and confirmations > 0 and batches >= 0
             and math.isfinite(tolerance) and tolerance >= 0 and math.isfinite(budget) and budget >= 0
             and 0 <= lower < upper <= 1 and mode in ("hot", "cold")):
         raise ValueError("Invalid TRITON_NPU_BENCH settings")
-    return values
+    return (max(1, math.ceil(active / 10)), *values)
 
 
 def do_bench_npu(
@@ -80,12 +79,10 @@ def do_bench_npu(
 
     if not isinstance(funcs, list):
         funcs = [funcs]
-    warmup_limit = warmup
     warmup, active, batch_runs, confirmations, tolerance, lower, upper, budget, batches, mode = _npu_bench_options(
         warmup, active, clear_l2_cache)
     clear_l2_cache = mode == "cold"
     if _active_limit is not None:
-        warmup = min(warmup, warmup_limit)
         active = min(active, _active_limit)
         budget = 0
 
@@ -126,13 +123,14 @@ def do_bench_npu(
     histories = [[] for _ in funcs]
     pending = list(builtins.range(len(funcs)))
     for batch in builtins.range(max(1, batches)):
+        warmup = max(1, math.ceil(active / 10))
         selected = [funcs[index] for index in pending] * batch_runs
         batch_path = os.path.join(torch_path, f"batch_{batch}") if batches > 1 else torch_path
         _profile_npu_batch(selected, warmup, active, buffer, batch_path, experimental_config)
         means = []
         try:
             scores = _collect_prof_result(batch_path, selected, warmup, active, target_kernel_name, clear_l2_cache,
-                                          (lower, upper), means)
+                                          (lower, upper) if active >= 10 else (0, 1), means)
         finally:
             _rm_dic(keep_res, torch_path)
         if len(selected) == 1:
