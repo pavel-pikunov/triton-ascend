@@ -22,6 +22,7 @@ import builtins
 import math
 import multiprocessing
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -42,7 +43,6 @@ class ProfilerResultMismatchError(RuntimeError):
 def _npu_bench_options(warmup=5, active=30, clear_l2_cache=False):
     values = tuple(
         type(default)(os.getenv("TRITON_NPU_BENCH_" + name, default)) for name, default in (
-            ("WARMUP", 5 if warmup is None else warmup),
             ("ACTIVE", active),
             ("BATCH_RUNS", 1),
             ("STABILITY_RUNS", 1),
@@ -53,12 +53,12 @@ def _npu_bench_options(warmup=5, active=30, clear_l2_cache=False):
             ("MAX_RETRIES", 0),
             ("CACHE_MODE", "cold" if clear_l2_cache else "hot"),
         ))
-    warmup, active, batch_runs, confirmations, tolerance, lower, upper, budget, batches, mode = values
-    if not (warmup >= 0 and active > 0 and batch_runs > 0 and confirmations > 0 and batches >= 0
+    active, batch_runs, confirmations, tolerance, lower, upper, budget, batches, mode = values
+    if not (active > 0 and batch_runs > 0 and confirmations > 0 and batches >= 0
             and math.isfinite(tolerance) and tolerance >= 0 and math.isfinite(budget) and budget >= 0
             and 0 <= lower < upper <= 1 and mode in ("hot", "cold")):
         raise ValueError("Invalid TRITON_NPU_BENCH settings")
-    return values
+    return (max(1, math.ceil(active / 10)), *values)
 
 
 def do_bench_npu(
@@ -76,12 +76,10 @@ def do_bench_npu(
 
     if not isinstance(funcs, list):
         funcs = [funcs]
-    warmup_limit = warmup
     warmup, active, batch_runs, confirmations, tolerance, lower, upper, budget, batches, mode = _npu_bench_options(
         warmup, active, clear_l2_cache)
     clear_l2_cache = mode == "cold"
     if _active_limit is not None:
-        warmup = min(warmup, warmup_limit)
         active = min(active, _active_limit)
         budget = 0
 
@@ -122,13 +120,14 @@ def do_bench_npu(
     histories = [[] for _ in funcs]
     pending = list(builtins.range(len(funcs)))
     for batch in builtins.range(max(1, batches)):
+        warmup = max(1, math.ceil(active / 10))
         selected = [funcs[index] for index in pending] * batch_runs
         batch_path = os.path.join(torch_path, f"batch_{batch}") if batches > 1 else torch_path
         _profile_npu_batch(selected, warmup, active, buffer, batch_path, experimental_config)
         means = []
         try:
             scores = _collect_prof_result(batch_path, selected, warmup, active, target_kernel_name, clear_l2_cache,
-                                          (lower, upper), means)
+                                          (lower, upper) if active >= 10 else (0, 1), means)
         finally:
             _rm_dic(keep_res, torch_path)
         if len(selected) == 1:
@@ -161,8 +160,11 @@ def _profile_npu_batch(funcs, warmup, active, buffer, torch_path, experimental_c
     import torch
     import torch_npu
 
+    mode = os.getenv("TRITON_NPU_BENCH_PROFILER_MODE", "full").strip().lower()
+    if mode not in ("full", "mspti"):
+        raise ValueError("Invalid TRITON_NPU_BENCH_PROFILER_MODE")
     total = warmup + active
-    with torch_npu.profiler.profile(
+    profile = _mspti_npu_profile(torch_path, buffer) if mode == "mspti" else torch_npu.profiler.profile(
         activities=[torch_npu.profiler.ProfilerActivity.NPU],
         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
         record_shapes=False,
@@ -171,7 +173,8 @@ def _profile_npu_batch(funcs, warmup, active, buffer, torch_path, experimental_c
         with_flops=False,
         with_modules=False,
         experimental_config=experimental_config,
-    ) as prof:
+    )
+    with profile as prof:
         for fn in funcs:
             for _ in builtins.range(total):
                 if buffer is not None:
@@ -179,6 +182,56 @@ def _profile_npu_batch(funcs, warmup, active, buffer, torch_path, experimental_c
                     torch.npu.synchronize()
                 fn()
                 torch.npu.synchronize()
+
+
+@contextmanager
+def _mspti_npu_profile(torch_path, buffer):
+    import csv
+    import torch
+    from mspti import KernelMonitor, MsptiResult
+
+    monitor, rows = KernelMonitor(), []
+
+    def capture(data):
+        rows.append((data.name, data.start, data.end, data.type))
+
+    @contextmanager
+    def record():
+        result = monitor.start(capture)
+        if result != MsptiResult.MSPTI_SUCCESS:
+            monitor.stop()
+            raise RuntimeError(f"msPTI start failed: {result}")
+        try:
+            yield
+        except BaseException:
+            monitor.stop()
+            raise
+        else:
+            result = monitor.stop()
+            if result != MsptiResult.MSPTI_SUCCESS:
+                raise RuntimeError(f"msPTI stop failed: {result}")
+
+    cache_names = set()
+    if buffer is not None:
+        # msPTI reports kernel types, not operator types; identify the eviction kernel once.
+        with record():
+            buffer.sum()
+            torch.npu.synchronize()
+        if not rows:
+            raise RuntimeError("msPTI did not record the L2 eviction kernel; check LD_PRELOAD and CANN support")
+        cache_names = {row[0] for row in rows}
+        rows.clear()
+    with record():
+        yield
+    if not rows or any(start <= 0 or end <= start for _, start, end, _ in rows):
+        raise RuntimeError("msPTI returned missing or invalid kernel timestamps; check LD_PRELOAD and CANN support")
+    rows.sort(key=lambda row: row[1])
+    os.makedirs(torch_path, exist_ok=True)
+    with open(os.path.join(torch_path, "kernel_details.csv"), "w", newline="", encoding="utf-8") as output:
+        writer = csv.writer(output)
+        writer.writerow(("Name", "Type", "Start Time(us)", "Duration(us)", "Accelerator Core"))
+        writer.writerows((name, "ReduceSum" if name in cache_names else kind, start / 1e3, (end - start) / 1e3, kind)
+                         for name, start, end, kind in rows)
 
 
 def _rm_dic(keep_res, torch_path):
