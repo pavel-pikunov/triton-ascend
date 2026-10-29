@@ -2422,7 +2422,6 @@ class AutoTilingTuner(Autotuner):
                     active=active,
                     clear_l2_cache=True,
                     target_kernel_name=target_kernel_name,
-                    _active_limit=active if cv_mode else None,
                 )
                 if len(run_fns) == 1:
                     time_cost = [time_cost]

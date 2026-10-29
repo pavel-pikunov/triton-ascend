@@ -218,7 +218,7 @@ def _decision_record(function_name, config, number, measurement, selection):
         method = "unmeasured"
     if isinstance(measurement, NpuMeasurementReport):
         from .testing import _npu_bench_options
-        bounds = _npu_bench_options()[5:7]
+        bounds = _npu_bench_options()[2:4]
         estimator = "mean" if bounds == (0.0, 1.0) else "trimmed_mean"
         method, score = "npu", measurement.score_ms
     elif isinstance(measurement, ScoreReport):

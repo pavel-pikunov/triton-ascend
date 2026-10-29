@@ -91,7 +91,7 @@ def profile_scores(run_fns, costs, report_sink):
         options = _npu_bench_options(clear_l2_cache=True)
         report_sink({
             config:
-            report_module.ScoreReport(cost, False, "npu", cache_mode=options[-1], quantiles=options[5:7])
+            report_module.ScoreReport(cost, False, "npu", cache_mode=options[-1], quantiles=options[2:4])
             for config, cost in zip(run_fns, costs)
         })
 
@@ -109,7 +109,7 @@ def profile_npu(tuner, measure, *args, **kwargs):
         nonlocal batch
         batch += 1
         level = os.getenv("TRITON_NPU_BENCH_LOG_LEVEL", "off")
-        series = int(os.getenv("TRITON_NPU_BENCH_BATCH_RUNS", "1"))
+        series = int(os.getenv("TRITON_NPU_BENCH_STABILITY_RUNS", "1"))
         benchmark.log_stage(
             level, "Profiler measurement", f"Batch {batch}: {len(funcs) // series} candidates, {series} series each; "
             f"warmup={warmup}, active={active}, export={os.getenv('TRITON_NPU_BENCH_PROFILER_MODE', 'torch_npu')}")
