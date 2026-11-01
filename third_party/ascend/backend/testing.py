@@ -40,21 +40,25 @@ class ProfilerResultMismatchError(RuntimeError):
         )
 
 
-def _npu_bench_options(clear_l2_cache=False):
+def _npu_bench_options(warmup=5, active=30, clear_l2_cache=False):
     values = tuple(
         type(default)(os.getenv("TRITON_NPU_BENCH_" + name, default)) for name, default in (
+            ("ACTIVE", active),
+            ("BATCH_RUNS", 1),
             ("STABILITY_RUNS", 1),
             ("STABILITY_TOLERANCE", 0.01),
             ("LOWER_QUANTILE", 0.0),
             ("UPPER_QUANTILE", 1.0),
+            ("MEASURE_BUDGET_MS", 0.0),
             ("MAX_RETRIES", 0),
             ("CACHE_MODE", "cold" if clear_l2_cache else "hot"),
         ))
-    confirmations, tolerance, lower, upper, batches, mode = values
-    if not (confirmations > 0 and batches >= 0 and math.isfinite(tolerance) and tolerance >= 0
+    active, batch_runs, confirmations, tolerance, lower, upper, budget, batches, mode = values
+    if not (active > 0 and batch_runs > 0 and confirmations > 0 and batches >= 0
+            and math.isfinite(tolerance) and tolerance >= 0 and math.isfinite(budget) and budget >= 0
             and 0 <= lower < upper <= 1 and mode in ("hot", "cold")):
         raise ValueError("Invalid TRITON_NPU_BENCH settings")
-    return values
+    return (max(1, math.ceil(active / 10)), *values)
 
 
 def do_bench_npu(
@@ -65,22 +69,33 @@ def do_bench_npu(
     prof_dir=None,
     keep_res=False,
     target_kernel_name: Optional[str] = None,
+    _active_limit=None,
 ):
+    """Confirm minima when TRITON_NPU_BENCH_STABILITY_RUNS > 1, within STABILITY_TOLERANCE.
+    Retry budgets use ordinary means from the first profile.
+    """
     import torch
     import torch_npu
 
     if not isinstance(funcs, list):
         funcs = [funcs]
-    confirmations, tolerance, lower, upper, batches, mode = _npu_bench_options(clear_l2_cache)
+    warmup, active, batch_runs, confirmations, tolerance, lower, upper, budget, batches, mode = _npu_bench_options(
+        warmup, active, clear_l2_cache)
     clear_l2_cache = mode == "cold"
+    if _active_limit is not None:
+        active = min(active, _active_limit)
+        budget = 0
 
     # warmup kernel
     for fn in funcs:
         fn()
         torch.npu.synchronize()
 
+    aic_metrics = torch_npu.profiler.AiCMetrics.AiCoreNone
+    if os.getenv("TRITON_NPU_BENCH_PIPE_UTILIZATION", "1") == "1":
+        aic_metrics = torch_npu.profiler.AiCMetrics.PipeUtilization
     experimental_config = torch_npu.profiler._ExperimentalConfig(
-        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        aic_metrics=aic_metrics,
         profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
         l2_cache=False,
         data_simplification=False,
@@ -108,12 +123,14 @@ def do_bench_npu(
     histories = [[] for _ in funcs]
     pending = list(builtins.range(len(funcs)))
     for batch in builtins.range(max(1, batches)):
-        selected = [funcs[index] for index in pending] * confirmations
+        warmup = max(1, math.ceil(active / 10))
+        selected = [funcs[index] for index in pending] * batch_runs
         batch_path = os.path.join(torch_path, f"batch_{batch}") if batches > 1 else torch_path
         _profile_npu_batch(selected, warmup, active, buffer, batch_path, experimental_config)
+        means = []
         try:
             scores = _collect_prof_result(batch_path, selected, warmup, active, target_kernel_name, clear_l2_cache,
-                                          (lower, upper) if active >= 10 else (0, 1))
+                                          (lower, upper) if active >= 10 else (0, 1), means)
         finally:
             _rm_dic(keep_res, torch_path)
         if len(selected) == 1:
@@ -128,6 +145,12 @@ def do_bench_npu(
         ]
         if not pending:
             break
+        if batch == 0 and batches > 1 and budget and means and math.isfinite(min(means)):
+            previous_active = active
+            active = max(active, math.ceil(budget / min(means)))
+            if active != previous_active:
+                for index in pending:
+                    histories[index].clear()
     if clear_l2_cache:
         del buffer
     if pending:
@@ -141,12 +164,15 @@ def _profile_npu_batch(funcs, warmup, active, buffer, torch_path, experimental_c
     import torch_npu
 
     mode = os.getenv("TRITON_NPU_BENCH_PROFILER_MODE", "torch_npu").strip().lower()
-    if mode not in ("torch_npu", "mspti"):
+    if mode not in ("torch_npu", "summary", "mspti"):
         raise ValueError("Invalid TRITON_NPU_BENCH_PROFILER_MODE")
+    summary = mode == "summary"
     total = warmup + active
     profile = _mspti_npu_profile(torch_path, buffer) if mode == "mspti" else torch_npu.profiler.profile(
         activities=[torch_npu.profiler.ProfilerActivity.NPU],
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path, analyse_flag=not summary),
+        schedule=(lambda step: torch_npu.profiler.ProfilerAction.RECORD_AND_SAVE
+                  if step == 0 else torch_npu.profiler.ProfilerAction.NONE) if summary else None,
         record_shapes=False,
         profile_memory=False,
         with_stack=False,
@@ -162,6 +188,11 @@ def _profile_npu_batch(funcs, warmup, active, buffer, torch_path, experimental_c
                     torch.npu.synchronize()
                 fn()
                 torch.npu.synchronize()
+        if summary:
+            prof.step()
+    if summary:
+        from ._npu_benchmark import export_npu_summary
+        export_npu_summary(prof.prof_if.prof_path)
 
 
 @contextmanager
@@ -245,6 +276,7 @@ def _collect_prof_result(
     target_kernel_name: Optional[str] = None,
     clear_l2_cache: bool = False,
     quantiles=(0, 1),
+    means=None,
 ):
     """
     Collect kernel performance from kernel_details.csv or CANN op_summary CSVs, returned in milliseconds.
@@ -261,6 +293,7 @@ def _collect_prof_result(
     :param target_kernel_name: target triton kernel name reported by profiler
     :type target_kernel_name: Optional[str]
     :param quantiles: lower and upper sorted-sample boundaries; retain at least one duration
+    :param means: optional output list of ordinary means in milliseconds, before trimming
     """
 
     import numpy as np
@@ -287,10 +320,12 @@ def _collect_prof_result(
         num_funcs, num_warmup + num_active)
     samples = durations[:, num_warmup:] / 1e3
     valid = np.isfinite(samples).all(axis=1) & (samples > 0).all(axis=1)
-    if quantiles != (0, 1):
-        start, end = (int(num_active * quantile) for quantile in quantiles)
-        samples = np.sort(samples, axis=1)[:, start:max(start + 1, end)]
-    time_cost = np.where(valid, samples.mean(axis=1), np.inf).tolist()
+    if means is not None:
+        means.extend(np.where(valid, samples.mean(axis=1), np.inf).tolist())
+    start, end = (int(num_active * quantile) for quantile in quantiles)
+    time_cost = (samples.mean(axis=1) if quantiles == (0, 1) else np.where(
+        valid,
+        np.sort(samples, axis=1)[:, start:max(start + 1, end)].mean(axis=1), np.inf)).tolist()
 
     if num_funcs == 1:
         return time_cost[0]
