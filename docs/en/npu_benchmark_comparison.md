@@ -10,14 +10,11 @@ This branch compares two selectable paths:
 `npu_legacy` has been removed from selection. The private copied tuner remains because the
 `default` route uses it; its obsolete legacy-profiler branch has been removed.
 
-The comparison branch additionally supports TRITON_NPU_BENCH_PROFILER_MODE=summary
-to skip TensorBoard analysis and read native CANN summary CSVs. The default is torch_npu.
-This changes export, not the minimum-confirmation algorithm. PIPE_UTILIZATION independently
-controls whether utilization counters are collected.
-The optional PROFILER_MODE=mspti instead collects kernel timestamps through CANN's
+TRITON_NPU_BENCH_PROFILER_MODE=torch_npu retains the original profiler and pipe-utilization
+counters. The optional PROFILER_MODE=mspti instead collects kernel timestamps through CANN's
 KernelMonitor without offline export. It requires the mspti Python package and
 libmspti.so preloaded before Python starts; utilization metrics are unavailable.
-The CSV reader and minimum-confirmation algorithm are shared by all three modes.
+The CSV reader and minimum-confirmation algorithm are shared by both modes.
 
 ## Repeating decisions
 

@@ -11,8 +11,9 @@ import pytest
 
 
 def configure(monkeypatch, **values):
-    settings = dict(ACTIVE=30, BATCH_RUNS=2, STABILITY_RUNS=3, STABILITY_TOLERANCE=.01, LOWER_QUANTILE=.25,
-                    UPPER_QUANTILE=.75, MEASURE_BUDGET_MS=0, MAX_RETRIES=3, CACHE_MODE="hot")
+    monkeypatch.delenv("TRITON_NPU_BENCH_WARMUP", raising=False)
+    settings = dict(ACTIVE=30, STABILITY_RUNS=3, STABILITY_TOLERANCE=.01, LOWER_QUANTILE=.25, UPPER_QUANTILE=.75,
+                    MEASURE_BUDGET_MS=0, MAX_RETRIES=3, CACHE_MODE="hot")
     settings.update(values)
     for name, value in settings.items():
         monkeypatch.setenv("TRITON_NPU_BENCH_" + name, str(value))
@@ -37,7 +38,7 @@ def profiles(monkeypatch, testing, batches):
 @pytest.mark.parametrize("requested, expected", [(2, 2), (30, 5)])
 def test_cv_keeps_counts_and_history_with_budget(backend, monkeypatch, requested, expected):
     configure(monkeypatch, ACTIVE=requested, MEASURE_BUDGET_MS=250)
-    counts = profiles(monkeypatch, backend.testing, [[10000., 10001.], [10002., 12000.]])
+    counts = profiles(monkeypatch, backend.testing, [[10000., 10001., 12000.], [10002., 13000., 14000.]])
     score = backend.testing.do_bench_npu(lambda: None, warmup=1, active=5, _active_limit=5, target_kernel_name="kernel")
     assert np.isclose(score, 10.)
     assert counts == [(1, expected), (1, expected)]
@@ -46,7 +47,7 @@ def test_cv_keeps_counts_and_history_with_budget(backend, monkeypatch, requested
 @pytest.mark.parametrize("active", [1, 30])
 def test_vector_budget_changes_active_once_and_restarts_history(backend, monkeypatch, active):
     configure(monkeypatch, ACTIVE=active, MEASURE_BUDGET_MS=.1)
-    counts = profiles(monkeypatch, backend.testing, [[1.9, 2.2], [2., 2.001], [2.002, 2.003]])
+    counts = profiles(monkeypatch, backend.testing, [[1.9, 2.2, 2.3], [2., 2.001, 3.], [2.002, 2.003, 4.]])
     score = backend.testing.do_bench_npu(lambda: None, target_kernel_name="kernel")
     assert np.isclose(score, .002)
     assert counts == [(max(1, (active + 9) // 10), active), (6, 53), (6, 53)]
@@ -54,7 +55,7 @@ def test_vector_budget_changes_active_once_and_restarts_history(backend, monkeyp
 
 def test_exhausted_batches_keep_an_unconfirmed_result(backend, monkeypatch, capsys):
     configure(monkeypatch, MAX_RETRIES=1, MEASURE_BUDGET_MS=.1)
-    counts = profiles(monkeypatch, backend.testing, [[1.9, 2.2]])
+    counts = profiles(monkeypatch, backend.testing, [[1.9, 2.2, 2.3]])
     score = backend.testing.do_bench_npu(lambda: None, target_kernel_name="kernel")
     assert np.isclose(score, .0019) and counts == [(3, 30)]
     assert "minimum not confirmed for configurations [1]" in capsys.readouterr().out
@@ -62,23 +63,48 @@ def test_exhausted_batches_keep_an_unconfirmed_result(backend, monkeypatch, caps
 
 @pytest.mark.parametrize("active, warmup", [(1, 1), (9, 1), (10, 1), (11, 2), (30, 3), (53, 6)])
 def test_warmup_follows_active_without_an_environment_override(backend, monkeypatch, active, warmup):
-    configure(monkeypatch, ACTIVE=active, BATCH_RUNS=1, STABILITY_RUNS=1)
-    monkeypatch.setenv("TRITON_NPU_BENCH_WARMUP", "ignored")
+    configure(monkeypatch, ACTIVE=active, STABILITY_RUNS=1)
+    monkeypatch.setenv("TRITON_NPU_BENCH_WARMUP", "removed")
     counts = profiles(monkeypatch, backend.testing, [[10.]])
     assert backend.testing._npu_bench_options()[0] == warmup
     assert np.isclose(backend.testing.do_bench_npu(lambda: None, warmup=0, target_kernel_name="kernel"), .01)
     assert counts == [(warmup, active)]
 
 
+def test_interleaved_batches_confirm_each_minimum_across_history(backend, monkeypatch):
+    import torch_npu
+
+    configure(monkeypatch)
+    monkeypatch.setenv("TRITON_NPU_BENCH_BATCH_RUNS", "removed")
+    monkeypatch.setenv("TRITON_NPU_BENCH_PIPE_UTILIZATION", "removed")
+    settings = {}
+    monkeypatch.setattr(torch_npu.profiler, "_ExperimentalConfig", lambda **kwargs: settings.update(kwargs))
+    counts = profiles(monkeypatch, backend.testing,
+                      [[10., 8., 10.04, 9.3, 10.08, 13.4], [8.2, 8.23, 8.25], [8.02, 8.03, 8.06]])
+    original, batches = backend.testing._profile_npu_batch, []
+
+    def profile(funcs, *args):
+        batches.append(list(funcs))
+        return original(funcs, *args)
+
+    monkeypatch.setattr(backend.testing, "_profile_npu_batch", profile)
+    first, second = lambda: None, lambda: None
+    result = backend.testing.do_bench_npu([first, second], target_kernel_name="kernel")
+    np.testing.assert_allclose(result, [.01, .008])
+    assert batches == [[first, second] * 3, [second] * 3, [second] * 3]
+    assert counts == [(3, 30)] * 3
+    assert settings["aic_metrics"] == torch_npu.profiler.AiCMetrics.PipeUtilization
+
+
 @pytest.mark.parametrize("active", [2, 9, 10, 11])
 def test_quantile_trimming_requires_ten_active_samples(backend, monkeypatch, active):
-    configure(monkeypatch, ACTIVE=active, BATCH_RUNS=1, STABILITY_RUNS=1)
+    configure(monkeypatch, ACTIVE=active, STABILITY_RUNS=1)
 
     def profile(funcs, warmup, active, buffer, directory, config):
         Path(directory).mkdir(parents=True)
         durations = [999.] * warmup + [10.] * (active - 1) + [100.]
-        pd.DataFrame({"Name": "kernel", "Type": "Vector", "Duration(us)": durations}).to_csv(
-            Path(directory) / "kernel_details.csv", index=False)
+        pd.DataFrame({"Name": "kernel", "Type": "Vector", "Duration(us)":
+                      durations}).to_csv(Path(directory) / "kernel_details.csv", index=False)
 
     monkeypatch.setattr(backend.testing, "_profile_npu_batch", profile)
     score = backend.testing.do_bench_npu(lambda: None, target_kernel_name="kernel")
@@ -161,7 +187,7 @@ def test_current_collector_accepts_split_summary_csv(backend, monkeypatch, tmp_p
     assert len(calls) == len(set(calls)) == parts + 1
 
 
-@pytest.mark.parametrize("mode", [None, "torch_npu", "summary"])
+@pytest.mark.parametrize("mode", [None, "torch_npu"])
 @pytest.mark.parametrize("cold", [False, True])
 def test_current_profiler_export_mode(backend, monkeypatch, tmp_path, mode, cold):
     import torch
@@ -194,26 +220,13 @@ def test_current_profiler_export_mode(backend, monkeypatch, tmp_path, mode, cold
     assert calls.count("kernel") == 5 and calls.count("sync") == (10 if cold else 5)
     assert calls.count("flush") == (5 if cold else 0)
     assert options["experimental_config"] == "config"
-    if mode == "summary":
-        assert options["handler"][1] == {"analyse_flag": False}
-        assert options["schedule"](0) == torch_npu.profiler.ProfilerAction.RECORD_AND_SAVE
-        assert options["schedule"](1) == torch_npu.profiler.ProfilerAction.NONE
-        assert calls[-3:] == ["step", "handler", ("export", profiler.prof_if.prof_path)]
-
-        def failed_export(path):
-            raise backend.policy.ProfilerAcquisitionError("summary export failed")
-
-        monkeypatch.setattr(backend.policy, "export_npu_summary", failed_export)
-        with pytest.raises(backend.policy.ProfilerAcquisitionError, match="summary export failed"):
-            backend.testing._profile_npu_batch([], 0, 1, None, str(tmp_path), "config")
-    else:
-        assert options["handler"][1].get("analyse_flag", True)
-        assert options.get("schedule") is None
-        assert calls[-1] == "handler" and "step" not in calls
-        assert not any(isinstance(call, tuple) and call[0] == "export" for call in calls)
+    assert options["handler"][1] == {}
+    assert "schedule" not in options
+    assert calls[-1] == "handler" and "step" not in calls
+    assert not any(isinstance(call, tuple) and call[0] == "export" for call in calls)
 
 
-@pytest.mark.parametrize("mode", ["full", "invalid"])
+@pytest.mark.parametrize("mode", ["full", "summary", "invalid"])
 def test_current_profiler_rejects_unknown_export_mode(backend, monkeypatch, tmp_path, mode):
     monkeypatch.setenv("TRITON_NPU_BENCH_PROFILER_MODE", mode)
     with pytest.raises(ValueError, match="TRITON_NPU_BENCH_PROFILER_MODE"):
